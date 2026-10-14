@@ -11,8 +11,8 @@ use microsandbox::{
 #[cfg(feature = "net")]
 use super::common::parse_port_mapping;
 use super::common::{
-    display_restore_warnings, guest_clock_parser, parse_explicit_disk_mount, parse_restore_volume,
-    parse_vsock_route,
+    display_restore_warnings, guest_clock_parser, parse_explicit_disk_mount,
+    parse_explicit_file_mount, parse_restore_volume, parse_tmpfs_mount, parse_vsock_route,
 };
 use crate::ui::{self, ErrorLine};
 
@@ -46,6 +46,10 @@ pub struct RestoreArgs {
     /// Destination resource bindings.
     #[command(flatten)]
     pub resources: RestoreResourceArgs,
+    /// Mount a tmpfs (`PATH[:SIZE][:OPTIONS]`), like `create --tmpfs`. A full restore keeps
+    /// captured guest mounts, so a new path needs --disk-only or a disk snapshot.
+    #[arg(long, value_name = "PATH[:SIZE][:OPTIONS]")]
+    pub tmpfs: Vec<String>,
     /// Destination controls applied before the restored workload can run.
     #[command(flatten)]
     pub controls: RestoreControlArgs,
@@ -66,6 +70,9 @@ pub struct RestoreResourceArgs {
     /// Attach a host disk image (`SOURCE:DEST[:OPTIONS]`), like `create --mount-disk`.
     #[arg(long = "mount-disk", value_name = "SOURCE:DEST[:OPTIONS]")]
     pub mount_disk: Vec<String>,
+    /// Mount a host file (`SOURCE:DEST[:OPTIONS]`), like `create --mount-file`.
+    #[arg(long = "mount-file", value_name = "SOURCE:DEST[:OPTIONS]")]
+    pub mount_file: Vec<String>,
     /// Publish child listeners: `[BIND:]HOST:GUEST[/tcp|udp]`, with equal-length port ranges.
     #[cfg(feature = "net")]
     #[arg(short, long)]
@@ -228,6 +235,11 @@ pub async fn run(
         builder = builder.snapshot_base(base);
     }
     builder = args.resources.apply_restore(builder)?;
+    // Restore-only: a fork resumes captured execution and never mounts a new tmpfs.
+    for spec in &args.tmpfs {
+        let (guest, mount) = parse_tmpfs_mount(spec)?;
+        builder = builder.volume(guest, |_| mount);
+    }
     builder = args.controls.apply(builder)?;
     let (mut progress, task) = builder.restore_with_progress()?;
     let mut display = if args.quiet {
@@ -299,6 +311,10 @@ macro_rules! apply_resources {
                 }
                 for spec in &self.mount_disk {
                     let (guest, mount) = parse_explicit_disk_mount(spec)?;
+                    builder = builder.volume(guest, |_| mount);
+                }
+                for spec in &self.mount_file {
+                    let (guest, mount) = parse_explicit_file_mount(spec)?;
                     builder = builder.volume(guest, |_| mount);
                 }
                 for route in &self.vsock {
@@ -474,6 +490,100 @@ mod tests {
         let good = args("/images/seed.img:/data2:ro,fstype=ext4");
         assert!(good.apply_restore(Sandbox::restore("group:snap")).is_ok());
         let bad = args("/images/seed.img");
+        assert!(bad.apply_restore(Sandbox::restore("group:snap")).is_err());
+    }
+
+    #[test]
+    fn restore_attaches_mount_file_and_tmpfs_like_create() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("config.json");
+        std::fs::write(&file, "{}").unwrap();
+        let file_spec = format!("{}:/etc/app/config.json:ro", file.display());
+        let tmpfs_spec = "/tmp:64M:noexec";
+        let cli = TestCli::try_parse_from([
+            "restore",
+            "group:snap",
+            "--name",
+            "x",
+            "--mount-file",
+            &file_spec,
+            "--tmpfs",
+            tmpfs_spec,
+        ])
+        .unwrap();
+        assert_eq!(cli.args.resources.mount_file, [file_spec.as_str()]);
+        assert_eq!(cli.args.tmpfs, [tmpfs_spec]);
+
+        let (guest, mount) = parse_explicit_file_mount(&cli.args.resources.mount_file[0]).unwrap();
+        assert_eq!(guest, "/etc/app/config.json");
+        match mount.build().unwrap() {
+            microsandbox::sandbox::VolumeMount::Bind {
+                host,
+                guest,
+                options,
+                ..
+            } => {
+                assert_eq!(host, file);
+                assert_eq!(guest, "/etc/app/config.json");
+                assert!(options.readonly);
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+        let (guest, mount) = parse_tmpfs_mount(&cli.args.tmpfs[0]).unwrap();
+        assert_eq!(guest, "/tmp");
+        match mount.build().unwrap() {
+            microsandbox::sandbox::VolumeMount::Tmpfs {
+                guest,
+                size_mib,
+                options,
+            } => {
+                assert_eq!(guest, "/tmp");
+                assert_eq!(size_mib, Some(64));
+                assert!(options.noexec);
+            }
+            other => panic!("expected Tmpfs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tmpfs_reaches_run_builder_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let cli = TestCli::try_parse_from([
+            "restore",
+            missing.to_str().unwrap(),
+            "--name",
+            "restore-tmpfs-binding",
+            "--tmpfs",
+            "/",
+        ])
+        .unwrap();
+        // As for --mount-disk, a root guest path is rejected before the snapshot is
+        // opened, so this fails only if `run` hands the tmpfs to the restore builder.
+        let error = run(cli.args, None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot mount a volume at guest root /"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn mount_file_specs_are_applied_to_the_restore_builder() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("config.json");
+        std::fs::write(&file, "{}").unwrap();
+        let args = |spec: &str| {
+            TestCli::try_parse_from(["restore", "group:snap", "--name", "x", "--mount-file", spec])
+                .unwrap()
+                .args
+                .resources
+        };
+        let good = args(&format!("{}:/etc/x", file.display()));
+        assert!(good.apply_restore(Sandbox::restore("group:snap")).is_ok());
+        // create's validation applies: the source must be an existing file.
+        let bad = args(&format!("{}:/etc/x", directory.path().display()));
         assert!(bad.apply_restore(Sandbox::restore("group:snap")).is_err());
     }
 

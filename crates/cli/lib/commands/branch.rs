@@ -149,4 +149,22 @@ mod tests {
                 .unwrap();
         assert_eq!(batch.branch.resources.mount_disk, [spec]);
     }
+
+    #[test]
+    fn both_fork_forms_accept_mount_file_but_not_tmpfs() {
+        let spec = "/host/config.json:/etc/app/config.json:ro";
+        let single =
+            Command::try_parse_from(["msb", "source", "--name", "child", "--mount-file", spec])
+                .unwrap();
+        assert_eq!(single.branch.resources.mount_file, [spec]);
+        let batch =
+            Command::try_parse_from(["msb", "source", "--names", "a", "b", "--mount-file", spec])
+                .unwrap();
+        assert_eq!(batch.branch.resources.mount_file, [spec]);
+        // A fork keeps the captured guest mounts, so it cannot add a tmpfs.
+        assert!(
+            Command::try_parse_from(["msb", "source", "--name", "child", "--tmpfs", "/tmp"])
+                .is_err()
+        );
+    }
 }

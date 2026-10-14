@@ -587,4 +587,26 @@ mod tests {
         }
         assert!(config(&restore).restore_resources.mapped.contains("/data2"));
     }
+
+    #[test]
+    fn a_later_tmpfs_volume_replaces_a_bind_at_the_same_guest_path() {
+        let restore = Sandbox::restore("saved")
+            .volume("/tmp", |v| v.bind("/host/tmp"))
+            .volume("/tmp", |v| v.tmpfs().size(64u32).noexec());
+        let mounts = &config(&restore).spec.mounts;
+        assert_eq!(mounts.len(), 1);
+        match &mounts[0] {
+            crate::sandbox::VolumeMount::Tmpfs {
+                guest,
+                size_mib,
+                options,
+            } => {
+                assert_eq!(guest, "/tmp");
+                assert_eq!(*size_mib, Some(64));
+                assert!(options.noexec);
+            }
+            other => panic!("expected Tmpfs, got {other:?}"),
+        }
+        assert!(config(&restore).restore_resources.mapped.contains("/tmp"));
+    }
 }

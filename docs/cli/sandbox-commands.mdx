@@ -282,6 +282,8 @@ msb snap restore ./saved.msb --name disk-copy --disk-only
 | `--allow-missing-resources` | Resume with missing external filesystems or additional disks unavailable (full restore prints warnings); restore otherwise requires their bindings |
 | `-v`, `--volume` | Bind `SOURCE:GUEST[:OPTIONS]`, or select a private captured disk with `GUEST` alone |
 | `--mount-disk` | Mount a disk image: `SOURCE:DEST[:OPTIONS]`, as in `msb create`; it wins over `-v` at the same guest path. A full restore accepts a disk only at a guest path captured in the snapshot, and the image must hold that disk's contents; use `--disk-only` to attach one at a new path |
+| `--mount-file` | Mount a host file: `SOURCE:DEST[:OPTIONS]`, as in `msb create`; it wins over `-v` at the same guest path. A full restore accepts a file only at a guest path captured in the snapshot, backed by the same file; use `--disk-only` to mount one at a new path |
+| `--tmpfs` | Mount a tmpfs: `PATH[:SIZE][:OPTIONS]`, as in `msb create`; it wins over `-v` at the same guest path. A full restore keeps the captured guest mounts, so a tmpfs at a new path needs `--disk-only` or a disk snapshot |
 | `-p`, `--port` | Publish `[BIND:]HOST:GUEST[/tcp\|udp]` |
 | `--tcp-accept-queue-size` | Accept-queue depth for the child's published TCP ports (default: `1024`) |
 | `--vsock` | Bind `HOST_PATH:PORT[/stream\|/dgram]` |
@@ -398,11 +400,12 @@ msb fork devbox --names worker-{1..10} # Bash/Zsh expand the names
 | `--guest-flush` | Guest writeback policy: `auto` (default), `required`, or `skip`; see [advanced guest flushing](/sandboxes/snapshots#guest-flushing) |
 | `--integrity` | Record disk content hashes |
 | `--mount-disk` | Rebind a captured disk to a host image: `SOURCE:DEST[:OPTIONS]`, as in `msb create`; it wins over `-v` at the same guest path |
+| `--mount-file` | Rebind a captured file mount: `SOURCE:DEST[:OPTIONS]`, as in `msb create`; it wins over `-v` at the same guest path |
 | `-q`, `--quiet` | Suppress progress |
 
 Both fork forms accept `--guest-flush auto|required|skip`. Auto and skip preserve dirty memory without flushing root or owned block filesystems; required adds writeback. Host-backed directory synchronization and host disk barriers remain in effect.
 
-Volume, port, TCP accept queue size, user, vsock, inheritance, and mount-policy flags match [`restore`](#msb-restore).
+Volume, file mount, port, TCP accept queue size, user, vsock, inheritance, and mount-policy flags match [`restore`](#msb-restore). `--tmpfs` is restore-only: a fork keeps the captured guest mounts.
 
 A fork cannot add a new block device. `--mount-disk` only rebinds a captured disk, such as a named disk volume, at `DEST` to a host image consistent with the captured state. Images are attached directly, so batch forks must not share a writable image. See [fork disk bindings](/sandboxes/snapshots#forking) for details.
 
