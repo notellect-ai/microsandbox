@@ -1,0 +1,104 @@
+# Notellect's build of msb: upstream at the same version plus the commits on
+# this branch. Every other upstream workflow is removed so a tag here never
+# publishes upstream packages.
+name: Notellect msb release
+
+on:
+  push:
+    tags: ["v*-notellect.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUST_TOOLCHAIN: "1.94.0"
+
+jobs:
+  build:
+    name: msb (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-aarch64, runner: macos-14 }
+          - { target: linux-x86_64, runner: ubuntu-22.04 }
+          - { target: linux-aarch64, runner: ubuntu-22.04-arm }
+          - { target: windows-x86_64, runner: windows-latest, rust_target: x86_64-pc-windows-msvc, vs_arch: amd64 }
+          - { target: windows-aarch64, runner: windows-11-arm, rust_target: aarch64-pc-windows-msvc, vs_arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          if [ -n "${{ matrix.rust_target }}" ]; then rustup target add "${{ matrix.rust_target }}"; fi
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+
+      - name: Build msb (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cargo build --locked --release -p microsandbox-cli --bin msb
+          mkdir -p dist
+          cp target/release/msb dist/msb-${{ matrix.target }}
+
+      - name: Codesign msb (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --entitlements msb-entitlements.plist --force -s - dist/msb-${{ matrix.target }}
+
+      - name: Checkout libkrunfw MSVC helpers
+        if: runner.os == 'Windows'
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Build msb (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_arch }}
+          cargo build --locked --release -p microsandbox-cli --bin msb --target ${{ matrix.rust_target }}
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\${{ matrix.rust_target }}\release\msb.exe dist\msb-${{ matrix.target }}.exe -Force
+
+      - name: Verify msb
+        shell: bash
+        run: for binary in dist/msb-*; do "$binary" --version; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msb-${{ matrix.target }}
+          path: dist/*
+          compression-level: 0
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum msb-* > checksums.sha256
+          cat checksums.sha256
+          upstream="${GITHUB_REF_NAME%-notellect.*}"
+          gh release create "$GITHUB_REF_NAME" msb-* checksums.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Upstream $upstream plus the commits on branch notellect/$upstream (see NOTELLECT.md)."
