@@ -2349,6 +2349,8 @@ fn build_vm(
         let cfg = PassthroughConfig {
             max_state_bytes: vm.fs_state_limit(),
             root_dir: host_path.clone(),
+            entry_timeout: Duration::ZERO,
+            attr_timeout: Duration::ZERO,
             external_checkpoint: owned_checkpoint.is_none().then_some(external_options),
             owned_checkpoint,
             inject_init: false,
