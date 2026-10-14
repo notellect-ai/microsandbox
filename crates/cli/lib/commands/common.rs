@@ -1458,26 +1458,8 @@ fn apply_sandbox_opts_inner(
 
     // --- Tmpfs ---
     for tmpfs_str in &opts.tmpfs {
-        let (path, size, options) = parse_tmpfs(tmpfs_str)?;
-        builder = builder.volume(&path, move |mut m| {
-            m = m.tmpfs();
-            if let Some(size_mib) = size {
-                m = m.size(size_mib);
-            }
-            if options.readonly {
-                m = m.readonly();
-            }
-            if options.noexec {
-                m = m.noexec();
-            }
-            if options.nosuid {
-                m = m.nosuid();
-            }
-            if options.nodev {
-                m = m.nodev();
-            }
-            m
-        });
+        let (path, mount) = parse_tmpfs_mount(tmpfs_str)?;
+        builder = builder.volume(path, |_| mount);
     }
 
     // --- Scripts ---
@@ -2076,6 +2058,14 @@ pub fn apply_explicit_file_mount(
     builder: SandboxBuilder,
     spec: &str,
 ) -> anyhow::Result<SandboxBuilder> {
+    let (guest, mount) = parse_explicit_file_mount(spec)?;
+    Ok(builder.volume(guest, |_| mount))
+}
+
+/// Parse a `--mount-file` spec into its guest path and configured mount.
+///
+/// Shared by create, restore, and both fork forms.
+pub(crate) fn parse_explicit_file_mount(spec: &str) -> anyhow::Result<(String, MountBuilder)> {
     let parsed = parse_cli_mount_spec(
         "mount-file",
         spec,
@@ -2088,12 +2078,9 @@ pub fn apply_explicit_file_mount(
     )?;
     ensure_host_kind("mount-file", parsed.source, HostPathKind::File)?;
 
-    let source = parsed.source.to_string();
     let guest = parsed.guest.to_string();
-    let options = parsed.options;
-    Ok(builder.volume(guest, move |m| {
-        apply_common_mount_options(m.bind(&source), options)
-    }))
+    let mount = MountBuilder::new(&guest).bind(parsed.source);
+    Ok((guest, apply_common_mount_options(mount, parsed.options)))
 }
 
 /// Apply a `--mount-disk` spec to the builder.
@@ -3370,6 +3357,30 @@ pub(crate) fn parse_violation_action(
             "invalid violation action: {other} (expected: block, block-and-log, block-and-terminate)"
         ),
     }
+}
+
+/// Parse a `--tmpfs` spec into its guest path and configured mount.
+///
+/// Shared by create, restore, and both fork forms.
+pub(crate) fn parse_tmpfs_mount(spec: &str) -> anyhow::Result<(String, MountBuilder)> {
+    let (path, size, options) = parse_tmpfs(spec)?;
+    let mut mount = MountBuilder::new(&path).tmpfs();
+    if let Some(size_mib) = size {
+        mount = mount.size(size_mib);
+    }
+    if options.readonly {
+        mount = mount.readonly();
+    }
+    if options.noexec {
+        mount = mount.noexec();
+    }
+    if options.nosuid {
+        mount = mount.nosuid();
+    }
+    if options.nodev {
+        mount = mount.nodev();
+    }
+    Ok((path, mount))
 }
 
 /// Parse a tmpfs spec: `PATH`, `PATH:SIZE`, `PATH:OPTIONS`, or `PATH:SIZE:OPTIONS`.

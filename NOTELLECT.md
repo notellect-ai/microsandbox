@@ -10,6 +10,11 @@ Commits on top of upstream v0.7.8:
 
 - Directory mounts turn off FUSE entry and attribute caching, so a running
   guest sees a file the Host has atomically replaced.
+- `snapshot restore` accepts create's `--mount-file` and `--tmpfs`, and both
+  fork forms accept `--mount-file`, so a disk snapshot boots with config files
+  and tmpfs on /tmp and /home through restore's hard-linked layers and qcow2
+  overlay instead of a copied root disk. The parsers are shared with create.
+  Shaped to go upstream unchanged (follows superradcompany/microsandbox#1733).
 
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits, and push `vX.Y.Z-notellect.1`.
