@@ -15,6 +15,11 @@ Commits on top of upstream v0.7.11:
   and tmpfs on /tmp and /home through restore's hard-linked layers and qcow2
   overlay instead of a copied root disk. The parsers are shared with create.
   Shaped to go upstream unchanged (follows superradcompany/microsandbox#1733).
+- Windows directory mounts keep a file the guest has open usable after it is
+  unlinked or replaced by a rename (POSIX semantics): fstat, read, write and
+  chmod work through the handle until its last close. A request for an inode
+  whose name is gone returns ESTALE instead of EBADF, so the guest kernel
+  redoes an open or stat that raced the removal with a fresh lookup.
 
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits (the CI commit again deletes every upstream workflow but
