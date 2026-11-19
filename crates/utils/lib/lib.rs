@@ -289,11 +289,13 @@ pub fn is_windows_drive_separator_at(s: &str, index: usize) -> bool {
 /// The wire grammar separates fields with `:` and options with `,`, and lists
 /// are joined with `;`. Host paths may legitimately contain all three (a
 /// Folder named "Smith, John"), so they travel percent-encoded: `%`, `,`,
-/// `;` and every `:` (including a Windows drive colon) become `%XX`.
+/// `;` and `:` become `%XX`. On Windows a drive colon (`C:\`) stays as it
+/// is, since the Windows mount spec parsers already recognise it.
 pub fn encode_mount_host_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
-    for c in path.chars() {
+    for (index, c) in path.char_indices() {
         match c {
+            ':' if cfg!(windows) && is_windows_drive_separator_at(path, index) => out.push(':'),
             '%' => out.push_str("%25"),
             ',' => out.push_str("%2C"),
             ';' => out.push_str("%3B"),
@@ -395,10 +397,17 @@ mod tests {
             "/data/100% done",
             r"C:\Users\用户\a,b;c",
             r"C:\plain path",
+            r"D:/x:y",
             "/data/%2C literal",
         ] {
             let encoded = encode_mount_host_path(path);
-            assert!(!encoded.contains([',', ';', ':']), "{encoded}");
+            let after_drive = if cfg!(windows) && is_windows_drive_path_text(path) {
+                assert_eq!(&encoded[..2], &path[..2], "drive colon kept: {encoded}");
+                &encoded[2..]
+            } else {
+                &encoded[..]
+            };
+            assert!(!after_drive.contains([',', ';', ':']), "{encoded}");
             assert_eq!(decode_mount_host_path(&encoded).unwrap(), path);
         }
     }
