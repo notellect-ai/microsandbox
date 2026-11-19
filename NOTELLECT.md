@@ -35,6 +35,13 @@ Commits on top of upstream v0.7.16 (carried over from `notellect/v0.7.11`):
   of OWNER RIGHTS. An elevated run makes BUILTIN\Administrators the owner of
   what it creates, so with OWNER RIGHTS a later non-elevated run of the same
   user was denied the cache. The user SID is the same in both runs.
+- On Windows, an elevated `msb` and its runtime give the pipes, metrics
+  mapping and events they create a default DACL of the user SID and SYSTEM
+  instead of Administrators and SYSTEM, and the runtime gives its own process
+  a Medium label and grants the user only identity, wait and terminate
+  rights. A later non-elevated run of the same user can then exec into, stop
+  and remove a sandbox that an elevated run left running, without being able
+  to take over the elevated process.
 
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits (the CI commit again deletes every upstream workflow but

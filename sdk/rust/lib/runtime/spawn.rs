@@ -1344,6 +1344,11 @@ fn reserve_metrics_slot(
     config: &SandboxConfig,
     sandbox_id: i32,
 ) -> Option<MetricsReservation> {
+    // The registry mapping and the pipes made after it must stay open to the same user's
+    // non-elevated runs when this launcher is elevated. Best effort, like the registry itself.
+    if let Err(err) = microsandbox_utils::elevation_share::share_new_objects_with_user() {
+        tracing::warn!(error = %err, "could not share launcher objects with non-elevated runs");
+    }
     let shm_name = local.config().metrics_registry_shm_name();
     let capacity = local.config().metrics_registry_capacity();
     let registry = match MetricsRegistry::open_or_create(&shm_name, capacity) {
