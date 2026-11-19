@@ -6,7 +6,7 @@ branch `notellect/vX.Y.Z` (the upstream tag plus Notellect's commits) and
 release tags `vX.Y.Z-notellect.N`. Pushing such a tag builds `msb` for macOS,
 Linux and Windows and publishes it with `checksums.sha256`.
 
-Commits on top of upstream v0.7.11:
+Commits on top of upstream v0.7.16 (carried over from `notellect/v0.7.11`):
 
 - Directory mounts turn off FUSE entry and attribute caching, so a running
   guest sees a file the Host has atomically replaced.
@@ -23,4 +23,5 @@ Commits on top of upstream v0.7.11:
 
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits (the CI commit again deletes every upstream workflow but
-`notellect-release.yml`), and push `vX.Y.Z-notellect.1`.
+`notellect-release.yml`, including ones upstream added since), and push
+`vX.Y.Z-notellect.1`.
