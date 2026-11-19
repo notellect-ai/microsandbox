@@ -1,8 +1,10 @@
 //! Keep what an elevated run leaves behind usable by the same user's normal runs.
 //!
-//! An elevated Windows token gives every kernel object it creates without explicit security
-//! (named pipes, file mappings, events, its own process) a default DACL that grants only
-//! BUILTIN\Administrators and SYSTEM. The same user's non-elevated token holds Administrators
+//! An elevated Windows token makes BUILTIN\Administrators the owner of what it creates, and
+//! gives kernel objects created without explicit security (file mappings, events, its own
+//! process) a default DACL that grants only Administrators and SYSTEM. Named pipes instead take
+//! a fixed default that grants full control to their creator owner, which is Administrators
+//! again. The same user's non-elevated token holds Administrators
 //! for deny only, so a later normal `msb` cannot connect to an elevated sandbox's agent or
 //! control pipe, open its metrics, or stop it. Granting the token user SID fixes that: both
 //! tokens of one account carry the same user SID. A non-elevated process changes nothing.
@@ -34,10 +36,11 @@ pub(crate) mod windows {
         SDDL_REVISION_1, SE_KERNEL_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl,
-        GetTokenInformation, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetTokenInformation,
-        TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
-        TokenDefaultDacl, TokenElevation, TokenUser,
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        GetSecurityDescriptorSacl, GetTokenInformation, LABEL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL,
+        TOKEN_ELEVATION, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenElevation,
+        TokenOwner, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -150,8 +153,10 @@ pub(crate) mod windows {
         user_sid_string(&token).map(Some)
     }
 
-    /// Make every kernel object this process creates from now on without explicit security
-    /// (pipes, file mappings, events) grant the account's user SID as well as SYSTEM.
+    /// Make every object this process creates from now on without explicit security grant the
+    /// account's user SID: the user becomes the token's default owner (named pipes grant their
+    /// creator owner, files and directories record it) and the default DACL (file mappings,
+    /// events) names the user and SYSTEM.
     ///
     /// Only an elevated process changes its token; a normal one already grants its user.
     pub fn share_new_objects_with_user() -> io::Result<()> {
@@ -165,8 +170,24 @@ pub(crate) mod windows {
         let Some(user) = elevated_user()? else {
             return Ok(());
         };
-        let sd = descriptor(&format!("D:(A;;GA;;;{user})(A;;GA;;;SY)"))?;
+        let sd = descriptor(&format!("O:{user}D:(A;;GA;;;{user})(A;;GA;;;SY)"))?;
         let token = open_token(TOKEN_QUERY | TOKEN_ADJUST_DEFAULT)?;
+        let (mut sid, mut defaulted) = (null_mut(), 0);
+        if unsafe { GetSecurityDescriptorOwner(sd.0, &mut sid, &mut defaulted) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owner = TOKEN_OWNER { Owner: sid };
+        if unsafe {
+            SetTokenInformation(
+                token.0,
+                TokenOwner,
+                (&owner as *const TOKEN_OWNER).cast(),
+                size_of::<TOKEN_OWNER>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         let default = TOKEN_DEFAULT_DACL {
             DefaultDacl: dacl(&sd)?,
         };
@@ -226,12 +247,16 @@ pub(crate) mod windows {
 mod tests {
     use std::ptr::{null, null_mut};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
         SE_KERNEL_OBJECT,
     };
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
     use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess};
 
     fn sddl(handle: windows_sys::Win32::Foundation::HANDLE, info: u32) -> String {
@@ -295,6 +320,37 @@ mod tests {
         assert!(
             event_dacl.contains(&format!(";;;{})", user)),
             "new objects must grant the user: {event_dacl}"
+        );
+
+        let pipe_name: Vec<u16> =
+            format!(r"\\.\pipe\msb-elevation-share-test-{}", std::process::id())
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                pipe_name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                0,
+                1,
+                512,
+                512,
+                0,
+                null(),
+            )
+        };
+        assert_ne!(
+            pipe,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let pipe_sd = sddl(pipe, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION);
+        unsafe { CloseHandle(pipe) };
+        println!("event: {event_dacl}\npipe: {pipe_sd}");
+        assert!(
+            pipe_sd.starts_with(&format!("O:{user}")) && pipe_sd.contains(&format!("FA;;;{user})")),
+            "a pipe must be owned by and grant the user: {pipe_sd}"
         );
 
         if elevated {
