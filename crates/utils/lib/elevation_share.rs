@@ -283,7 +283,12 @@ mod tests {
         // A second call is a no-op for the default DACL and reapplies the same process SD.
         super::share_current_process_with_user().expect("share again");
 
-        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+        // Unnamed kernel objects carry no security descriptor; a named one shows the default DACL.
+        let name: Vec<u16> = format!("Local\\msb-elevation-share-test-{}", std::process::id())
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let event = unsafe { CreateEventW(null(), 1, 0, name.as_ptr()) };
         assert!(!event.is_null());
         let event_dacl = sddl(event, DACL_SECURITY_INFORMATION);
         unsafe { CloseHandle(event) };
