@@ -31,6 +31,10 @@ Commits on top of upstream v0.7.16 (carried over from `notellect/v0.7.11`):
   without JOB_OBJECT_LIMIT_BREAKAWAY_OK, so CREATE_BREAKAWAY_FROM_JOB fails
   with ERROR_ACCESS_DENIED) starts inside that job instead. It then ends with
   the job.
+- On Windows, the memory snapshot cache grants the account's user SID instead
+  of OWNER RIGHTS. An elevated run makes BUILTIN\Administrators the owner of
+  what it creates, so with OWNER RIGHTS a later non-elevated run of the same
+  user was denied the cache. The user SID is the same in both runs.
 
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits (the CI commit again deletes every upstream workflow but
