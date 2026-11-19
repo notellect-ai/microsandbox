@@ -26,6 +26,11 @@ Commits on top of upstream v0.7.16 (carried over from `notellect/v0.7.11`):
   decodes it, so a name can never inject mount options. A single-file mount
   is exported under the guest file name, so the host file name never reaches
   the agentd file-mount list.
+- On Windows, a detached runtime that cannot leave its launcher's job
+  (Task Scheduler, some terminals and CI agents give their children a job
+  without JOB_OBJECT_LIMIT_BREAKAWAY_OK, so CREATE_BREAKAWAY_FROM_JOB fails
+  with ERROR_ACCESS_DENIED) starts inside that job instead. It then ends with
+  the job.
 
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits (the CI commit again deletes every upstream workflow but
