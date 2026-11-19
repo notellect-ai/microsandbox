@@ -284,6 +284,54 @@ pub fn is_windows_drive_separator_at(s: &str, index: usize) -> bool {
         && matches!(bytes[2], b'\\' | b'/')
 }
 
+/// Encode a host path for the `tag:host[:opts]` mount wire format.
+///
+/// The wire grammar separates fields with `:` and options with `,`, and lists
+/// are joined with `;`. Host paths may legitimately contain all three (a
+/// Folder named "Smith, John"), so they travel percent-encoded: `%`, `,`,
+/// `;` and every `:` (including a Windows drive colon) become `%XX`.
+pub fn encode_mount_host_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            ',' => out.push_str("%2C"),
+            ';' => out.push_str("%3B"),
+            ':' => out.push_str("%3A"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Decode a host path written by [`encode_mount_host_path`].
+///
+/// Text without `%` decodes to itself, so hand-written specs such as
+/// `tag:/host/data` or `tag:C:\data` keep working.
+pub fn decode_mount_host_path(text: &str) -> Result<String, String> {
+    if !text.contains('%') {
+        return Ok(text.to_string());
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let escape = bytes
+                .get(index + 1..index + 3)
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .ok_or_else(|| format!("invalid percent escape in mount host path {text:?}"))?;
+            out.push(escape);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| format!("mount host path is not valid UTF-8: {text:?}"))
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -337,5 +385,30 @@ mod tests {
         assert!(looks_like_local_path_text(r".\relative"));
         assert!(looks_like_local_path_text(r"\\server\share\file.txt"));
         assert!(!looks_like_local_path_text("alpine"));
+    }
+
+    #[test]
+    fn test_mount_host_path_round_trips_wire_separators() {
+        for path in [
+            "/Users/a/Smith, John",
+            "/data/a;b/c:d",
+            "/data/100% done",
+            r"C:\Users\用户\a,b;c",
+            r"C:\plain path",
+            "/data/%2C literal",
+        ] {
+            let encoded = encode_mount_host_path(path);
+            assert!(!encoded.contains([',', ';', ':']), "{encoded}");
+            assert_eq!(decode_mount_host_path(&encoded).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn test_mount_host_path_decodes_raw_specs_and_rejects_bad_escapes() {
+        assert_eq!(decode_mount_host_path("/host/data").unwrap(), "/host/data");
+        assert_eq!(decode_mount_host_path(r"C:\data").unwrap(), r"C:\data");
+        assert!(decode_mount_host_path("/a%2").is_err());
+        assert!(decode_mount_host_path("/a%zz").is_err());
+        assert!(decode_mount_host_path("/a%FF").is_err());
     }
 }

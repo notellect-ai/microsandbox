@@ -20,6 +20,12 @@ Commits on top of upstream v0.7.16 (carried over from `notellect/v0.7.11`):
   chmod work through the handle until its last close. A request for an inode
   whose name is gone returns ESTALE instead of EBADF, so the guest kernel
   redoes an open or stat that raced the removal with a fresh lookup.
+- Mount host paths may contain `,`, `;` and `:`, as real folder and file
+  names do (for example "Smith, John"). The SDK percent-encodes `%`, `,`, `;`
+  and `:` in the host path on the spawn-to-runtime wire, and the runtime
+  decodes it, so a name can never inject mount options. A single-file mount
+  is exported under the guest file name, so the host file name never reaches
+  the agentd file-mount list.
 
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits (the CI commit again deletes every upstream workflow but
