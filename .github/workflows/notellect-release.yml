@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: darwin-aarch64, runner: macos-14 }
+          - { target: darwin-aarch64, runner: macos-15 }
           - { target: linux-x86_64, runner: ubuntu-22.04 }
           - { target: linux-aarch64, runner: ubuntu-22.04-arm }
           - { target: windows-x86_64, runner: windows-latest, rust_target: x86_64-pc-windows-msvc, vs_arch: amd64 }
