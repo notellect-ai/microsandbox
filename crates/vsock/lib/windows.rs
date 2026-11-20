@@ -10,9 +10,9 @@ use msb_krun::backends::vsock::{
     VsockStreamBackend,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_FAILED, WAIT_OBJECT_0,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA,
+    ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, SECURITY_IDENTIFICATION,
@@ -47,6 +47,9 @@ pub struct WindowsNamedPipePortBackend {
 
 struct WindowsNamedPipeBackend {
     shared: Arc<SharedState>,
+    /// Released when the guest end drops. The worker may outlive it briefly:
+    /// it wakes at once, cancels its pipe I/O and exits, but the peer limit
+    /// counts guest connections, not worker threads.
     _lease: PeerLease,
 }
 
@@ -94,7 +97,11 @@ unsafe impl Sync for Event {}
 
 /// One overlapped operation on the pipe: its OVERLAPPED and buffer stay put
 /// (boxed) until the operation has completed or been cancelled and reaped.
+/// Dropping it cancels and reaps a pending operation, so the kernel never
+/// writes into freed memory, even if the worker unwinds. The pipe handle it
+/// names must outlive it.
 struct PendingIo {
+    pipe: HANDLE,
     overlapped: Box<OVERLAPPED>,
     event: Event,
     buffer: Vec<u8>,
@@ -197,8 +204,9 @@ impl Event {
 }
 
 impl PendingIo {
-    fn new(capacity: usize) -> io::Result<Self> {
+    fn new(pipe: &PipeHandle, capacity: usize) -> io::Result<Self> {
         Ok(Self {
+            pipe: pipe.raw(),
             overlapped: Box::new(unsafe { std::mem::zeroed() }),
             event: Event::new(true)?,
             buffer: vec![0; capacity],
@@ -207,11 +215,11 @@ impl PendingIo {
     }
 
     /// Start a read of up to `count` bytes into the buffer.
-    fn start_read(&mut self, pipe: &PipeHandle, count: usize) -> io::Result<()> {
+    fn start_read(&mut self, count: usize) -> io::Result<()> {
         self.prepare();
         let started = unsafe {
             ReadFile(
-                pipe.raw(),
+                self.pipe,
                 self.buffer.as_mut_ptr(),
                 count.min(self.buffer.len()) as u32,
                 std::ptr::null_mut(),
@@ -222,12 +230,12 @@ impl PendingIo {
     }
 
     /// Start a write of `bytes`, which the buffer keeps until it completes.
-    fn start_write(&mut self, pipe: &PipeHandle, bytes: Vec<u8>) -> io::Result<()> {
+    fn start_write(&mut self, bytes: Vec<u8>) -> io::Result<()> {
         self.prepare();
         self.buffer = bytes;
         let started = unsafe {
             WriteFile(
-                pipe.raw(),
+                self.pipe,
                 self.buffer.as_ptr(),
                 self.buffer.len() as u32,
                 std::ptr::null_mut(),
@@ -256,10 +264,9 @@ impl PendingIo {
     }
 
     /// The finished operation's byte count, once its event is set.
-    fn finish(&mut self, pipe: &PipeHandle) -> io::Result<usize> {
+    fn finish(&mut self) -> io::Result<usize> {
         let mut transferred = 0;
-        let ok =
-            unsafe { GetOverlappedResult(pipe.raw(), &*self.overlapped, &mut transferred, 0) };
+        let ok = unsafe { GetOverlappedResult(self.pipe, &*self.overlapped, &mut transferred, 0) };
         self.pending = false;
         if ok == 0 {
             let error = io::Error::last_os_error();
@@ -272,17 +279,19 @@ impl PendingIo {
     }
 
     /// Cancel the operation if it is still running and wait until the
-    /// system no longer uses its OVERLAPPED and buffer.
-    fn cancel(&mut self, pipe: &PipeHandle) {
+    /// system no longer uses its OVERLAPPED and buffer. Returns the bytes it
+    /// transferred if it had completed before the cancel took effect.
+    fn cancel(&mut self) -> usize {
         if !self.pending {
-            return;
+            return 0;
         }
         let mut transferred = 0;
-        unsafe {
-            CancelIoEx(pipe.raw(), &*self.overlapped);
-            GetOverlappedResult(pipe.raw(), &*self.overlapped, &mut transferred, 1);
-        }
+        let ok = unsafe {
+            CancelIoEx(self.pipe, &*self.overlapped);
+            GetOverlappedResult(self.pipe, &*self.overlapped, &mut transferred, 1)
+        };
         self.pending = false;
+        if ok == 0 { 0 } else { transferred as usize }
     }
 }
 
@@ -333,10 +342,11 @@ impl VsockStreamBackend for WindowsNamedPipeBackend {
 
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut state = self.shared.state.lock().unwrap();
-        if let ConnectionState::Failed(error) = &state.connection {
-            return Err(error.to_io_error());
-        }
+        // Bytes the Host sent before a failure still reach the guest first.
         if state.incoming.is_empty() {
+            if let ConnectionState::Failed(error) = &state.connection {
+                return Err(error.to_io_error());
+            }
             return if state.read_shutdown {
                 Ok(0)
             } else {
@@ -382,6 +392,8 @@ impl VsockStreamBackend for WindowsNamedPipeBackend {
         match how {
             VsockShutdown::Read => state.read_shutdown = true,
             VsockShutdown::Write => state.write_shutdown = true,
+            // Like a drop: guest bytes still queued for the Host are
+            // discarded, not flushed.
             VsockShutdown::Both => {
                 state.read_shutdown = true;
                 state.write_shutdown = true;
@@ -400,8 +412,7 @@ impl Drop for WindowsNamedPipeBackend {
         self.shared.state.lock().unwrap().terminate = true;
         // A named-pipe server can stop reading indefinitely. The worker waits
         // on its overlapped I/O and this event together, so it wakes, cancels
-        // that I/O and exits: dropping a guest connection cannot strand a
-        // thread outside the peer limit.
+        // that I/O and exits instead of staying blocked on the pipe.
         self.shared.wake_worker.set();
     }
 }
@@ -411,6 +422,12 @@ impl Drop for PipeHandle {
         unsafe {
             CloseHandle(self.raw());
         }
+    }
+}
+
+impl Drop for PendingIo {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -463,8 +480,16 @@ fn connect_named_pipe(path: &Path, shared: &SharedState) -> io::Result<PipeHandl
             ));
         }
 
-        // Overlapped, so a read can wait for the Host while writes still go
-        // out: synchronous I/O on one handle is serialized by Windows.
+        // Overlapped, so the worker can wait on a pending read and on guest
+        // activity together: synchronous I/O on one handle is serialized by
+        // Windows, so a blocked read would also hold back every write.
+        //
+        // Limit: while a write is blocked because the Host is not reading,
+        // the worker waits on that write alone. A read already pending still
+        // completes, but no further Host bytes are read until the write
+        // finishes, so a Host that writes a large reply without first reading
+        // the guest's request can deadlock both ends. Notellect's Host broker
+        // reads a whole request before it replies.
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -490,11 +515,15 @@ fn connect_named_pipe(path: &Path, shared: &SharedState) -> io::Result<PipeHandl
     }
 }
 
-/// Whether a pipe error means the Host closed its end (end of stream).
+/// Whether a pipe error means the Host closed its end. A write then fails
+/// with ERROR_NO_DATA, while a read still returns the bytes the Host wrote
+/// before closing and only then ERROR_BROKEN_PIPE (end of stream).
 fn is_pipe_closed(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
-        Some(code) if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_PIPE_NOT_CONNECTED as i32
+        Some(code) if code == ERROR_BROKEN_PIPE as i32
+            || code == ERROR_PIPE_NOT_CONNECTED as i32
+            || code == ERROR_NO_DATA as i32
     )
 }
 
@@ -509,22 +538,25 @@ fn wait_for(io: &PendingIo, wake: &Event) -> io::Result<bool> {
     Ok(result == WAIT_OBJECT_0)
 }
 
+/// Wait for the wake event alone.
+fn wait_for_wake(wake: &Event) -> io::Result<()> {
+    if unsafe { WaitForMultipleObjects(1, &wake.0, 0, INFINITE) } == WAIT_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Write all of `bytes`, waiting on the write and the wake event together
 /// so a terminating guest connection stops a write the Host never reads.
-fn write_all(
-    pipe: &PipeHandle,
-    write: &mut PendingIo,
-    bytes: Vec<u8>,
-    shared: &SharedState,
-) -> IoWait {
+fn write_all(write: &mut PendingIo, bytes: Vec<u8>, shared: &SharedState) -> IoWait {
     let length = bytes.len();
-    if let Err(error) = write.start_write(pipe, bytes) {
+    if let Err(error) = write.start_write(bytes) {
         return IoWait::Completed(Err(error));
     }
     loop {
         match wait_for(write, &shared.wake_worker) {
             Ok(true) => {
-                return IoWait::Completed(write.finish(pipe).and_then(|written| {
+                return IoWait::Completed(write.finish().and_then(|written| {
                     if written == length {
                         Ok(written)
                     } else {
@@ -536,14 +568,14 @@ fn write_all(
                 }));
             }
             Ok(false) if shared.terminating() => {
-                write.cancel(pipe);
+                write.cancel();
                 return IoWait::Terminated;
             }
             // Other guest activity: the main loop rereads all state once
             // this write is done, so the wake needs no keeping.
             Ok(false) => {}
             Err(error) => {
-                write.cancel(pipe);
+                write.cancel();
                 return IoWait::Completed(Err(error));
             }
         }
@@ -558,7 +590,12 @@ fn named_pipe_worker(path: PathBuf, shared: Arc<SharedState>) {
             return;
         }
     };
-    let (mut read, mut write) = match (PendingIo::new(IO_CHUNK_SIZE), PendingIo::new(0)) {
+    // Declared after the handle, so both are dropped (cancelled and reaped)
+    // before it is closed.
+    let (mut read, mut write) = match (
+        PendingIo::new(&handle, IO_CHUNK_SIZE),
+        PendingIo::new(&handle, 0),
+    ) {
         (Ok(read), Ok(write)) => (read, write),
         (Err(error), _) | (_, Err(error)) => {
             shared.fail(error);
@@ -574,16 +611,28 @@ fn named_pipe_worker(path: PathBuf, shared: Arc<SharedState>) {
     }
     let _ = shared.notifier.notify();
 
-    pump(&handle, &mut read, &mut write, &shared);
-    // Nothing may outlive the worker that still writes into its buffers.
-    read.cancel(&handle);
-    write.cancel(&handle);
+    pump(&mut read, &mut write, &shared);
+    // A read that completed while the connection was ending still carries
+    // Host bytes: hand them over unless the guest end is gone.
+    write.cancel();
+    let count = read.cancel();
+    if count > 0 && !shared.terminating() {
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .incoming
+            .extend(&read.buffer[..count]);
+        let _ = shared.notifier.notify();
+    }
 }
 
 /// Move bytes both ways until the connection ends: guest bytes are written
 /// as they are queued, and a read is always pending while there is room, so
-/// Host bytes reach the guest as soon as they arrive.
-fn pump(handle: &PipeHandle, read: &mut PendingIo, write: &mut PendingIo, shared: &SharedState) {
+/// Host bytes reach the guest as soon as they arrive. When the Host closes,
+/// guest writes stop but reading goes on until every byte the Host sent
+/// before closing has been delivered, then the stream ends.
+fn pump(read: &mut PendingIo, write: &mut PendingIo, shared: &SharedState) {
     loop {
         let (outgoing, read_capacity) = {
             let mut state = shared.state.lock().unwrap();
@@ -601,8 +650,17 @@ fn pump(handle: &PipeHandle, read: &mut PendingIo, write: &mut PendingIo, shared
         };
 
         if !outgoing.is_empty() {
-            match write_all(handle, write, outgoing, shared) {
+            match write_all(write, outgoing, shared) {
                 IoWait::Completed(Ok(_)) => {
+                    let _ = shared.notifier.notify();
+                }
+                IoWait::Completed(Err(error)) if is_pipe_closed(&error) => {
+                    // The Host no longer reads: drop what the guest queued
+                    // and refuse more, but keep reading its last bytes.
+                    let mut state = shared.state.lock().unwrap();
+                    state.write_shutdown = true;
+                    state.outgoing.clear();
+                    drop(state);
                     let _ = shared.notifier.notify();
                 }
                 IoWait::Completed(Err(error)) => {
@@ -614,7 +672,7 @@ fn pump(handle: &PipeHandle, read: &mut PendingIo, write: &mut PendingIo, shared
         }
 
         if !read.pending && read_capacity > 0 {
-            if let Err(error) = read.start_read(handle, read_capacity.min(IO_CHUNK_SIZE)) {
+            if let Err(error) = read.start_read(read_capacity.min(IO_CHUNK_SIZE)) {
                 if is_pipe_closed(&error) {
                     shared.close();
                 } else {
@@ -627,7 +685,7 @@ fn pump(handle: &PipeHandle, read: &mut PendingIo, write: &mut PendingIo, shared
         // More guest bytes are queued: write them before waiting.
         if !shared.state.lock().unwrap().outgoing.is_empty() {
             if read.pending && read_ready(read) {
-                if !deliver(handle, read, shared) {
+                if !deliver(read, shared) {
                     return;
                 }
             }
@@ -637,7 +695,7 @@ fn pump(handle: &PipeHandle, read: &mut PendingIo, write: &mut PendingIo, shared
         if read.pending {
             match wait_for(read, &shared.wake_worker) {
                 Ok(true) => {
-                    if !deliver(handle, read, shared) {
+                    if !deliver(read, shared) {
                         return;
                     }
                 }
@@ -649,7 +707,10 @@ fn pump(handle: &PipeHandle, read: &mut PendingIo, write: &mut PendingIo, shared
             }
         } else {
             // No room to read until the guest consumes bytes: wait for it.
-            unsafe { WaitForMultipleObjects(1, &shared.wake_worker.0, 0, INFINITE) };
+            if let Err(error) = wait_for_wake(&shared.wake_worker) {
+                shared.fail(error);
+                return;
+            }
         }
     }
 }
@@ -661,8 +722,8 @@ fn read_ready(read: &PendingIo) -> bool {
 
 /// Hand a completed read's bytes to the guest. Returns false when the
 /// connection has ended.
-fn deliver(handle: &PipeHandle, read: &mut PendingIo, shared: &SharedState) -> bool {
-    match read.finish(handle) {
+fn deliver(read: &mut PendingIo, shared: &SharedState) -> bool {
+    match read.finish() {
         Ok(count) => {
             if count > 0 {
                 shared
@@ -941,7 +1002,9 @@ mod tests {
     }
 
     fn pattern(length: usize, seed: u8) -> Vec<u8> {
-        (0..length).map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+        (0..length)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
     }
 
     /// Run `host` on its own thread and wait at most DEADLINE for it, so a
@@ -973,19 +1036,25 @@ mod tests {
             }
         });
         let endpoint = guest_connect(&name);
-        let started = Instant::now();
+        let mut round_trips = Vec::with_capacity(ROUNDS);
         for round in 0..ROUNDS {
             let request = (round as u64).to_le_bytes();
+            let started = Instant::now();
             guest_write_all(&*endpoint, &request);
             assert_eq!(guest_read_up_to(&*endpoint, 8), request);
+            round_trips.push(started.elapsed());
         }
-        let average = started.elapsed() / ROUNDS as u32;
         host.join().unwrap();
-        // The polling relay took one Windows timer tick (about 15.6 ms) per
-        // reply; a blocking read takes well under a millisecond.
+        round_trips.sort();
+        let median = round_trips[ROUNDS / 2];
+        // A polling relay waits one Windows timer tick (about 15.6 ms) per
+        // reply, so every round trip costs at least that; a blocking read
+        // takes well under a millisecond. Half a tick separates the two with
+        // room for a loaded CI runner, and the median ignores the odd round
+        // that loses its time slice.
         assert!(
-            average < Duration::from_millis(3),
-            "average round trip {average:?}"
+            median < Duration::from_millis(8),
+            "median round trip {median:?}"
         );
     }
 
@@ -1027,11 +1096,51 @@ mod tests {
                 }
                 Err(_) => break,
                 Ok(_) => {
-                    assert!(Instant::now() < deadline, "writes to a closed Host kept succeeding");
+                    assert!(
+                        Instant::now() < deadline,
+                        "writes to a closed Host kept succeeding"
+                    );
                     std::thread::yield_now();
                 }
             }
         }
+    }
+
+    #[test]
+    fn host_replying_then_closing_while_the_guest_still_sends_delivers_the_reply_then_eof() {
+        let name = pipe_name("replyclose");
+        let server = host_pipe(&name);
+        let host = std::thread::spawn(move || {
+            host_accept(&server);
+            // Read only the start of the guest's stream, answer, and close
+            // while the rest of it is still queued in the relay.
+            assert_eq!(host_read_exact(&server, 1024), pattern(1024, 4));
+            host_write_all(&server, b"final reply");
+            drop(server);
+        });
+        let endpoint = guest_connect(&name);
+        // Far more than the pipe buffers: the relay is still writing it when
+        // the Host closes.
+        let mut stream = pattern(1 << 20, 4);
+        let deadline = Instant::now() + DEADLINE;
+        while !stream.is_empty() {
+            match endpoint.write(&stream) {
+                Ok(count) => {
+                    stream.drain(..count);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "guest write timed out");
+                    std::thread::yield_now();
+                }
+                // Refusing further guest bytes once the Host closed is fine.
+                Err(_) => break,
+            }
+        }
+        host.join().unwrap();
+        // guest_read_up_to fails on any read error; the stream must end
+        // cleanly after the reply.
+        assert_eq!(guest_read_up_to(&*endpoint, 1 << 20), b"final reply");
+        assert_eq!(endpoint.read(&mut [0_u8; 16]).unwrap(), 0);
     }
 
     #[test]
@@ -1052,7 +1161,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         drop(endpoint);
         let result = within_deadline(move || host_read(&server, &mut [0_u8; 16]));
-        assert!(result.is_err(), "the relay kept its pipe end open: {result:?}");
+        assert!(
+            result.is_err(),
+            "the relay kept its pipe end open: {result:?}"
+        );
     }
 
     #[test]
@@ -1084,7 +1196,10 @@ mod tests {
                 }
             }
         });
-        assert!(drained.0 < 1 << 20, "the whole write went through: {drained:?}");
+        assert!(
+            drained.0 < 1 << 20,
+            "the whole write went through: {drained:?}"
+        );
     }
 
     #[test]
