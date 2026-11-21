@@ -553,13 +553,48 @@ pub(super) fn windows_file_identity(file: &File) -> io::Result<(u32, u32, u32)> 
 }
 
 /// Guest RAM must not inherit broad read permissions from a custom cache parent.
-///
-/// The grant names the account's user SID, which elevated and non-elevated runs of one
-/// Windows user share. OWNER RIGHTS would follow the owner instead, and an elevated run
-/// makes BUILTIN\Administrators the owner, which a later non-elevated run is not.
 #[cfg(windows)]
 fn restrict_cache_directory(path: &Path) -> io::Result<()> {
-    microsandbox_utils::private_file::harden_existing_directory(path)
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+    };
+    // OWNER RIGHTS follows the actual owner; SYSTEM is retained for OS maintenance. Children
+    // inherit these ACEs. This is local-user confidentiality, not an adversarial-host boundary.
+    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)\0"
+        .encode_utf16()
+        .collect();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let success = unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    let result = if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    result
 }
 
 fn invalid(message: &str) -> io::Error {
