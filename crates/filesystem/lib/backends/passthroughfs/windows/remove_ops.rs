@@ -8,7 +8,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FileDispositionInfoEx, FileRenameInfoEx, SetFileInformationByHandle,
+    FILE_RENAME_INFO, FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileRenameInfoEx,
+    SetFileInformationByHandle,
 };
 
 use super::*;
@@ -19,6 +20,28 @@ use super::*;
 
 const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
 const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x2;
+
+//--------------------------------------------------------------------------------------------------
+// Test hooks
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on the renaming thread after the host rename and before the
+    /// inode table follows it, so a test can act inside that window.
+    pub(super) static AFTER_HOST_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_host_rename() {
+    if let Some(hook) = AFTER_HOST_RENAME.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_host_rename() {}
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -115,6 +138,7 @@ impl PassthroughFs {
         };
         if old_path == new_path || !new_path.exists() {
             std::fs::rename(old_path, new_path).map_err(host_error)?;
+            after_host_rename();
             return finish();
         }
         let destination = StdOpenOptions::new()
@@ -130,6 +154,7 @@ impl PassthroughFs {
             } else {
                 std::fs::rename(old_path, new_path).map_err(host_error)?;
             }
+            after_host_rename();
             finish()
         })
     }
@@ -171,22 +196,48 @@ impl PassthroughFs {
         Ok(())
     }
 
+    /// Pin a file about to lose its name. Owned mounts pin every tracked file;
+    /// other mounts pin only files the guest still has open, so that fstat,
+    /// read and write keep working on the old object as POSIX requires.
     pub(super) fn prepare_owned_unlink(
         &self,
         path: &Path,
     ) -> io::Result<Option<PreparedOwnedUnlink>> {
-        if self.cfg.owned_checkpoint.is_none() {
-            return Ok(None);
-        }
         let data = self.inodes.read().unwrap().by_path.get(path).cloned();
         let Some(data) = data else {
             return Ok(None);
         };
+        if self.cfg.owned_checkpoint.is_none() && !self.has_open_handle(data.inode) {
+            return Ok(None);
+        }
         let metadata = self.safe_metadata(path)?;
         if !metadata.is_file() {
             return Ok(None);
         }
+        // Read the guest metadata now: an ADS override moves with whichever
+        // file holds the name, so after a rename-over it is the new file's.
         let current = self.current_override(&metadata, &data)?;
+        if self.cfg.owned_checkpoint.is_none() {
+            // Attribute access is enough for fstat; write access keeps a
+            // guest chmod/utimes on the open file working.
+            let access = if self.cfg.readonly {
+                FILE_READ_ATTRIBUTES
+            } else {
+                FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+            };
+            let file = StdOpenOptions::new()
+                .access_mode(access)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .map_err(host_error)?;
+            reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
+            return Ok(Some(PreparedOwnedUnlink {
+                data,
+                file,
+                stat: current,
+                stat_file: None,
+            }));
+        }
         let file = StdOpenOptions::new()
             .read(true)
             .write(!metadata.permissions().readonly())
@@ -227,11 +278,11 @@ impl PassthroughFs {
         if let Some(data) = inodes.by_path.remove(path) {
             self.finish_removed_alias(&mut inodes, &data);
             drop(inodes);
-            self.reap_owned_inode(data.inode);
+            self.reap_retained_inode(data.inode);
         }
     }
 
-    fn finish_removed_alias(&self, inodes: &mut InodeTable, data: &Arc<InodeData>) {
+    pub(super) fn finish_removed_alias(&self, inodes: &mut InodeTable, data: &Arc<InodeData>) {
         if let Some(path) = inodes
             .by_path
             .iter()
@@ -240,7 +291,7 @@ impl PassthroughFs {
             *data.path.write().unwrap() = path;
             *data.retained.lock().unwrap() = None;
             *data.retained_stat.lock().unwrap() = None;
-        } else if data.retained.lock().unwrap().is_none() {
+        } else if data.retained.lock().unwrap().is_none() && !self.retain_open_file(data) {
             inodes.by_inode.remove(&data.inode);
             if let Some(identity) = data.identity
                 && inodes
@@ -262,18 +313,70 @@ impl PassthroughFs {
         }
     }
 
+    /// Fallback for a handle opened after prepare_owned_unlink looked: keep
+    /// the removed file reachable through that handle. Called before the
+    /// path's stat store entry is moved or removed.
+    pub(super) fn retain_open_file(&self, data: &InodeData) -> bool {
+        let file = self
+            .handles
+            .read()
+            .unwrap()
+            .values()
+            .find(|handle| handle.inode == data.inode)
+            .and_then(|handle| handle.file.lock().unwrap().try_clone().ok());
+        let Some(file) = file else {
+            return false;
+        };
+        // A handle opened by path after the host rename holds the replacing
+        // file; pinning it would alias the old inode to the new object.
+        if data
+            .identity
+            .is_some_and(|identity| mobility::file_identity(&file).ok() != Some(identity))
+        {
+            return false;
+        }
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        if metadata.is_dir() {
+            return false;
+        }
+        let Ok(stat) = self.current_override(&metadata, data) else {
+            return false;
+        };
+        *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
+            uid: stat.uid,
+            gid: stat.gid,
+            mode: Some(stat.mode),
+            rdev: u64::from(stat.rdev),
+        };
+        *data.retained.lock().unwrap() = Some(file);
+        true
+    }
+
     pub(super) fn rename_inode_path(&self, old_path: &Path, new_path: &Path) {
         if old_path == new_path {
             return;
         }
         let mut inodes = self.inodes.write().unwrap();
-        let replaced = inodes.by_path.remove(new_path);
+        let mut replaced = inodes.by_path.remove(new_path);
         let moved = inodes
             .by_path
             .iter()
             .filter(|(path, _)| path.starts_with(old_path))
             .map(|(path, data)| (path.clone(), data.clone()))
             .collect::<Vec<_>>();
+        // A lookup of the new name inside the window after the host rename
+        // already gave it to the moved object (and finished the replaced
+        // one): keep it there.
+        if moved.is_empty()
+            && let Some(data) = &replaced
+            && data.identity.is_some()
+            && self.path_identity(new_path).ok().flatten() == data.identity
+        {
+            inodes.by_path.insert(new_path.to_path_buf(), data.clone());
+            replaced = None;
+        }
         for (path, data) in moved {
             inodes.by_path.remove(&path);
             // Cached descendants must follow directory renames on bind mounts too.
@@ -300,7 +403,7 @@ impl PassthroughFs {
         }
         drop(inodes);
         if let Some(replaced) = replaced {
-            self.reap_owned_inode(replaced.inode);
+            self.reap_retained_inode(replaced.inode);
         }
     }
 }
