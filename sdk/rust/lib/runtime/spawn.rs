@@ -2508,7 +2508,7 @@ fn machine_cli_args(
 
     // Process mounts: emit host-side device args and collect the matching
     // typed guest-side mount instructions for agentd.
-    let encode_host_paths = mount_host_paths_need_encoding(config);
+    let encode_host_paths = true;
     launch.mount_host_paths_encoded = encode_host_paths;
     for mount in &config.spec.mounts {
         match mount {

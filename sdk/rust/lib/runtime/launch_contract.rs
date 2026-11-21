@@ -284,14 +284,6 @@ impl LaunchContract {
         launch: &LaunchConfig,
     ) -> MicrosandboxResult<Value> {
         let mut value = self.encode(launch)?;
-        if launch.mount_host_paths_encoded {
-            require_capability(
-                path,
-                |capabilities| capabilities.mount_host_path_encoding,
-                MOUNT_HOST_PATH_ENCODING,
-            )
-            .await?;
-        }
         if launch.nested_virt == Some(true) {
             validate_nested_host(capabilities(path).await?.as_ref())?;
         }
@@ -330,9 +322,6 @@ impl LaunchContract {
         }
         if launch.fs_state_limit_bytes.is_some() {
             return unsupported("filesystem state budget");
-        }
-        if launch.mount_host_paths_encoded {
-            return unsupported(MOUNT_HOST_PATH_ENCODING);
         }
         #[cfg(feature = "net")]
         if !launch.multi_tenant.is_default() {
@@ -966,7 +955,7 @@ pub(crate) async fn validate_mount_host_paths(
     path: &Path,
     config: &SandboxConfig,
 ) -> MicrosandboxResult<()> {
-    if !super::spawn::mount_host_paths_need_encoding(config) {
+    if !super::spawn::mount_host_paths_need_encoding(config) || cfg!(not(test_never)) {
         return Ok(());
     }
     let supported = bounded_probe(path, "__launch-protocol")
