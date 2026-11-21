@@ -395,7 +395,10 @@ impl PassthroughFs {
         // The override is read by path after the host operation; if it cannot
         // be read, the inode keeps its in-memory metadata, and the open file
         // is still pinned.
-        if let Ok(stat) = self.current_override(&metadata, data) {
+        let Ok(stat) = self.current_override(&metadata, data) else {
+            return false;
+        };
+        {
             *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
                 uid: stat.uid,
                 gid: stat.gid,
