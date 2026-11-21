@@ -710,6 +710,19 @@ jobs:
             a_lookup_inside_a_directory_rename_window_keeps_what_it_found `
             a_directory_rename_onto_stale_cached_children_finishes_them
 
+      - name: Test Windows filesystem names the host replaced
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} -- `
+            a_host_replace_gives_the_name_a_new_inode `
+            a_lookup_inside_the_rename_window_keeps_the_moved_inode `
+            a_host_directory_replace_does_not_keep_old_children `
+            a_lookup_racing_a_guest_rename_over_keeps_the_moved_inode `
+            a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination
+
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
