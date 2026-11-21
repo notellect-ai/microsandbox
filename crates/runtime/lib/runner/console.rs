@@ -375,10 +375,9 @@ impl AgentConsolePipeBridge {
         let pipe_name = pipe_name.into();
         let server = {
             let _guard = handle.enter();
-            ServerOptions::new()
-                .first_pipe_instance(true)
-                .pipe_mode(PipeMode::Byte)
-                .create(&pipe_name)?
+            let mut options = ServerOptions::new();
+            options.first_pipe_instance(true).pipe_mode(PipeMode::Byte);
+            super::create_shared_pipe(&options, &pipe_name)?
         };
 
         let task = handle.spawn(async move {

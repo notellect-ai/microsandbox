@@ -742,10 +742,11 @@ fn run(
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
-    // Before any pipe, mapping or event exists: an elevated runtime must stay reachable and
-    // stoppable by the same user's normal runs. Best effort; a failure only keeps the default.
-    if let Err(error) = microsandbox_utils::elevation_share::share_current_process_with_user() {
-        tracing::warn!(%error, "could not share runtime objects with non-elevated runs");
+    // An elevated runtime stays stoppable by the same account's non-elevated runs (its pipes
+    // are shared where they are created). Best effort; a failure only keeps the default.
+    #[cfg(windows)]
+    if let Err(error) = microsandbox_utils::elevation_share::protect_runtime_process() {
+        tracing::warn!(%error, "could not let non-elevated runs stop this runtime");
     }
 
     let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
