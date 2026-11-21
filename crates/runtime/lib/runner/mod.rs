@@ -35,8 +35,7 @@ pub(crate) fn create_shared_pipe(
     options: &tokio::net::windows::named_pipe::ServerOptions,
     name: impl AsRef<std::ffi::OsStr>,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    use microsandbox_utils::elevation_share::{SharedObject, shared_security};
-    match shared_security(SharedObject::Pipe) {
+    match microsandbox_utils::elevation_share::shared_pipe_security() {
         Ok(Some(mut security)) => unsafe {
             options.create_with_security_attributes_raw(name, security.as_ptr().cast())
         },

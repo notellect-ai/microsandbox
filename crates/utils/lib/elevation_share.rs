@@ -2,14 +2,18 @@
 //!
 //! With UAC, one account logs on with a split token: a filtered token (Medium integrity,
 //! BUILTIN\Administrators for deny only) and a full one (High integrity, Administrators
-//! enabled). Objects the full token creates without explicit security are owned by
-//! Administrators, and their default DACL or, for named pipes, the pipe default DACL grants
-//! Administrators, SYSTEM and the owner. The filtered token of the same account then cannot
-//! open the sandbox's pipes or the metrics registry, and cannot stop the runtime process.
+//! enabled). Named pipes the full token creates without explicit security are owned by
+//! Administrators, and the pipe default DACL grants full access only to SYSTEM,
+//! Administrators and that owner (everyone else gets read). The runtime process carries a
+//! High label. The filtered token of the same account then cannot connect to the sandbox's
+//! pipes and cannot stop the runtime process.
 //!
-//! This module gives only the objects a non-elevated run needs an explicit security
-//! descriptor that also grants the account's user SID, and makes the runtime process
-//! stoppable but nothing more. It never changes the process token's defaults. It acts only in
+//! Named objects that take the token default DACL, such as the metrics registry mapping,
+//! already work: in the session's object namespace that DACL grants the logon SID, which both
+//! halves of a split token share, and such objects carry no High label.
+//!
+//! This module gives the runtime's pipes an explicit security descriptor that also grants
+//! the account's user SID, and makes the runtime process stoppable but nothing more. It never changes the process token's defaults. It acts only in
 //! a process whose token is the full half of a split token (`TokenElevationTypeFull`), so it
 //! covers one account's elevated and non-elevated runs; over-the-shoulder elevation as a
 //! different account and non-UAC administrator tokens are left unchanged.
@@ -40,10 +44,6 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 /// can connect, read and write but cannot add a server instance of its own to the pipe.
 const USER_PIPE_RIGHTS: &str = "0x12019b";
 
-/// Mapping rights for the user: `SECTION_QUERY | SECTION_MAP_WRITE | SECTION_MAP_READ |
-/// READ_CONTROL`. No `WRITE_DAC`, `WRITE_OWNER` or `DELETE`.
-const USER_MAPPING_RIGHTS: &str = "0x20007";
-
 /// Process rights for the user and for the object's owner: check its identity, wait for it
 /// and stop it (`SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE`). Never
 /// memory, thread, handle or security access, which would let a Medium process take over the
@@ -53,15 +53,6 @@ const USER_PROCESS_RIGHTS: &str = "0x101001";
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
-
-/// A kind of object a non-elevated run of the same account must open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SharedObject {
-    /// A named pipe server a client connects to.
-    Pipe,
-    /// A named file mapping a client maps for reading and writing.
-    Mapping,
-}
 
 /// Security attributes for one object creation, owning their security descriptor.
 pub struct SharedSecurity {
@@ -103,12 +94,12 @@ impl Drop for Token {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Security attributes for creating `object` so that a non-elevated run of this account can
-/// open it, or `None` when this process is not the full half of a split token (then the
-/// default security already serves the same account).
-pub fn shared_security(object: SharedObject) -> io::Result<Option<SharedSecurity>> {
+/// Security attributes for creating a named pipe server instance that a non-elevated run of
+/// this account can connect to, or `None` when this process is not the full half of a split
+/// token (then the default security already serves the same account).
+pub fn shared_pipe_security() -> io::Result<Option<SharedSecurity>> {
     match split_elevated_user()? {
-        Some(user) => security_for_user(object, &user).map(Some),
+        Some(user) => pipe_security_for_user(&user).map(Some),
         None => Ok(None),
     }
 }
@@ -122,18 +113,15 @@ pub fn protect_runtime_process() -> io::Result<()> {
     }
 }
 
-/// The security attributes [`shared_security`] uses, for the user SID `user` (string form).
+/// The security attributes [`shared_pipe_security`] uses, for the user SID `user` (string
+/// form).
 ///
 /// Owner BUILTIN\Administrators; full access for SYSTEM and Administrators; the user gets
 /// only the rights a client needs.
 #[doc(hidden)]
-pub fn security_for_user(object: SharedObject, user: &str) -> io::Result<SharedSecurity> {
-    let rights = match object {
-        SharedObject::Pipe => USER_PIPE_RIGHTS,
-        SharedObject::Mapping => USER_MAPPING_RIGHTS,
-    };
+pub fn pipe_security_for_user(user: &str) -> io::Result<SharedSecurity> {
     let descriptor = descriptor(&format!(
-        "O:BAD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;{rights};;;{user})"
+        "O:BAD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;{USER_PIPE_RIGHTS};;;{user})"
     ))?;
     Ok(SharedSecurity {
         descriptor,
@@ -312,8 +300,6 @@ mod tests {
         PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_WRITE, TerminateProcess,
     };
 
-    use super::SharedObject;
-
     const CHILD_ENV: &str = "MSB_TEST_ELEVATION_SHARE_CHILD";
     /// What the child prints, followed by the pipe and mapping names, once they exist.
     const READY: &str = "elevation-share-child-ready";
@@ -409,7 +395,7 @@ mod tests {
     }
 
     /// Child half of `split_token_user_can_stop_but_not_take_over_the_runtime`: an emulated
-    /// elevated runtime with one shared pipe and one shared mapping.
+    /// elevated runtime with one shared pipe and one mapping created with default security.
     #[test]
     fn elevated_runtime_child() {
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -422,7 +408,7 @@ mod tests {
 
         let id = std::process::id();
         let pipe_name = format!(r"\\.\pipe\msb-elevation-share-test-{id}");
-        let mut pipe_security = super::security_for_user(SharedObject::Pipe, &user).unwrap();
+        let mut pipe_security = super::pipe_security_for_user(&user).unwrap();
         let pipe = unsafe {
             CreateNamedPipeW(
                 wide(&pipe_name).as_ptr(),
@@ -441,12 +427,12 @@ mod tests {
             "{}",
             std::io::Error::last_os_error()
         );
+        // Default security, as the metrics registry creates its mapping: no sharing needed.
         let mapping_name = format!("Local\\msb-elevation-share-test-{id}");
-        let mut mapping_security = super::security_for_user(SharedObject::Mapping, &user).unwrap();
         let mapping = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
-                mapping_security.as_ptr(),
+                null(),
                 PAGE_READWRITE,
                 0,
                 4096,
@@ -539,7 +525,8 @@ mod tests {
     }
 
     /// A non-elevated run of the same account (Administrators deny-only, Medium) can stop
-    /// the elevated runtime and open its shared pipe and mapping, but cannot get security,
+    /// the elevated runtime, open its shared pipe and open a mapping it created with default
+    /// security (as the metrics registry does), but cannot get security,
     /// ownership or memory access to the runtime process.
     #[test]
     fn split_token_user_can_stop_but_not_take_over_the_runtime() {
@@ -672,6 +659,6 @@ mod tests {
             "PROCESS_VM_WRITE on the elevated runtime process"
         );
         assert!(pipe.0, "open the shared pipe for read/write: {}", pipe.1);
-        assert!(mapping.0, "open the shared mapping: {}", mapping.1);
+        assert!(mapping.0, "open a default-security mapping: {}", mapping.1);
     }
 }

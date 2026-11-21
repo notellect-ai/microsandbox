@@ -28,16 +28,14 @@ use crate::layout::{
 use crate::snapshot::{LiveMetric, LiveMetricState};
 use crate::{GuestMemoryObservation, MetricsError, MetricsResult, guest_memory_clock};
 #[cfg(target_os = "windows")]
-use microsandbox_utils::elevation_share::SharedObject;
-#[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError,
     HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, FILE_MAP_WRITE,
-    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile, OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
@@ -1397,8 +1395,7 @@ fn open_existing_region(
     name: &std::ffi::CStr,
     map_len: usize,
 ) -> MetricsResult<Option<MappedRegion>> {
-    // Read and write only: a registry shared with non-elevated runs grants them no more.
-    open_existing_windows_region(name, map_len, FILE_MAP_READ | FILE_MAP_WRITE)
+    open_existing_windows_region(name, map_len, FILE_MAP_ALL_ACCESS)
 }
 
 #[cfg(target_os = "windows")]
@@ -1483,17 +1480,10 @@ pub(crate) fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsRes
 pub(crate) fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsResult<MappedRegion> {
     let name = windows_mapping_name(name)?;
     let max_size = map_len as u64;
-    // A non-elevated run of this account must open a registry an elevated run created.
-    // Best effort, like the registry: without it the mapping keeps the default security.
-    let mut security =
-        microsandbox_utils::elevation_share::shared_security(SharedObject::Mapping).unwrap_or(None);
-    let attributes = security
-        .as_mut()
-        .map_or(std::ptr::null(), |security| security.as_ptr().cast_const());
     let handle = unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
-            attributes,
+            std::ptr::null(),
             PAGE_READWRITE,
             (max_size >> 32) as u32,
             max_size as u32,
