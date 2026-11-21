@@ -266,6 +266,9 @@ impl PassthroughFs {
                 .open(path)
                 .map_err(host_error)?;
             reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
+            if !Self::holds_own_object(&data, &file) {
+                return Ok(None);
+            }
             return Ok(Some(PreparedOwnedUnlink {
                 data,
                 file,
@@ -280,6 +283,9 @@ impl PassthroughFs {
             .open(path)
             .map_err(host_error)?;
         reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
+        if !Self::holds_own_object(&data, &file) {
+            return Ok(None);
+        }
         let stat_file = self.pin_owned_stat(path, current)?;
         Ok(Some(PreparedOwnedUnlink {
             data,
@@ -289,28 +295,37 @@ impl PassthroughFs {
         }))
     }
 
+    /// The Host may have replaced the object at the inode's name since the
+    /// guest looked it up: pinning that one would give the inode another file.
+    fn holds_own_object(data: &InodeData, file: &File) -> bool {
+        data.identity
+            .is_none_or(|identity| mobility::file_identity(file).ok() == Some(identity))
+    }
+
     /// Called with the inode table locked, by the table update that drops
     /// the name: a lookup between the two would see a retained inode that
     /// still has its name, finish it as replaced by the Host and keep it
     /// (retained), and the update would then never reap it.
-    fn retain_owned_unlink(&self, prepared: Option<PreparedOwnedUnlink>) {
-        if let Some(PreparedOwnedUnlink {
+    fn retain_owned_unlink(&self, prepared: Option<PreparedOwnedUnlink>) -> Option<Arc<InodeData>> {
+        let Some(PreparedOwnedUnlink {
             data,
             file,
             stat,
             stat_file,
         }) = prepared
-        {
-            *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
-                uid: stat.uid,
-                gid: stat.gid,
-                mode: Some(stat.mode),
-                rdev: u64::from(stat.rdev),
-            };
-            *data.retained.lock().unwrap() = Some(file);
-            *data.retained_stat.lock().unwrap() = stat_file;
-            after_retain();
-        }
+        else {
+            return None;
+        };
+        *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
+            uid: stat.uid,
+            gid: stat.gid,
+            mode: Some(stat.mode),
+            rdev: u64::from(stat.rdev),
+        };
+        *data.retained.lock().unwrap() = Some(file);
+        *data.retained_stat.lock().unwrap() = stat_file;
+        after_retain();
+        Some(data)
     }
 
     pub(super) fn remove_inode_path(&self, path: &Path) {
@@ -321,11 +336,33 @@ impl PassthroughFs {
     /// the same table lock.
     fn finish_unlink_path(&self, path: &Path, retained: Option<PreparedOwnedUnlink>) {
         let mut inodes = self.inodes.write().unwrap();
-        self.retain_owned_unlink(retained);
-        if let Some(data) = inodes.by_path.remove(path) {
-            self.finish_removed_alias(&mut inodes, &data);
-            drop(inodes);
+        let pinned = self.retain_owned_unlink(retained);
+        let removed = inodes.by_path.remove(path);
+        if let Some(data) = &removed {
+            self.finish_removed_alias(&mut inodes, data);
+        }
+        Self::unpin_if_named(&inodes, pinned);
+        drop(inodes);
+        if let Some(data) = removed {
             self.reap_retained_inode(data.inode);
+        }
+    }
+
+    /// A lookup inside the window can give the prepared inode another name
+    /// (a hard link elsewhere) before the update runs: it is then not removed
+    /// by it, and keeps its name, so it must not stay retained.
+    fn unpin_if_named(inodes: &InodeTable, pinned: Option<Arc<InodeData>>) {
+        let Some(data) = pinned else {
+            return;
+        };
+        if let Some(path) = inodes
+            .by_path
+            .iter()
+            .find_map(|(path, alias)| Arc::ptr_eq(alias, &data).then(|| path.clone()))
+        {
+            *data.path.write().unwrap() = path;
+            *data.retained.lock().unwrap() = None;
+            *data.retained_stat.lock().unwrap() = None;
         }
     }
 
@@ -413,34 +450,51 @@ impl PassthroughFs {
             return;
         }
         let mut inodes = self.inodes.write().unwrap();
-        self.retain_owned_unlink(retained);
+        let pinned = self.retain_owned_unlink(retained);
         let mut replaced = inodes.by_path.remove(new_path);
-        let moved = inodes
-            .by_path
-            .iter()
-            .filter(|(path, _)| path.starts_with(old_path))
-            .map(|(path, data)| (path.clone(), data.clone()))
-            .collect::<Vec<_>>();
         // A lookup of the new name inside the window after the host rename
         // already gave it to the moved object (and finished the replaced
         // one): keep it there.
-        if moved.is_empty()
-            && let Some(data) = &replaced
+        if let Some(data) = &replaced
             && data.identity.is_some()
             && self.path_identity(new_path).ok().flatten() == data.identity
         {
             inodes.by_path.insert(new_path.to_path_buf(), data.clone());
             replaced = None;
         }
+        let moved = inodes
+            .by_path
+            .iter()
+            .filter(|(path, _)| path.starts_with(old_path))
+            .map(|(path, data)| (path.clone(), data.clone()))
+            .collect::<Vec<_>>();
+        // Inodes that lost a name to another: finished once the table is updated.
+        let mut displaced = Vec::new();
         for (path, data) in moved {
             inodes.by_path.remove(&path);
             // Cached descendants must follow directory renames on bind mounts too.
             // An unrelated destination inode keeps its retained pin.
-            let path = if path == old_path {
+            let target = if path == old_path {
                 new_path.to_path_buf()
             } else {
                 new_path.join(path.strip_prefix(old_path).expect("selected descendant"))
             };
+            // A lookup inside the window cached a name under the destination.
+            // If the Host has that cached object there (it replaced the moved
+            // descendant), the moved inode lost the name; otherwise the cached
+            // entry is stale.
+            if let Some(existing) = inodes.by_path.get(&target).cloned()
+                && !Arc::ptr_eq(&existing, &data)
+            {
+                if existing.identity.is_some()
+                    && self.path_identity(&target).ok().flatten() == existing.identity
+                {
+                    displaced.push(data);
+                    continue;
+                }
+                inodes.by_path.remove(&target);
+                displaced.push(existing);
+            }
             let canonical = data.path();
             if canonical == old_path {
                 *data.path.write().unwrap() = new_path.to_path_buf();
@@ -451,14 +505,16 @@ impl PassthroughFs {
                         .expect("selected descendant"),
                 );
             }
-            inodes.by_path.insert(path, data);
+            inodes.by_path.insert(target, data);
         }
-        if let Some(replaced) = &replaced {
-            self.finish_removed_alias(&mut inodes, replaced);
+        displaced.extend(replaced);
+        for data in &displaced {
+            self.finish_removed_alias(&mut inodes, data);
         }
+        Self::unpin_if_named(&inodes, pinned);
         drop(inodes);
-        if let Some(replaced) = replaced {
-            self.reap_retained_inode(replaced.inode);
+        for data in displaced {
+            self.reap_retained_inode(data.inode);
         }
     }
 }
