@@ -194,9 +194,15 @@ impl PassthroughFs {
     }
 
     pub(super) fn intern_path(&self, path: PathBuf) -> io::Result<Arc<InodeData>> {
-        let identity = self.path_identity(&path)?;
+        let mut identity = self.path_identity(&path)?;
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.by_path.get(&path).cloned() {
+            if identity.is_some() && data.identity.is_some() && data.identity != identity {
+                // The identity was read before the table lock: a guest rename
+                // may have finished since and given the name to the object it
+                // now holds. Read it again under the lock.
+                identity = self.path_identity(&path)?;
+            }
             if identity.is_none() || data.identity.is_none() || data.identity == identity {
                 // A cached alias (hard link) can outlive the canonical name.
                 if identity.is_some() && data.identity == identity {
