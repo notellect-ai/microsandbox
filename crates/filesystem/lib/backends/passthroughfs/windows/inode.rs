@@ -229,7 +229,7 @@ impl PassthroughFs {
             }
             // The mount root keeps its inode whatever the host did to it: the
             // guest cannot look it up again.
-            if data.inode == ROOT_INODE
+            if data.inode == u64::MAX
                 || identity.is_none()
                 || data.identity.is_none()
                 || data.identity == identity
