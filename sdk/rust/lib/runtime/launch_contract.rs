@@ -969,13 +969,9 @@ pub(crate) async fn validate_mount_host_paths(
     if !super::spawn::mount_host_paths_need_encoding(config) {
         return Ok(());
     }
-    let supported = bounded_probe(path, "__launch-protocol")
-        .await
-        .ok()
-        .and_then(|output| serde_json::from_slice::<LaunchCapabilities>(&output).ok())
-        .is_some_and(|capabilities| {
-            capabilities.protocols.contains(&2) && capabilities.mount_host_path_encoding
-        });
+    let supported = capabilities(path).await.is_ok_and(|capabilities| {
+        capabilities.protocols.contains(&2) && capabilities.mount_host_path_encoding
+    });
     if !supported {
         return Err(MicrosandboxError::unsupported(
             crate::error::Operation::SandboxStart,
