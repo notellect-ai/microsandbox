@@ -8,15 +8,17 @@
 //! High label. The filtered token of the same account then cannot connect to the sandbox's
 //! pipes and cannot stop the runtime process.
 //!
-//! Named objects that take the token default DACL, such as the metrics registry mapping,
-//! already work: in the session's object namespace that DACL grants the logon SID, which both
-//! halves of a split token share, and such objects carry no High label.
+//! Named kernel objects created without explicit security under a `Local\` name, such as the
+//! metrics registry mapping, already work: they inherit the session's BaseNamedObjects
+//! directory grant to the logon SID, which both halves of a split token share, and they carry
+//! no High label.
 //!
 //! This module gives the runtime's pipes an explicit security descriptor that also grants
-//! the account's user SID, and makes the runtime process stoppable but nothing more. It never changes the process token's defaults. It acts only in
-//! a process whose token is the full half of a split token (`TokenElevationTypeFull`), so it
-//! covers one account's elevated and non-elevated runs; over-the-shoulder elevation as a
-//! different account and non-UAC administrator tokens are left unchanged.
+//! the account's user SID, and makes the runtime process stoppable but nothing more. It never
+//! changes the process token's defaults. It acts only in a process whose token is the full
+//! half of a split token (`TokenElevationTypeFull`), so it covers one account's elevated and
+//! non-elevated runs; over-the-shoulder elevation as a different account and non-UAC
+//! administrator tokens are left unchanged.
 
 use std::ffi::c_void;
 use std::io;
@@ -118,8 +120,7 @@ pub fn protect_runtime_process() -> io::Result<()> {
 ///
 /// Owner BUILTIN\Administrators; full access for SYSTEM and Administrators; the user gets
 /// only the rights a client needs.
-#[doc(hidden)]
-pub fn pipe_security_for_user(user: &str) -> io::Result<SharedSecurity> {
+fn pipe_security_for_user(user: &str) -> io::Result<SharedSecurity> {
     let descriptor = descriptor(&format!(
         "O:BAD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;{USER_PIPE_RIGHTS};;;{user})"
     ))?;
@@ -141,8 +142,7 @@ pub fn pipe_security_for_user(user: &str) -> io::Result<SharedSecurity> {
 /// High-labelled process for termination at all). The owner is reset because whoever owns a
 /// process object holds implicit `WRITE_DAC`, which the Medium label no longer blocks; the
 /// OWNER RIGHTS entry removes that implicit right from any owner.
-#[doc(hidden)]
-pub fn protect_process_for_user(user: &str) -> io::Result<()> {
+fn protect_process_for_user(user: &str) -> io::Result<()> {
     let sd = descriptor(&format!(
         "O:BAD:(A;;{USER_PROCESS_RIGHTS};;;{user})(A;;{USER_PROCESS_RIGHTS};;;OW)\
          (A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NWNR;;;ME)"
@@ -180,14 +180,12 @@ fn apply_process_security(sd: PSECURITY_DESCRIPTOR) -> io::Result<()> {
 }
 
 /// The string user SID of this process's token.
-#[doc(hidden)]
-pub fn current_user_sid() -> io::Result<String> {
+fn current_user_sid() -> io::Result<String> {
     user_sid_string(&open_token()?)
 }
 
 /// This process's `TOKEN_ELEVATION_TYPE` (1 default, 2 full, 3 limited).
-#[doc(hidden)]
-pub fn elevation_type() -> io::Result<TOKEN_ELEVATION_TYPE> {
+fn elevation_type() -> io::Result<TOKEN_ELEVATION_TYPE> {
     let token = open_token()?;
     let mut kind: TOKEN_ELEVATION_TYPE = 0;
     let mut length = 0;
@@ -286,9 +284,10 @@ mod tests {
         ConvertStringSidToSidW, SE_KERNEL_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
-        CreateRestrictedToken, ImpersonateLoggedOnUser, OWNER_SECURITY_INFORMATION, RevertToSelf,
-        SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
-        TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
+        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser,
+        OWNER_SECURITY_INFORMATION, RevertToSelf, SID_AND_ATTRIBUTES, SetTokenInformation,
+        TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenIntegrityLevel,
     };
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX};
     use windows_sys::Win32::System::Memory::{
@@ -297,14 +296,19 @@ mod tests {
     use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_WRITE, TerminateProcess,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
     };
 
     const CHILD_ENV: &str = "MSB_TEST_ELEVATION_SHARE_CHILD";
     /// What the child prints, followed by the pipe and mapping names, once they exist.
     const READY: &str = "elevation-share-child-ready";
-    const WRITE_DAC: u32 = 0x0004_0000;
-    const WRITE_OWNER: u32 = 0x0008_0000;
+    /// What the filtered token may open the runtime process for, and nothing else:
+    /// `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE`.
+    const ALLOWED_PROCESS_RIGHTS: u32 = 0x0010_1001;
+    /// Every specific process right (bits 0-15), every standard right (`DELETE`,
+    /// `READ_CONTROL`, `WRITE_DAC`, `WRITE_OWNER`, `SYNCHRONIZE`) and `ACCESS_SYSTEM_SECURITY`.
+    /// Generic bits map onto these, and `MAXIMUM_ALLOWED` is not a right.
+    const PROBED_PROCESS_RIGHTS: u32 = 0x011f_ffff;
     /// The child is killed, and the test fails, if the parent has not finished by then.
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -477,7 +481,7 @@ mod tests {
             unsafe {
                 CreateRestrictedToken(
                     token,
-                    0,
+                    DISABLE_MAX_PRIVILEGE,
                     1,
                     &administrators,
                     0,
@@ -592,9 +596,12 @@ mod tests {
                 pid,
                 PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
             );
-            let write_dac = can_open_process(pid, WRITE_DAC);
-            let write_owner = can_open_process(pid, WRITE_OWNER);
-            let vm_write = can_open_process(pid, PROCESS_VM_WRITE);
+            // Each right on its own: the union of those that open is what the caller can get.
+            let granted = (0..32)
+                .map(|bit| 1u32 << bit)
+                .filter(|&right| PROBED_PROCESS_RIGHTS & right != 0)
+                .filter(|&right| can_open_process(pid, right))
+                .fold(0, |granted, right| granted | right);
             let pipe = unsafe {
                 CreateFileW(
                     wide(&pipe_name).as_ptr(),
@@ -627,9 +634,7 @@ mod tests {
             assert_ne!(unsafe { RevertToSelf() }, 0);
             (
                 stop,
-                write_dac,
-                write_owner,
-                vm_write,
+                granted,
                 (pipe_ok, pipe_error.to_string()),
                 (mapping_ok, mapping_error.to_string()),
             )
@@ -645,18 +650,14 @@ mod tests {
         unsafe { CloseHandle(watchdog_target as HANDLE) };
         assert!(!killed, "the test did not finish within {DEADLINE:?}");
 
-        let (stop, write_dac, write_owner, vm_write, pipe, mapping) = results;
-        println!(
-            "stop={stop} write_dac={write_dac} write_owner={write_owner} vm_write={vm_write} \
-             pipe={pipe:?} mapping={mapping:?}"
-        );
+        let (stop, granted, pipe, mapping) = results;
+        println!("stop={stop} granted={granted:#010x} pipe={pipe:?} mapping={mapping:?}");
         assert!(status.success(), "child failed: {status}");
         assert!(stop, "a non-elevated run must be able to stop the runtime");
-        assert!(!write_dac, "WRITE_DAC on the elevated runtime process");
-        assert!(!write_owner, "WRITE_OWNER on the elevated runtime process");
-        assert!(
-            !vm_write,
-            "PROCESS_VM_WRITE on the elevated runtime process"
+        assert_eq!(
+            granted, ALLOWED_PROCESS_RIGHTS,
+            "process rights a non-elevated run gets on the elevated runtime \
+             (granted {granted:#010x}, expected {ALLOWED_PROCESS_RIGHTS:#010x})"
         );
         assert!(pipe.0, "open the shared pipe for read/write: {}", pipe.1);
         assert!(mapping.0, "open a default-security mapping: {}", mapping.1);
