@@ -665,9 +665,13 @@ impl MountBuilder {
                 host_permissions,
             },
             MountKind::Bind(host) => {
-                // The spawn → VM wire format percent-encodes the host
-                // path, so `,`, `;` and `:` cannot inject options.
-                validate_host_path_utf8(&host, "bind host path")?;
+                // The spawn → VM wire format encodes mount specs as
+                // `tag:host[:opts]`. Embedded separators in the host
+                // path would collide with that grammar and could
+                // silently inject policy options. Reject at the SDK
+                // boundary so callers get a clear error. Windows drive
+                // prefixes are the one allowed colon shape.
+                validate_host_path_wire_safe(&host, "bind host path")?;
                 VolumeMount::Bind {
                     host,
                     guest: self.guest,
@@ -1317,7 +1321,7 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
             host_permissions,
             ..
         } => {
-            validate_host_path_utf8(host, "bind host path")?;
+            validate_host_path_wire_safe(host, "bind host path")?;
             validate_virtiofs_policies(*stat_virtualization, *host_permissions, options)?;
         }
         VolumeMount::Named {
@@ -1356,16 +1360,6 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
                 validate_fstype(fstype)?;
             }
         }
-    }
-    Ok(())
-}
-
-/// A bind host path travels percent-encoded, so it only needs to be UTF-8.
-fn validate_host_path_utf8(path: &Path, label: &str) -> crate::MicrosandboxResult<()> {
-    if path.to_str().is_none() {
-        return Err(crate::MicrosandboxError::InvalidConfig(format!(
-            "{label} must be valid UTF-8"
-        )));
     }
     Ok(())
 }
