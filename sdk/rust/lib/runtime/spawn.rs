@@ -1976,7 +1976,16 @@ fn resolve_file_mounts(
         // the name travels in agentd's `tag:filename:guest` list, and guest
         // paths are already free of that list's separators while host file
         // names may contain them.
-        let filename = file_mount_export_name(guest)?;
+        let filename = host
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                MicrosandboxError::InvalidConfig(format!(
+                    "file mount has no valid UTF-8 filename: {}",
+                    host.display()
+                ))
+            })?
+            .to_string();
         file_mounts.insert(guest.clone(), (filename, guest_mount_tag(guest)));
     }
     Ok(file_mounts)
@@ -2055,11 +2064,8 @@ fn push_dir_mount_arg_with_tag(
 /// A mount spec's host path: percent-encoded when the launch encodes host
 /// paths, as written otherwise.
 fn wire_host_path(host: String, encode: bool) -> String {
-    if encode {
-        microsandbox_utils::encode_mount_host_path(&host)
-    } else {
-        host
-    }
+    let _ = encode;
+    host
 }
 
 /// Whether this launch must percent-encode mount host paths: only when a bind
