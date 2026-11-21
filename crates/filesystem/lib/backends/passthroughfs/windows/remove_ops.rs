@@ -410,12 +410,6 @@ impl PassthroughFs {
         };
         // A handle opened by path after the host rename holds the replacing
         // file; pinning it would alias the old inode to the new object.
-        if data
-            .identity
-            .is_some_and(|identity| mobility::file_identity(&file).ok() != Some(identity))
-        {
-            return false;
-        }
         let Ok(metadata) = file.metadata() else {
             return false;
         };
