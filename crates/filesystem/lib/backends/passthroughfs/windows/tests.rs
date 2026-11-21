@@ -4183,6 +4183,112 @@ fn a_host_directory_move_onto_stale_cached_children_finishes_them() {
     assert_matrix_tables(&fs, "host directory move onto stale children", true);
 }
 
+/// Sets up `a_host_directory_move_onto_stale_cached_children_finishes_them`
+/// with the stale `e/c` open in the guest: returns the moved and stale inodes
+/// and the guest's handle on the stale one, with `d` now at `e` on the Host.
+fn stale_children_with_open_handle(temp: &TempDir, owned: bool) -> (PassthroughFs, u64, u64, u64) {
+    for (path, contents) in [("d/c", "moved"), ("e/c", "stale")] {
+        std::fs::create_dir_all(temp.path.join(path).parent().unwrap()).unwrap();
+        std::fs::write(temp.path.join(path), contents).unwrap();
+    }
+    let fs = if owned {
+        owned_fs_for(&temp.path, crate::OwnedDirectoryCheckpoint::default())
+    } else {
+        fs_for(&temp.path)
+    };
+    let moved = matrix_lookup(&fs, "d/c").unwrap().inode;
+    let stale = matrix_lookup(&fs, "e/c").unwrap().inode;
+    let (handle, _) = fs
+        .open(context(), stale, false, LINUX_O_RDWR as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+    std::fs::remove_file(temp.path.join("e/c")).unwrap();
+    fs.rmdir(context(), ROOT_INODE, c"e").unwrap();
+    std::fs::rename(temp.path.join("d"), temp.path.join("e")).unwrap();
+    (fs, moved, stale, handle)
+}
+
+/// The stale child is still open when the move takes its name: it is kept
+/// (retained) without a name, its handle reads and writes, and closing it
+/// leaves nothing behind.
+#[test]
+fn a_stale_child_open_in_the_guest_is_retained_when_a_host_move_takes_its_name() {
+    for owned in [false, true] {
+        let temp = TempDir::new();
+        let (fs, moved, stale, handle) = stale_children_with_open_handle(&temp, owned);
+        matrix_lookup(&fs, "e").unwrap();
+        assert_eq!(matrix_lookup(&fs, "e/c").unwrap().inode, moved);
+        {
+            let inodes = fs.inodes.read().unwrap();
+            let data = inodes
+                .by_inode
+                .get(&stale)
+                .unwrap_or_else(|| panic!("owned {owned}: the open stale child was dropped"));
+            assert!(
+                data.retained.lock().unwrap().is_some(),
+                "owned {owned}: the open stale child is not retained"
+            );
+            assert!(
+                !inodes.by_path.values().any(|alias| alias.inode == stale),
+                "owned {owned}: the stale child kept a name"
+            );
+        }
+        assert_matrix_tables(&fs, "open stale child", false);
+        assert_eq!(read_all(&fs, stale, handle).unwrap(), b"stale");
+        let mut reader = SourceReader {
+            bytes: b"STALE".to_vec(),
+            pos: 0,
+        };
+        let written = fs
+            .write(
+                context(),
+                stale,
+                handle,
+                &mut reader,
+                5,
+                0,
+                None,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(read_all(&fs, stale, handle).unwrap(), b"STALE");
+        fs.release(context(), stale, 0, handle, false, false, None)
+            .unwrap();
+        fs.forget(context(), stale, 1);
+        assert!(
+            !fs.inodes.read().unwrap().by_inode.contains_key(&stale),
+            "owned {owned}: the closed stale child is still tracked"
+        );
+        assert_matrix_tables(&fs, "closed stale child", true);
+        assert_eq!(std::fs::read(temp.path.join("e/c")).unwrap(), b"moved");
+    }
+}
+
+/// The other order: the guest closes the stale child before the lookup that
+/// follows the move (the move's update runs under the table lock, so a
+/// release lands either before it or after it). The stale inode is dropped
+/// by the update itself.
+#[test]
+fn a_stale_child_closed_before_a_host_move_takes_its_name_is_dropped() {
+    for owned in [false, true] {
+        let temp = TempDir::new();
+        let (fs, moved, stale, handle) = stale_children_with_open_handle(&temp, owned);
+        fs.release(context(), stale, 0, handle, false, false, None)
+            .unwrap();
+        matrix_lookup(&fs, "e").unwrap();
+        assert_eq!(matrix_lookup(&fs, "e/c").unwrap().inode, moved);
+        assert!(
+            !fs.inodes.read().unwrap().by_inode.contains_key(&stale),
+            "owned {owned}: the closed stale child is still tracked"
+        );
+        fs.forget(context(), stale, 1);
+        assert_matrix_tables(&fs, "stale child closed first", true);
+    }
+}
+
 /// A Host process holding a file open without FILE_SHARE_DELETE makes the
 /// guest's unlink and rename fail. The failure must leave everything as it
 /// was: the names, their inodes, the guest's open handle and the contents.
