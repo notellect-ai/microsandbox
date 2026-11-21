@@ -3853,8 +3853,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
             "mount options must use tag:host_path:opts syntax, got comma in host path {host_path:?}"
         ));
     }
-    // Spawn percent-encodes the host path so it may contain `,`, `;` and `:`.
-    let host_path = microsandbox_utils::decode_mount_host_path(host_path)?;
+    let host_path = host_path.to_string();
 
     let mut stat_virtualization = StatVirtualization::Strict;
     let mut host_permissions = HostPermissions::Private;
