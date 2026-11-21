@@ -3855,6 +3855,8 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
             "mount options must use tag:host_path:opts syntax, got comma in host path {host_path:?}"
         ));
     }
+    // Spawn percent-encodes the host path so it may contain `,`, `;` and `:`.
+    let host_path = microsandbox_utils::decode_mount_host_path(host_path)?;
 
     let mut stat_virtualization = StatVirtualization::Strict;
     let mut host_permissions = HostPermissions::Private;
@@ -4853,6 +4855,36 @@ mod tests {
         assert!(!p.readonly);
         assert_eq!(p.override_uid, None);
         assert_eq!(p.override_gid, None);
+    }
+
+    #[test]
+    fn test_parse_mount_spec_decodes_wire_separators_in_host_path() {
+        for host in [
+            "/Users/a/Smith, John",
+            "/data/a;b:c",
+            r"C:\Users\用户\a,b;c",
+        ] {
+            let spec = format!(
+                "fm:{}:ro,stat-virt=strict",
+                microsandbox_utils::encode_mount_host_path(host)
+            );
+            let p = parse_mount_spec(&spec).unwrap();
+            assert_eq!(p.host_path, host);
+            assert!(p.readonly);
+            let p = parse_mount_spec(&format!(
+                "fm:{}",
+                microsandbox_utils::encode_mount_host_path(host)
+            ))
+            .unwrap();
+            assert_eq!(p.host_path, host);
+            assert!(!p.readonly);
+        }
+        // A comma in a host path must not be able to inject options.
+        let injected = microsandbox_utils::encode_mount_host_path("/data/x:rw,stat-virt=off");
+        let p = parse_mount_spec(&format!("fm:{injected}:ro")).unwrap();
+        assert_eq!(p.host_path, "/data/x:rw,stat-virt=off");
+        assert!(p.readonly);
+        assert!(matches!(p.stat_virtualization, StatVirtualization::Strict));
     }
 
     #[test]
