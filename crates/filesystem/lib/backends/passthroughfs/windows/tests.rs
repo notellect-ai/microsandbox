@@ -4287,3 +4287,475 @@ fn a_host_directory_replace_does_not_keep_old_children() {
         }
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Concurrency matrix: guest {unlink, rename-over, directory rename} x Host {replace, delete,
+// rename} x racing guest {lookup, open, release+forget, readdir}, each landing in every window of
+// the guest operation: after the host change and before the inode table follows it, and (for
+// operations that retain an open removed file) right after the retain mark, which is taken under
+// the table lock. Every cell checks the tables for leaked or dangling inodes, that racing calls
+// fail only with ESTALE or ENOENT, that an opened inode reads its own file, and that every name
+// afterwards reaches the object the Host has there.
+//--------------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MatrixGuest {
+    Unlink,
+    RenameOver,
+    RenameDir,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MatrixHost {
+    Replace,
+    Delete,
+    Rename,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MatrixRacer {
+    Lookup,
+    Open,
+    ReleaseForget,
+    Readdir,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MatrixWindow {
+    AfterHostChange,
+    AfterRetain,
+}
+
+/// How long a window waits for a racing call that may be blocked on the
+/// table lock the guest operation holds.
+const MATRIX_RACER_WAIT: Duration = Duration::from_millis(100);
+
+struct MatrixSetup {
+    /// The guest's open handle on the object the operation removes or moves.
+    held: (u64, u64),
+    /// Inodes the guest has cached, with the contents of their own file
+    /// (`None` for a directory).
+    cached: Vec<(u64, Option<&'static [u8]>)>,
+    /// Paths the guest looks up while racing and that are checked at the end.
+    paths: &'static [&'static str],
+    /// Directory inodes the racing readdir lists besides the root.
+    dirs: Vec<u64>,
+}
+
+fn matrix_errno_allowed(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(LINUX_ESTALE) | Some(LINUX_ENOENT)
+    )
+}
+
+/// Look up a relative path component by component.
+fn matrix_lookup(fs: &PassthroughFs, path: &str) -> io::Result<Entry> {
+    let mut parent = ROOT_INODE;
+    let mut entry = None;
+    for name in path.split('/') {
+        let name = std::ffi::CString::new(name).unwrap();
+        let found = fs.lookup(context(), parent, &name)?;
+        parent = found.inode;
+        entry = Some(found);
+    }
+    Ok(entry.expect("non-empty path"))
+}
+
+fn matrix_setup(fs: &PassthroughFs, root: &Path, guest: MatrixGuest) -> MatrixSetup {
+    match guest {
+        MatrixGuest::Unlink => {
+            let (data, held) = create_with(fs, context(), c"data", 0o644, b"old");
+            let (other, handle) = create_with(fs, context(), c"other", 0o644, b"other");
+            fs.release(context(), other, 0, handle, false, false, None)
+                .unwrap();
+            MatrixSetup {
+                held: (data, held),
+                cached: vec![(data, Some(b"old")), (other, Some(b"other"))],
+                paths: &["data", "other"],
+                dirs: Vec::new(),
+            }
+        }
+        MatrixGuest::RenameOver => {
+            let (data, held) = create_with(fs, context(), c"data", 0o644, b"old");
+            let (tmp, handle) = create_with(fs, context(), c"tmp", 0o644, b"new");
+            fs.release(context(), tmp, 0, handle, false, false, None)
+                .unwrap();
+            MatrixSetup {
+                held: (data, held),
+                cached: vec![(data, Some(b"old")), (tmp, Some(b"new"))],
+                paths: &["data", "tmp", "moved"],
+                dirs: Vec::new(),
+            }
+        }
+        MatrixGuest::RenameDir => {
+            std::fs::create_dir(root.join("dir")).unwrap();
+            std::fs::write(root.join("dir").join("child"), b"child").unwrap();
+            let dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
+            let child = fs.lookup(context(), dir, c"child").unwrap().inode;
+            let (handle, _) = fs.open(context(), child, false, 0).unwrap();
+            MatrixSetup {
+                held: (child, handle.unwrap()),
+                cached: vec![(dir, None), (child, Some(b"child"))],
+                paths: &[
+                    "dir",
+                    "dir2",
+                    "dir3",
+                    "dir/child",
+                    "dir2/child",
+                    "dir3/child",
+                ],
+                dirs: vec![dir],
+            }
+        }
+    }
+}
+
+fn matrix_guest_op(fs: &PassthroughFs, guest: MatrixGuest) {
+    match guest {
+        MatrixGuest::Unlink => fs.unlink(context(), ROOT_INODE, c"data").unwrap(),
+        MatrixGuest::RenameOver => fs
+            .rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap(),
+        MatrixGuest::RenameDir => fs
+            .rename(context(), ROOT_INODE, c"dir", ROOT_INODE, c"dir2", 0)
+            .unwrap(),
+    }
+}
+
+/// A Host process acting inside the window, on the names the guest
+/// operation just changed.
+fn matrix_host_op(root: &Path, guest: MatrixGuest, host: MatrixHost) {
+    let save = |target: &Path| {
+        let tmp = target.with_file_name("host.tmp");
+        std::fs::write(&tmp, b"host").unwrap();
+        std::fs::rename(&tmp, target).unwrap();
+    };
+    match (guest, host) {
+        // The guest removed `data`: the Host saves a new one, deletes the
+        // sibling, or moves the sibling onto the free name.
+        (MatrixGuest::Unlink, MatrixHost::Replace) => save(&root.join("data")),
+        (MatrixGuest::Unlink, MatrixHost::Delete) => {
+            std::fs::remove_file(root.join("other")).unwrap()
+        }
+        (MatrixGuest::Unlink, MatrixHost::Rename) => {
+            std::fs::rename(root.join("other"), root.join("data")).unwrap()
+        }
+        // `data` now holds the moved file.
+        (MatrixGuest::RenameOver, MatrixHost::Replace) => save(&root.join("data")),
+        (MatrixGuest::RenameOver, MatrixHost::Delete) => {
+            std::fs::remove_file(root.join("data")).unwrap()
+        }
+        (MatrixGuest::RenameOver, MatrixHost::Rename) => {
+            std::fs::rename(root.join("data"), root.join("moved")).unwrap()
+        }
+        // `dir2` is the moved directory with its cached child.
+        (MatrixGuest::RenameDir, MatrixHost::Replace) => save(&root.join("dir2").join("child")),
+        (MatrixGuest::RenameDir, MatrixHost::Delete) => {
+            std::fs::remove_file(root.join("dir2").join("child")).unwrap()
+        }
+        (MatrixGuest::RenameDir, MatrixHost::Rename) => {
+            std::fs::rename(root.join("dir2"), root.join("dir3")).unwrap()
+        }
+    }
+}
+
+struct MatrixRace<'a> {
+    fs: &'a PassthroughFs,
+    setup: &'a MatrixSetup,
+    held_released: &'a AtomicBool,
+    opened: &'a Mutex<Vec<(u64, u64)>>,
+    cell: &'a str,
+}
+
+impl MatrixRace<'_> {
+    fn check<T>(&self, call: &str, result: io::Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) if matrix_errno_allowed(&error) => None,
+            Err(error) => panic!("{}: {call} failed with {error}", self.cell),
+        }
+    }
+
+    fn run(&self, racer: MatrixRacer) {
+        let fs = self.fs;
+        match racer {
+            MatrixRacer::Lookup => {
+                for path in self.setup.paths {
+                    self.check(&format!("lookup {path}"), matrix_lookup(fs, path));
+                }
+            }
+            MatrixRacer::Open => {
+                for &(inode, contents) in &self.setup.cached {
+                    let Some(contents) = contents else { continue };
+                    let Some((handle, _)) = self.check(
+                        &format!("open inode {inode}"),
+                        fs.open(context(), inode, false, 0),
+                    ) else {
+                        continue;
+                    };
+                    let handle = handle.unwrap();
+                    self.opened.lock().unwrap().push((inode, handle));
+                    let bytes =
+                        self.check(&format!("read inode {inode}"), read_all(fs, inode, handle));
+                    if let Some(bytes) = bytes {
+                        assert_eq!(
+                            bytes, contents,
+                            "{}: inode {inode} read another file",
+                            self.cell
+                        );
+                    }
+                }
+            }
+            MatrixRacer::ReleaseForget => {
+                let (inode, handle) = self.setup.held;
+                fs.release(context(), inode, 0, handle, false, false, None)
+                    .unwrap();
+                self.held_released.store(true, Ordering::Release);
+                fs.forget(context(), inode, 1);
+            }
+            MatrixRacer::Readdir => {
+                for &dir in std::iter::once(&ROOT_INODE).chain(&self.setup.dirs) {
+                    let Some((handle, _)) = self.check(
+                        &format!("opendir {dir}"),
+                        fs.opendir(context(), dir, LINUX_O_DIRECTORY as u32),
+                    ) else {
+                        continue;
+                    };
+                    let handle = handle.unwrap();
+                    self.check(
+                        &format!("readdirplus {dir}"),
+                        fs.readdirplus(context(), dir, handle, 4096, 0),
+                    );
+                    fs.releasedir(context(), dir, 0, handle).unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// Every name and identity points at a tracked inode, and every tracked
+/// inode has a name or is a retained removed file the guest can still reach.
+/// With `quiesced`, nothing in the guest holds anything any more: no inode
+/// may be retained.
+fn assert_matrix_tables(fs: &PassthroughFs, cell: &str, quiesced: bool) {
+    let inodes = fs.inodes.read().unwrap();
+    for (path, data) in &inodes.by_path {
+        assert!(
+            inodes
+                .by_inode
+                .get(&data.inode)
+                .is_some_and(|tracked| Arc::ptr_eq(tracked, data)),
+            "{cell}: {path:?} names untracked inode {}",
+            data.inode
+        );
+    }
+    for (identity, data) in &inodes.by_identity {
+        assert!(
+            inodes
+                .by_inode
+                .get(&data.inode)
+                .is_some_and(|tracked| Arc::ptr_eq(tracked, data)),
+            "{cell}: identity {identity:?} points at untracked inode {}",
+            data.inode
+        );
+        assert_eq!(
+            data.identity,
+            Some(*identity),
+            "{cell}: inode {}",
+            data.inode
+        );
+    }
+    for (&inode, data) in &inodes.by_inode {
+        if inode == ROOT_INODE {
+            continue;
+        }
+        let named = inodes
+            .by_path
+            .values()
+            .any(|alias| Arc::ptr_eq(alias, data));
+        let retained = data.retained.lock().unwrap().is_some();
+        let reachable = fs.has_open_handle(inode) || data.lookups.load(Ordering::Acquire) != 0;
+        assert!(
+            !(named && retained),
+            "{cell}: inode {inode} is retained but named"
+        );
+        assert!(
+            named || (retained && reachable && !quiesced),
+            "{cell}: inode {inode} leaked (named {named}, retained {retained}, \
+             reachable {reachable})"
+        );
+    }
+}
+
+fn run_matrix_cell(
+    guest: MatrixGuest,
+    host: MatrixHost,
+    racer: MatrixRacer,
+    window: MatrixWindow,
+    owned: bool,
+) {
+    let cell = format!("{guest:?} x Host {host:?} x {racer:?} in {window:?} (owned {owned})");
+    let temp = TempDir::new();
+    let fs = if owned {
+        owned_fs_for(&temp.path, crate::OwnedDirectoryCheckpoint::default())
+    } else {
+        fs_for(&temp.path)
+    };
+    let setup = matrix_setup(&fs, &temp.path, guest);
+    let held_released = AtomicBool::new(false);
+    let opened = Mutex::new(Vec::new());
+
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (host_done_tx, host_done_rx) = std::sync::mpsc::channel::<()>();
+    let (racer_done_tx, racer_done_rx) = std::sync::mpsc::channel::<()>();
+    let fired = Arc::new(AtomicBool::new(false));
+    let hook: Box<dyn FnOnce()> = {
+        let fired = fired.clone();
+        Box::new(move || {
+            fired.store(true, Ordering::Release);
+            go_tx.send(()).unwrap();
+            host_done_rx
+                .recv_timeout(STEP_LIMIT)
+                .expect("Host change inside the window");
+            // A racing call may wait for the table lock the operation holds.
+            let _ = racer_done_rx.recv_timeout(MATRIX_RACER_WAIT);
+        })
+    };
+    match (window, guest) {
+        (MatrixWindow::AfterHostChange, MatrixGuest::Unlink) => {
+            remove_ops::AFTER_HOST_UNLINK.with(|slot| *slot.borrow_mut() = Some(hook))
+        }
+        (MatrixWindow::AfterHostChange, _) => {
+            remove_ops::AFTER_HOST_RENAME.with(|slot| *slot.borrow_mut() = Some(hook))
+        }
+        (MatrixWindow::AfterRetain, _) => {
+            remove_ops::AFTER_RETAIN.with(|slot| *slot.borrow_mut() = Some(hook))
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let race = MatrixRace {
+            fs: &fs,
+            setup: &setup,
+            held_released: &held_released,
+            opened: &opened,
+            cell: &cell,
+        };
+        let racer_thread = scope.spawn(move || {
+            let go_rx = go_rx;
+            if go_rx.recv_timeout(STEP_LIMIT).is_err() {
+                return; // The window was not reached; reported below.
+            }
+            matrix_host_op(&temp.path, guest, host);
+            host_done_tx.send(()).unwrap();
+            race.run(racer);
+            let _ = racer_done_tx.send(());
+        });
+        matrix_guest_op(&fs, guest);
+        racer_thread.join().unwrap();
+    });
+    remove_ops::AFTER_HOST_UNLINK.with(|slot| slot.borrow_mut().take());
+    remove_ops::AFTER_HOST_RENAME.with(|slot| slot.borrow_mut().take());
+    remove_ops::AFTER_RETAIN.with(|slot| slot.borrow_mut().take());
+    assert!(
+        fired.load(Ordering::Acquire),
+        "{cell}: the window was never reached"
+    );
+    assert_matrix_tables(&fs, &cell, false);
+
+    // The guest lets go of everything: its handles and its lookups.
+    if !held_released.load(Ordering::Acquire) {
+        let (inode, handle) = setup.held;
+        fs.release(context(), inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+    for (inode, handle) in opened.into_inner().unwrap() {
+        fs.release(context(), inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+    let lookups = fs
+        .inodes
+        .read()
+        .unwrap()
+        .by_inode
+        .values()
+        .map(|data| (data.inode, data.lookups.load(Ordering::Acquire)))
+        .collect::<Vec<_>>();
+    for (inode, count) in lookups {
+        if count != 0 {
+            fs.forget(context(), inode, count);
+        }
+    }
+    assert_matrix_tables(&fs, &cell, true);
+
+    // Every name reaches the object the Host has there.
+    for path in setup.paths {
+        let host_path = path
+            .split('/')
+            .fold(temp.path.clone(), |full, name| full.join(name));
+        match matrix_lookup(&fs, path) {
+            Ok(entry) if host_path.is_file() => {
+                let (handle, _) = fs.open(context(), entry.inode, false, 0).unwrap();
+                let handle = handle.unwrap();
+                assert_eq!(
+                    read_all(&fs, entry.inode, handle).unwrap(),
+                    std::fs::read(&host_path).unwrap(),
+                    "{cell}: {path} reads another file"
+                );
+                fs.release(context(), entry.inode, 0, handle, false, false, None)
+                    .unwrap();
+            }
+            Ok(_) => assert!(
+                host_path.is_dir(),
+                "{cell}: {path} found but gone on the Host"
+            ),
+            Err(error) => {
+                assert!(
+                    !host_path.exists(),
+                    "{cell}: {path} exists on the Host: {error}"
+                );
+                assert_eq!(error.raw_os_error(), Some(LINUX_ENOENT), "{cell}: {path}");
+            }
+        }
+    }
+    assert_matrix_tables(&fs, &cell, true);
+}
+
+fn run_matrix(guest: MatrixGuest) {
+    let _deadline = Deadline::start("concurrency matrix", SCOPE_LIMIT);
+    let windows: &[MatrixWindow] = match guest {
+        // A directory rename retains nothing.
+        MatrixGuest::RenameDir => &[MatrixWindow::AfterHostChange],
+        _ => &[MatrixWindow::AfterHostChange, MatrixWindow::AfterRetain],
+    };
+    for owned in [false, true] {
+        for &window in windows {
+            for host in [MatrixHost::Replace, MatrixHost::Delete, MatrixHost::Rename] {
+                for racer in [
+                    MatrixRacer::Lookup,
+                    MatrixRacer::Open,
+                    MatrixRacer::ReleaseForget,
+                    MatrixRacer::Readdir,
+                ] {
+                    run_matrix_cell(guest, host, racer, window, owned);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matrix_guest_unlink_races() {
+    run_matrix(MatrixGuest::Unlink);
+}
+
+#[test]
+fn matrix_guest_rename_over_races() {
+    run_matrix(MatrixGuest::RenameOver);
+}
+
+#[test]
+fn matrix_guest_directory_rename_races() {
+    run_matrix(MatrixGuest::RenameDir);
+}
