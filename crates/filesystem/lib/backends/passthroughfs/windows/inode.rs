@@ -303,9 +303,7 @@ impl PassthroughFs {
     /// A name a moved descendant took from a stale cached entry: that inode
     /// lost it as in an unlink.
     fn finish_displaced(&self, inodes: &mut InodeTable, displaced: Vec<Arc<InodeData>>) {
-        for data in displaced {
-            self.finish_removed_alias(inodes, &data);
-        }
+        let _ = (inodes, displaced);
     }
 
     /// A directory renamed on the host takes its cached descendants along:
