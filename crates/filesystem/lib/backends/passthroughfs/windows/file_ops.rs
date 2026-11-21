@@ -74,6 +74,23 @@ impl PassthroughFs {
                 reopened.set_len(0).map_err(host_error)?;
             }
             Ok(reopened)
+        } else if let Some(identity) = data.identity
+            && flags & LINUX_O_TRUNC as u32 != 0
+        {
+            // An open by path reaches whatever holds the name now, which after
+            // a host replace is not the inode's object (`insert_handle`
+            // refuses it). Truncate only once the file is known to be the
+            // inode's own.
+            let mut options = open_options_from_flags(flags, false)?;
+            let file = options
+                .truncate(false)
+                .open(data.path())
+                .map_err(host_error)?;
+            if mobility::file_identity(&file)? != identity {
+                return Err(linux_error(LINUX_ESTALE));
+            }
+            file.set_len(0).map_err(host_error)?;
+            Ok(file)
         } else {
             open_options_from_flags(flags, false)?
                 .open(data.path())
