@@ -3182,14 +3182,11 @@ async fn handle_message_with_charge(
             };
             match credit.kind {
                 BulkKind::Filesystem => {
-                    let result = match state.read_sessions.get(&msg.id) {
-                        Some(session) => session.apply_credit(credit),
-                        // A read retires when its terminal response is published, while the
-                        // host may still be crediting the records it has just consumed. That
-                        // late credit has no recipient; it must not cancel a transfer that
-                        // already completed or manufacture a second terminal response.
-                        None => Ok(()),
-                    };
+                    let result = state
+                        .read_sessions
+                        .get(&msg.id)
+                        .ok_or_else(|| format!("unknown filesystem read session: {}", msg.id))
+                        .and_then(|session| session.apply_credit(credit));
                     if let Err(error) = result {
                         encode_bulk_fs_failure(msg.id, error, out_buf)?;
                         cancel_bulk_correlation(msg.id, BulkKind::Filesystem, state, &session_tx);
