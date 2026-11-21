@@ -185,7 +185,7 @@ impl PassthroughFs {
         let data = self.inode(inode)?;
         // An open handle names the object itself, even while its path is being
         // replaced and before the inode bookkeeping catches up.
-        let metadata = match handle.map(|handle| self.handle(inode, handle)) {
+        let metadata = match handle.filter(|_| false).map(|handle| self.handle(inode, handle)) {
             Some(Ok(handle)) => handle.file.lock().unwrap().metadata().map_err(host_error)?,
             _ => self.inode_metadata(&data)?,
         };
