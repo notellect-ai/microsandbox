@@ -1,0 +1,120 @@
+# Windows checks for Notellect's commits: formatting, clippy on the crates
+# they change, and every test of theirs that runs without a microVM. GitHub's
+# Windows runners cannot boot a microVM; tests that need one run on
+# Notellect's Windows VM instead.
+#
+# Runs on every push to a notellect/* branch, and from notellect-release.yml,
+# whose build waits for it, so a tag is never published without it.
+name: Notellect Windows check
+
+on:
+  push:
+    branches: ["notellect/**"]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_TOOLCHAIN: "1.100.0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  agentd:
+    name: agentd (x86_64-linux-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and musl
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Build agentd
+        run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: check-agentd-x86_64
+          path: target/x86_64-unknown-linux-musl/release/agentd
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    name: Windows (fmt, clippy, tests)
+    needs: agentd
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # The filesystem crate embeds this agentd. The SDK only archives the
+      # msb and libkrunfw it finds here; nothing in these checks runs them,
+      # so empty stand-ins keep its build script from downloading a release.
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}\embed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: check-agentd-x86_64
+          path: embed
+
+      - name: Stand-in runtime pair
+        shell: pwsh
+        run: |
+          New-Item -ItemType File -Force -Path embed\msb.exe, embed\libkrunfw.dll | Out-Null
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Notellect's crates, with all their targets. microsandbox-runtime and
+      # microsandbox are linted without their lib test targets, where upstream
+      # v0.8.1 itself has Windows-only clippy findings.
+      - name: Clippy
+        shell: bash
+        run: |
+          cargo clippy --locked --all-targets \
+            -p microsandbox-vsock -p microsandbox-filesystem -p microsandbox-utils \
+            -p msb_krun_devices -p microsandbox-cli -- -D warnings
+          cargo clippy --locked --lib --bins \
+            -p microsandbox-runtime -p microsandbox -- -D warnings
+          cargo clippy --locked -p microsandbox --test windows_job_breakaway -- -D warnings
+
+      - name: Test vsock named-pipe relay
+        run: cargo test --locked -p microsandbox-vsock
+
+      - name: Test filesystem (Windows passthrough, single-file mounts)
+        run: cargo test --locked -p microsandbox-filesystem --lib
+
+      - name: Test utils (mount path encoding, elevation sharing)
+        run: cargo test --locked -p microsandbox-utils --lib
+
+      - name: Test vsock device (resets, credit)
+        run: cargo test --locked -p msb_krun_devices --lib vsock
+
+      - name: Test runtime (snapshot cache ACL, mount specs)
+        shell: bash
+        run: |
+          cargo test --locked -p microsandbox-runtime --lib -- \
+            checkpoint::memory_cache runner::vm::tests
+
+      - name: Test SDK (mount wire encoding)
+        shell: bash
+        run: cargo test --locked -p microsandbox --lib -- dir_mount_arg file_mount_export_name
+
+      - name: Test CLI (volume paths with commas)
+        run: cargo test --locked -p microsandbox-cli --lib -- commands::common

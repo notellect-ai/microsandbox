@@ -107,9 +107,14 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  windows-check:
+    name: Windows check
+    uses: ./.github/workflows/notellect-windows-check.yml
+
   build:
     name: msb (${{ matrix.target }})
-    needs: [firmware, agentd]
+    # Nothing is built for release until Notellect's Windows checks pass.
+    needs: [firmware, agentd, windows-check]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
