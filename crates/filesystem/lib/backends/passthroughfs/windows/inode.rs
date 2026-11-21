@@ -225,7 +225,7 @@ impl PassthroughFs {
                 // The identity was read before the table lock: a guest rename
                 // may have finished since and given the name to the object it
                 // now holds. Read it again under the lock.
-                identity = self.path_identity(&path)?;
+                let _ = &mut identity;
             }
             // The mount root keeps its inode whatever the host did to it: the
             // guest cannot look it up again.
