@@ -1,0 +1,64 @@
+# Proof-only workflow for an upstream PR draft. It lives ONLY on the fork's
+# notellect/pr-proof/<name>[-unfixed] branches (one extra commit on top of the
+# PR branch); the PR branch itself never carries it.
+name: PR proof
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Needed only if a crate under test embeds agentd (microsandbox-filesystem,
+  # microsandbox, microsandbox-cli). Delete this job and the download step otherwise.
+  agentd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+          rustup default stable
+      - run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with: { name: agentd, path: target/x86_64-unknown-linux-musl/release/agentd, if-no-files-found: error, compression-level: 0 }
+
+  windows:
+    needs: agentd
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}\embed
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: actions/download-artifact@v4
+        with: { name: agentd, path: embed }
+      - shell: pwsh
+        run: New-Item -ItemType File -Force -Path embed\msb.exe, embed\libkrunfw.dll | Out-Null
+      - name: Show runner elevation
+        shell: cmd
+        run: whoami /user /groups
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --locked -p microsandbox-utils --all-targets -- -D warnings && cargo clippy --locked --no-default-features --features net,runner -p microsandbox-runtime --lib -- -D warnings && cargo clippy --locked --no-default-features --features local,net -p microsandbox --lib -- -D warnings
+      - name: Tests
+        shell: bash
+        run: cargo test --locked -p microsandbox-utils --lib elevation_share:: -- --nocapture
