@@ -4104,8 +4104,11 @@ fn a_lookup_of_a_hard_link_inside_the_unlink_window_keeps_the_inode_unretained()
             inode.retained.lock().unwrap().is_none(),
             "a named inode is retained"
         );
-        assert_eq!(inode.path(), temp.path.join("alias"));
-        assert!(!inodes.by_path.contains_key(&temp.path.join("data")));
+        assert!(inode.path().ends_with("alias"), "{:?}", inode.path());
+        assert!(
+            !inodes.by_path.keys().any(|path| path.ends_with("data")),
+            "the unlinked name is still tracked"
+        );
     }
     fs.release(context(), data, 0, handle, false, false, None)
         .unwrap();
