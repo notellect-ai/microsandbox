@@ -4012,13 +4012,25 @@ fn a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination() {
             inode
         });
         // Closed after the rename prepared the destination: the close finds
-        // nothing to drop yet.
-        let fs_ref = &fs;
+        // nothing to drop yet. The hook cannot borrow `fs`, so a scoped thread
+        // closes it.
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+        let closer = scope.spawn(|| {
+            let close_rx = close_rx;
+            close_rx
+                .recv_timeout(STEP_LIMIT)
+                .expect("rename reaching its host rename hook");
+            fs.release(context(), old, 0, handle, false, false, None)
+                .unwrap();
+            closed_tx.send(()).unwrap();
+        });
         remove_ops::AFTER_HOST_RENAME.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
-                fs_ref
-                    .release(context(), old, 0, handle, false, false, None)
-                    .unwrap();
+                close_tx.send(()).unwrap();
+                closed_rx
+                    .recv_timeout(STEP_LIMIT)
+                    .expect("destination closed");
             }));
         });
         remove_ops::AFTER_RETAIN.with(|hook| {
@@ -4032,6 +4044,7 @@ fn a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination() {
         });
         fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
             .unwrap();
+        closer.join().unwrap();
         looker.join().unwrap()
     });
 
