@@ -3982,6 +3982,70 @@ fn open_and_write_racing_an_unlink_stay_on_the_removed_file() {
     }
 }
 
+/// A guest rename-over whose destination the guest closed after the rename
+/// prepared it, with a lookup of the name right after the destination is
+/// marked retained: the lookup must not see the retained inode under its
+/// name (it would finish it as replaced by the Host and keep it, and the
+/// rename would then never drop it). The destination is dropped, and the name
+/// belongs to the moved file.
+#[test]
+fn a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (old, handle) = create_with(&fs, context(), c"data", 0o644, b"old");
+    let (tmp, tmp_handle) = create_with(&fs, context(), c"tmp", 0o644, b"new");
+    fs.release(context(), tmp, 0, tmp_handle, false, false, None)
+        .unwrap();
+
+    let _deadline = Deadline::start("lookup racing a rename-over", SCOPE_LIMIT);
+    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel::<()>();
+    let (looked_up_tx, looked_up_rx) = std::sync::mpsc::channel::<u64>();
+    let looked_up = std::thread::scope(|scope| {
+        let looker = scope.spawn(|| {
+            // Moved in: a Receiver cannot be shared with the scoped thread.
+            let lookup_rx = lookup_rx;
+            lookup_rx
+                .recv_timeout(STEP_LIMIT)
+                .expect("rename reaching its retain hook");
+            let inode = fs.lookup(context(), ROOT_INODE, c"data").unwrap().inode;
+            looked_up_tx.send(inode).unwrap();
+            inode
+        });
+        // Closed after the rename prepared the destination: the close finds
+        // nothing to drop yet.
+        let fs_ref = &fs;
+        remove_ops::AFTER_HOST_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs_ref
+                    .release(context(), old, 0, handle, false, false, None)
+                    .unwrap();
+            }));
+        });
+        remove_ops::AFTER_RETAIN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                lookup_tx.send(()).unwrap();
+                // The lookup waits for the inode table, which the rename holds
+                // while it marks the destination retained; give a lookup that
+                // does not wait time to finish inside the window.
+                let _ = looked_up_rx.recv_timeout(Duration::from_millis(500));
+            }));
+        });
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap();
+        looker.join().unwrap()
+    });
+
+    assert_eq!(looked_up, tmp, "the name belongs to the moved file");
+    let inodes = fs.inodes.read().unwrap();
+    assert!(
+        !inodes.by_inode.contains_key(&old),
+        "the closed destination is still tracked"
+    );
+    assert_eq!(inodes.by_inode.len(), 2, "root and the moved file only");
+    drop(inodes);
+    assert_eq!(std::fs::read(temp.path.join("data")).unwrap(), b"new");
+}
+
 /// A Host process holding a file open without FILE_SHARE_DELETE makes the
 /// guest's unlink and rename fail. The failure must leave everything as it
 /// was: the names, their inodes, the guest's open handle and the contents.
