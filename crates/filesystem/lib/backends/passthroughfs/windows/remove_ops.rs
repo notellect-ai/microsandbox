@@ -307,15 +307,12 @@ impl PassthroughFs {
     /// still has its name, finish it as replaced by the Host and keep it
     /// (retained), and the update would then never reap it.
     fn retain_owned_unlink(&self, prepared: Option<PreparedOwnedUnlink>) -> Option<Arc<InodeData>> {
-        let Some(PreparedOwnedUnlink {
+        let PreparedOwnedUnlink {
             data,
             file,
             stat,
             stat_file,
-        }) = prepared
-        else {
-            return None;
-        };
+        } = prepared?;
         *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
             uid: stat.uid,
             gid: stat.gid,
