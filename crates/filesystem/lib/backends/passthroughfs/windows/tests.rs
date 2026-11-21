@@ -3896,11 +3896,12 @@ fn retain_skips_a_handle_holding_another_file() {
     fs.handles.write().unwrap().remove(&u64::MAX);
 }
 
-/// An open by path and a write through a handle the guest already holds,
-/// inside the window between the host deletion and the inode table
-/// following it, while a Host process creates a new file under the name:
-/// the open must not attach the removed inode to the new file, and the write
-/// must land in the removed file.
+/// An open by path inside the window between the host deletion and the
+/// inode table following it, while a Host process creates a new file under
+/// the name, must not attach the removed inode to the new file. A write
+/// through a handle the guest already holds cannot enter the window (the
+/// unlink suspends the file's mappings, which writes wait for); sent then,
+/// it must land in the removed file once the unlink finishes.
 #[test]
 fn open_and_write_racing_an_unlink_stay_on_the_removed_file() {
     for host_recreates in [false, true] {
@@ -3923,6 +3924,7 @@ fn open_and_write_racing_an_unlink_stay_on_the_removed_file() {
                     std::fs::write(&host_path, b"host file").unwrap();
                 }
                 let opened = fs.open(context(), old, false, LINUX_O_RDWR as u32);
+                resume_tx.send(()).unwrap();
                 let mut reader = SourceReader {
                     bytes: b"XYZ".to_vec(),
                     pos: 0,
@@ -3939,7 +3941,6 @@ fn open_and_write_racing_an_unlink_stay_on_the_removed_file() {
                     false,
                     0,
                 );
-                resume_tx.send(()).unwrap();
                 (opened.map(|(handle, _)| handle.unwrap()), written)
             });
             remove_ops::AFTER_HOST_UNLINK.with(|hook| {
@@ -3947,7 +3948,7 @@ fn open_and_write_racing_an_unlink_stay_on_the_removed_file() {
                     unlinked_tx.send(()).unwrap();
                     resume_rx
                         .recv_timeout(STEP_LIMIT)
-                        .expect("racing open and write finished");
+                        .expect("racing open finished");
                 }));
             });
             fs.unlink(context(), ROOT_INODE, c"data").unwrap();
