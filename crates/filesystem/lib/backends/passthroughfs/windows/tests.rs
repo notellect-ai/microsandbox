@@ -4634,6 +4634,7 @@ fn run_matrix_cell(
         }
     }
 
+    let root = temp.path.as_path();
     std::thread::scope(|scope| {
         let race = MatrixRace {
             fs: &fs,
@@ -4647,7 +4648,7 @@ fn run_matrix_cell(
             if go_rx.recv_timeout(STEP_LIMIT).is_err() {
                 return; // The window was not reached; reported below.
             }
-            matrix_host_op(&temp.path, guest, host);
+            matrix_host_op(root, guest, host);
             host_done_tx.send(()).unwrap();
             race.run(racer);
             let _ = racer_done_tx.send(());
