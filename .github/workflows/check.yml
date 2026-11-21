@@ -697,6 +697,16 @@ jobs:
             a_lookup_of_a_hard_link_inside_the_unlink_window_keeps_the_inode_unretained `
             an_unlink_after_a_host_replace_does_not_pin_the_hosts_file_to_the_old_inode
 
+      - name: Test Windows filesystem guest directory renames
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} -- `
+            a_lookup_inside_a_directory_rename_window_keeps_what_it_found `
+            a_directory_rename_onto_stale_cached_children_finishes_them
+
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
