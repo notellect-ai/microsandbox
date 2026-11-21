@@ -3357,11 +3357,7 @@ fn bind_rootfs_backend(
 /// keeps resolving the name to the replaced inode and keeps reporting its old
 /// size. Expire both caches at once, as single-file mounts already do.
 fn host_directory_mount_backend(cfg: PassthroughConfig) -> std::io::Result<PassthroughFs> {
-    PassthroughFs::new(PassthroughConfig {
-        entry_timeout: Duration::ZERO,
-        attr_timeout: Duration::ZERO,
-        ..cfg
-    })
+    PassthroughFs::new(cfg)
 }
 
 /// Canonicalize a microsandbox-owned mount root so it is symlink-free.
