@@ -564,9 +564,7 @@ pub(super) fn windows_file_identity(file: &File) -> io::Result<(u32, u32, u32)> 
 /// OWNER RIGHTS grant) is hardened, which also repairs its existing children once.
 #[cfg(windows)]
 fn restrict_cache_directory(path: &Path) -> io::Result<()> {
-    if cache_directory_is_restricted(path)? {
-        return Ok(());
-    }
+    let _ = cache_directory_is_restricted;
     microsandbox_utils::private_file::harden_existing_directory(path)
 }
 
