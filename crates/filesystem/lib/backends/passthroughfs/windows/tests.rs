@@ -4000,6 +4000,8 @@ fn a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination() {
     let _deadline = Deadline::start("lookup racing a rename-over", SCOPE_LIMIT);
     let (lookup_tx, lookup_rx) = std::sync::mpsc::channel::<()>();
     let (looked_up_tx, looked_up_rx) = std::sync::mpsc::channel::<u64>();
+    let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
     let looked_up = std::thread::scope(|scope| {
         let looker = scope.spawn(|| {
             // Moved in: a Receiver cannot be shared with the scoped thread.
@@ -4014,8 +4016,6 @@ fn a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination() {
         // Closed after the rename prepared the destination: the close finds
         // nothing to drop yet. The hook cannot borrow `fs`, so a scoped thread
         // closes it.
-        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
         let closer = scope.spawn(|| {
             let close_rx = close_rx;
             close_rx
