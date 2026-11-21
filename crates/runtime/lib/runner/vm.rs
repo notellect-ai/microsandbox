@@ -2587,7 +2587,7 @@ fn build_vm(
             quota_bytes: parsed.quota_bytes,
             ..Default::default()
         };
-        let backend = match PassthroughFs::new(cfg) {
+        let backend = match host_directory_mount_backend(cfg) {
             Err(error) if owned_mount.is_none() && relaxed && restore_binding.is_some_and(|binding| !binding.require_backing)
                 && matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory) => {
                 external_mount_reports.last_mut().expect("restore report").unavailable = Some(format!("external export cannot be opened: {error}; filesystem operations return EIO"));
@@ -3346,6 +3346,22 @@ fn bind_rootfs_backend(
         ..Default::default()
     };
     PassthroughFs::new(cfg).map_err(|e| RuntimeError::Custom(format!("rootfs: {e}")))
+}
+
+/// Open the passthrough backend for a host directory mount (`--mount`).
+///
+/// The host can change a mounted directory while the guest runs, for example
+/// an editor saving a file by writing a temporary file and renaming it over
+/// the original. The guest kernel caches each entry and its attributes for
+/// the timeout the FUSE reply carries, so with a non-zero timeout the guest
+/// keeps resolving the name to the replaced inode and keeps reporting its old
+/// size. Expire both caches at once, as single-file mounts already do.
+fn host_directory_mount_backend(cfg: PassthroughConfig) -> std::io::Result<PassthroughFs> {
+    PassthroughFs::new(PassthroughConfig {
+        entry_timeout: Duration::ZERO,
+        attr_timeout: Duration::ZERO,
+        ..cfg
+    })
 }
 
 /// Canonicalize a microsandbox-owned mount root so it is symlink-free.
@@ -4138,9 +4154,10 @@ mod tests {
         AGENT_BULK_QUEUE_SIZE, AGENT_CONTROL_QUEUE_SIZE, AgentTransportProfile, ConsoleSharedState,
         HostPermissions, StatVirtualization, agent_kernel_cmdline, agent_primary_queue_size,
         append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame,
-        guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override, parse_mount_spec,
-        prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline, validate_disk_format,
+        guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override,
+        host_directory_mount_backend, parse_mount_spec, prepend_scripts_path,
+        request_guest_shutdown, request_guest_shutdown_with_timeout, thp_kernel_cmdline,
+        validate_disk_format,
     };
     #[cfg(unix)]
     use super::{
@@ -4492,6 +4509,45 @@ mod tests {
 
         assert_ne!(host.inode, init.inode);
         assert_eq!(init.inode, 2);
+    }
+
+    // The guest kernel caches an entry and its attributes for the timeout
+    // each FUSE reply carries. A host directory mount must reply with zero,
+    // so after the host replaces a file by rename the guest's next lookup
+    // reaches the new file instead of a cached, replaced inode.
+    #[test]
+    fn test_host_directory_mount_replies_expire_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.txt");
+        let replacement = dir.path().join("config.txt.tmp");
+        std::fs::write(&file, b"old").unwrap();
+
+        let fs = host_directory_mount_backend(super::PassthroughConfig {
+            root_dir: dir.path().to_path_buf(),
+            // The tempdir path may traverse a symlinked prefix (macOS `/var`).
+            no_symlink_root: false,
+            inject_init: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let entry = fs.lookup(fs_context(), 1, c"config.txt").unwrap();
+        assert_eq!(entry.attr.st_size, 3);
+        assert_eq!(entry.entry_timeout, Duration::ZERO);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
+        let (_, attr_timeout) = fs.getattr(fs_context(), entry.inode, None).unwrap();
+        assert_eq!(attr_timeout, Duration::ZERO);
+
+        std::fs::write(&replacement, b"new contents").unwrap();
+        #[cfg(windows)]
+        std::fs::remove_file(&file).unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+
+        let entry = fs.lookup(fs_context(), 1, c"config.txt").unwrap();
+        assert_eq!(entry.attr.st_size as u64, b"new contents".len() as u64);
+        assert_eq!(entry.entry_timeout, Duration::ZERO);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
     }
 
     #[cfg(unix)]
