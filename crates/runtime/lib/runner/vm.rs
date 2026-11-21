@@ -3363,8 +3363,6 @@ fn host_directory_mount_config(parsed: &ParsedMountSpec) -> PassthroughConfig {
         // unless the mount opted out via `follow-root-symlinks`.
         no_symlink_root: !parsed.follow_root_symlinks,
         quota_bytes: parsed.quota_bytes,
-        entry_timeout: Duration::ZERO,
-        attr_timeout: Duration::ZERO,
         ..Default::default()
     }
 }
