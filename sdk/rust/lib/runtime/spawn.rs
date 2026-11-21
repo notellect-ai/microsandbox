@@ -36,7 +36,8 @@ use tokio::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    ERROR_ACCESS_DENIED, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    SetHandleInformation,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
@@ -666,8 +667,7 @@ impl LocalContext {
         let mut cmd = Command::new(&msb_path);
         #[cfg(windows)]
         if matches!(mode, SpawnMode::Detached) {
-            let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
-            cmd.creation_flags(flags);
+            cmd.creation_flags(DETACHED_SPAWN_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
         }
         cmd.args(visible);
         if config.storage_reader.is_some() {
@@ -1074,8 +1074,30 @@ fn spawn_runtime_command(
     } else {
         None
     };
+    #[cfg(windows)]
+    if matches!(_mode, SpawnMode::Detached) {
+        return match cmd.spawn() {
+            // A launcher job without JOB_OBJECT_LIMIT_BREAKAWAY_OK (Task Scheduler, some
+            // terminals and CI agents) makes CreateProcess with CREATE_BREAKAWAY_FROM_JOB fail
+            // with ERROR_ACCESS_DENIED. Jobs nest since Windows 8, so start the runtime inside
+            // the launcher's job instead; it then ends with that job, as it may.
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                tracing::warn!(
+                    "detached spawn: the launcher's job object forbids breakaway, so the sandbox \
+                     runtime starts inside it and will be terminated when that job ends"
+                );
+                cmd.creation_flags(DETACHED_SPAWN_FLAGS);
+                cmd.spawn()
+            }
+            result => result,
+        };
+    }
     cmd.spawn()
 }
+
+/// Creation flags of a detached runtime, apart from leaving the launcher's job.
+#[cfg(windows)]
+const DETACHED_SPAWN_FLAGS: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
 
 fn block_writeback_policy(
     config: &RuntimeConfig,
