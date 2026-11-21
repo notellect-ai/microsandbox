@@ -7,6 +7,13 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use test_utils::Deadline;
+
+/// How long a test waits for one step of another thread.
+const STEP_LIMIT: Duration = Duration::from_secs(10);
+/// How long a test's threads may run before the test process is ended.
+const SCOPE_LIMIT: Duration = Duration::from_secs(120);
+
 struct TempDir {
     path: PathBuf,
 }
@@ -2582,7 +2589,9 @@ fn dax_write_to_another_inode_completes_while_a_write_is_paused() {
     impl ZeroCopyReader for PausedReader {
         fn read_to(&mut self, file: &File, count: usize, offset: u64) -> io::Result<usize> {
             self.entered.send(()).unwrap();
-            self.resume.recv().unwrap();
+            self.resume
+                .recv_timeout(STEP_LIMIT)
+                .expect("paused write waiting to resume");
             self.source.read_to(file, count, offset)
         }
     }
@@ -2635,6 +2644,7 @@ fn dax_write_to_another_inode_completes_while_a_write_is_paused() {
             0,
         )
     };
+    let _deadline = Deadline::start("paused write and an unrelated write", SCOPE_LIMIT);
     let completed = std::thread::scope(|scope| {
         scope.spawn(|| {
             let mut reader = PausedReader {
@@ -2647,7 +2657,9 @@ fn dax_write_to_another_inode_completes_while_a_write_is_paused() {
             };
             write(first, first_handle, &mut reader).unwrap();
         });
-        entered_rx.recv().unwrap();
+        entered_rx
+            .recv_timeout(STEP_LIMIT)
+            .expect("first write reaching its pause");
         scope.spawn(|| {
             let mut reader = SourceReader {
                 bytes: b"y".to_vec(),
@@ -2713,11 +2725,14 @@ fn dax_resize_preserves_concurrent_slot_removal_and_replacement() {
     let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
 
+    let _deadline = Deadline::start("paused resize and mapping changes", SCOPE_LIMIT);
     let completed = std::thread::scope(|scope| {
         scope.spawn(|| {
             fs.resize_inode(first, || {
                 entered_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
+                resume_rx
+                    .recv_timeout(STEP_LIMIT)
+                    .expect("resize waiting to resume");
                 StdOpenOptions::new()
                     .write(true)
                     .open(&first_path)?
@@ -2725,7 +2740,9 @@ fn dax_resize_preserves_concurrent_slot_removal_and_replacement() {
             })
             .unwrap();
         });
-        entered_rx.recv().unwrap();
+        entered_rx
+            .recv_timeout(STEP_LIMIT)
+            .expect("resize reaching its pause");
         scope.spawn(|| {
             let result = fs
                 .removemapping(
@@ -3328,9 +3345,12 @@ fn dax_unmapped_file_write_does_not_wait_for_worker() {
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     let (sender, _) = dax_worker_stub(move || {
         entered_tx.send(()).unwrap();
-        resume_rx.recv().unwrap();
+        resume_rx
+            .recv_timeout(STEP_LIMIT)
+            .expect("VMM worker waiting to resume");
         true
     });
+    let _deadline = Deadline::start("paused VMM worker and an unmapped write", SCOPE_LIMIT);
     let completed = std::thread::scope(|scope| {
         scope.spawn(|| {
             fs.setupmapping(
@@ -3347,7 +3367,9 @@ fn dax_unmapped_file_write_does_not_wait_for_worker() {
             )
             .unwrap()
         });
-        entered_rx.recv().unwrap();
+        entered_rx
+            .recv_timeout(STEP_LIMIT)
+            .expect("mapping reaching the VMM worker");
         scope.spawn(|| {
             let mut reader = SourceReader {
                 bytes: b"x".to_vec(),
@@ -3709,6 +3731,7 @@ fn concurrent_replace_while_reading_never_fails_reads() {
     // Which round's payload each inode holds: a handle must read its own
     // inode's file, never the one that replaced it.
     let rounds = Mutex::new(std::collections::HashMap::from([(inode, 0usize)]));
+    let _deadline = Deadline::start("reader racing replacing renames", SCOPE_LIMIT);
     let (reads, stale) = std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
             let mut reads = 0usize;
@@ -3794,11 +3817,14 @@ fn open_racing_a_rename_over_does_not_reach_the_replacing_file() {
 
     let (renamed_tx, renamed_rx) = std::sync::mpsc::channel::<()>();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let _deadline = Deadline::start("open racing a rename over", SCOPE_LIMIT);
     let in_window = std::thread::scope(|scope| {
         let racer = scope.spawn(|| {
             // Moved in: a Receiver cannot be shared with the scoped thread.
             let renamed_rx = renamed_rx;
-            renamed_rx.recv().unwrap();
+            renamed_rx
+                .recv_timeout(STEP_LIMIT)
+                .expect("rename reaching its hook");
             let opened = fs.open(context(), old, false, LINUX_O_RDWR as u32);
             if let Ok((Some(handle), _)) = &opened {
                 let mut reader = SourceReader {

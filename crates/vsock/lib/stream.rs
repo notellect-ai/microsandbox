@@ -168,6 +168,8 @@ mod tests {
             )
             .unwrap();
         let (mut host, _) = listener.accept().unwrap();
+        host.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
 
         for _ in 0..100 {
             if endpoint.connect_state().unwrap() == VsockConnectState::Connected {
@@ -182,7 +184,8 @@ mod tests {
 
         endpoint.write(b"guest").unwrap();
         let mut request = [0; 5];
-        host.read_exact(&mut request).unwrap();
+        host.read_exact(&mut request)
+            .expect("Host reading the guest request");
         assert_eq!(&request, b"guest");
 
         host.write_all(b"host").unwrap();
