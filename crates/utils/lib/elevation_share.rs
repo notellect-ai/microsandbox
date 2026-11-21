@@ -25,6 +25,7 @@ pub fn share_current_process_with_user() -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) mod windows {
     use std::io;
     use std::ptr::null_mut;
@@ -160,6 +161,10 @@ pub(crate) mod windows {
     ///
     /// Only an elevated process changes its token; a normal one already grants its user.
     pub fn share_new_objects_with_user() -> io::Result<()> {
+        Ok(())
+    }
+
+    pub fn unused_share_new_objects_with_user() -> io::Result<()> {
         static DONE: OnceLock<Result<(), String>> = OnceLock::new();
         DONE.get_or_init(|| apply_default_dacl().map_err(|e| e.to_string()))
             .clone()
@@ -213,6 +218,10 @@ pub(crate) mod windows {
     /// and terminate rights. Administrators (enabled only in elevated tokens) and SYSTEM keep
     /// full access.
     pub fn share_current_process_with_user() -> io::Result<()> {
+        Ok(())
+    }
+
+    pub fn unused_share_current_process_with_user() -> io::Result<()> {
         share_new_objects_with_user()?;
         let Some(user) = elevated_user()? else {
             return Ok(());
