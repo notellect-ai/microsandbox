@@ -1,0 +1,43 @@
+# Proof-only workflow for an upstream PR draft. It lives ONLY on the fork's
+# notellect/pr-proof/<name>[-unfixed] branches (one extra commit on top of the
+# PR branch); the PR branch itself never carries it.
+name: PR proof
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      # The new tests run first: an -unfixed branch must fail here.
+      - name: Tests
+        shell: bash
+        run: cargo test --locked --no-default-features -p microsandbox-filesystem --lib -- a_host_replace_gives_the_name_a_new_inode a_lookup_inside_the_rename_window_keeps_the_moved_inode a_host_directory_replace_does_not_keep_old_children a_lookup_racing_a_guest_rename_over_keeps_the_moved_inode a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination open_racing_a_rename_over_does_not_reach_the_replacing_file open_and_write_racing_an_unlink_stay_on_the_removed_file an_open_with_truncate_after_a_host_replace_leaves_the_hosts_file_alone a_host_replace_of_the_root_keeps_the_root_inode
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --locked --no-default-features -p microsandbox-filesystem --all-targets -- -D warnings
+      - name: All filesystem tests
+        shell: bash
+        run: cargo test --locked --no-default-features -p microsandbox-filesystem --lib
