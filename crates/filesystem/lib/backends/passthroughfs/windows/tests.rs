@@ -4112,12 +4112,9 @@ fn a_lookup_of_a_hard_link_inside_the_unlink_window_keeps_the_inode_unretained()
     }
     fs.release(context(), data, 0, handle, false, false, None)
         .unwrap();
-    fs.forget(context(), data, 2);
-    assert!(
-        !fs.inodes.read().unwrap().by_inode.contains_key(&data),
-        "the forgotten inode is still tracked"
-    );
+    // Closing the last handle must not reap the inode from under its name.
     let alias = fs.lookup(context(), ROOT_INODE, c"alias").unwrap().inode;
+    assert_eq!(alias, data, "the alias keeps its inode after the close");
     let (handle, _) = fs
         .open(context(), alias, false, libc::O_RDONLY as u32)
         .unwrap();
