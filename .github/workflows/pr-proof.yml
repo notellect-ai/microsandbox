@@ -41,7 +41,7 @@ jobs:
       # The tests run first: an -unfixed branch must fail here.
       - name: Tests
         shell: bash
-        run: cargo test --locked --no-default-features -p microsandbox-filesystem --lib backends::passthroughfs::windows::
+        run: cargo test --locked --no-default-features -p microsandbox-filesystem --lib 'backends::passthroughfs::windows::'
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
