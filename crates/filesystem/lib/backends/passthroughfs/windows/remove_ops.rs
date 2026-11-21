@@ -204,14 +204,8 @@ impl PassthroughFs {
         let Some(data) = data else {
             return Ok(None);
         };
-        if self.cfg.owned_checkpoint.is_none() {
-            if !self.has_open_handle(data.inode) {
-                return Ok(None);
-            }
-            // The pin is best effort here: if any step fails, the unlink goes
-            // ahead without it, and finish_removed_alias falls back to
-            // retain_open_file, which pins a clone of the guest's own handle.
-            return Ok(self.pin_open_file(path, data));
+        if self.cfg.owned_checkpoint.is_none() && !self.has_open_handle(data.inode) {
+            return Ok(None);
         }
         let metadata = self.safe_metadata(path)?;
         if !metadata.is_file() {
@@ -220,6 +214,33 @@ impl PassthroughFs {
         // Read the guest metadata now: an ADS override moves with whichever
         // file holds the name, so after a rename-over it is the new file's.
         let current = self.current_override(&metadata, &data)?;
+        if self.cfg.owned_checkpoint.is_none() {
+            // Attribute access is enough for fstat; write access keeps a
+            // guest chmod/utimes on the open file working. The pin is best
+            // effort: if the file cannot be opened even for reading its
+            // attributes, the unlink goes ahead without it.
+            let open = |access| {
+                StdOpenOptions::new()
+                    .access_mode(access)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)
+            };
+            let Ok(file) = open(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+                .or_else(|_| open(FILE_READ_ATTRIBUTES))
+            else {
+                return Ok(None);
+            };
+            reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
+            if !Self::holds_own_object(&data, &file) {
+                return Ok(None);
+            }
+            return Ok(Some(PreparedOwnedUnlink {
+                data,
+                file,
+                stat: current,
+                stat_file: None,
+            }));
+        }
         let file = StdOpenOptions::new()
             .read(true)
             .write(!metadata.permissions().readonly())
@@ -237,35 +258,6 @@ impl PassthroughFs {
             stat: current,
             stat_file,
         }))
-    }
-
-    /// Pin a file the guest has open on a mount without an owned checkpoint.
-    /// Attribute access is enough for fstat; write access keeps a guest
-    /// chmod/utimes on the open file working.
-    fn pin_open_file(&self, path: &Path, data: Arc<InodeData>) -> Option<PreparedOwnedUnlink> {
-        let metadata = self.safe_metadata(path).ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        // Read the guest metadata now: an ADS override moves with whichever
-        // file holds the name, so after a rename-over it is the new file's.
-        let current = self.current_override(&metadata, &data).ok()?;
-        let open = |access| {
-            StdOpenOptions::new()
-                .access_mode(access)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)
-        };
-        let file = open(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
-            .or_else(|_| open(FILE_READ_ATTRIBUTES))
-            .ok()?;
-        reject_reparse_metadata(&file.metadata().ok()?).ok()?;
-        Self::holds_own_object(&data, &file).then_some(PreparedOwnedUnlink {
-            data,
-            file,
-            stat: current,
-            stat_file: None,
-        })
     }
 
     /// The host may have replaced the object at the inode's name since the
