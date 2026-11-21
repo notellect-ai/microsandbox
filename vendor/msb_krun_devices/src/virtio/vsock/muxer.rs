@@ -62,6 +62,8 @@ pub enum MuxerRx {
     Reset {
         local_port: u32,
         peer_port: u32,
+        /// The connection's forwarded byte count; 0 when there is none.
+        fwd_cnt: u32,
     },
     GetnameResponse {
         local_port: u32,
@@ -908,6 +910,7 @@ impl VsockMuxer {
                         MuxerRx::Reset {
                             local_port: pkt.dst_port(),
                             peer_port: pkt.src_port(),
+                            fwd_cnt: 0,
                         },
                         &self.rxq,
                         queue,
@@ -941,6 +944,7 @@ impl VsockMuxer {
                                 MuxerRx::Reset {
                                     local_port: pkt.dst_port(),
                                     peer_port: pkt.src_port(),
+                                    fwd_cnt: 0,
                                 },
                                 &self.rxq,
                                 queue,
@@ -964,6 +968,7 @@ impl VsockMuxer {
                             MuxerRx::Reset {
                                 local_port: pkt.dst_port(),
                                 peer_port: pkt.src_port(),
+                                fwd_cnt: 0,
                             },
                             &self.rxq,
                             queue,
@@ -997,6 +1002,7 @@ impl VsockMuxer {
                             MuxerRx::Reset {
                                 local_port: pkt.dst_port(),
                                 peer_port: pkt.src_port(),
+                                fwd_cnt: 0,
                             },
                             &self.rxq,
                             queue,
@@ -1020,6 +1026,7 @@ impl VsockMuxer {
                         MuxerRx::Reset {
                             local_port: pkt.dst_port(),
                             peer_port: pkt.src_port(),
+                            fwd_cnt: 0,
                         },
                         &self.rxq,
                         queue,
@@ -1042,6 +1049,7 @@ impl VsockMuxer {
                     MuxerRx::Reset {
                         local_port: pkt.dst_port(),
                         peer_port: pkt.src_port(),
+                        fwd_cnt: 0,
                     },
                     &self.rxq,
                     queue,
@@ -1071,6 +1079,7 @@ impl VsockMuxer {
                         MuxerRx::Reset {
                             local_port: pkt.dst_port(),
                             peer_port: pkt.src_port(),
+                            fwd_cnt: 0,
                         },
                         &self.rxq,
                         queue,
@@ -1092,6 +1101,7 @@ impl VsockMuxer {
                         MuxerRx::Reset {
                             local_port: pkt.dst_port(),
                             peer_port: pkt.src_port(),
+                            fwd_cnt: 0,
                         },
                         &self.rxq,
                         queue,
@@ -1118,6 +1128,7 @@ impl VsockMuxer {
                 MuxerRx::Reset {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
+                    fwd_cnt: 0,
                 },
                 &self.rxq,
                 queue,
@@ -1210,6 +1221,7 @@ impl VsockMuxer {
             let rx = MuxerRx::Reset {
                 local_port: pkt.dst_port(),
                 peer_port: pkt.src_port(),
+                fwd_cnt: 0,
             };
             push_packet(self.cid, rx, &self.rxq, queue, mem);
         }
@@ -1303,7 +1315,8 @@ mod tests {
             muxer.rxq.lock().unwrap().pop(),
             Some(MuxerRx::Reset {
                 local_port: 5000,
-                peer_port: 1234
+                peer_port: 1234,
+                fwd_cnt: 0
             })
         ));
     }
@@ -1458,7 +1471,8 @@ mod tests {
             for port in 0..control_count {
                 assert!(device.muxer.rxq.lock().unwrap().push(MuxerRx::Reset {
                     local_port: port as u32,
-                    peer_port: 1
+                    peer_port: 1,
+                    fwd_cnt: 0
                 }));
             }
 
