@@ -45,6 +45,24 @@ fn after_host_rename() {}
 
 #[cfg(test)]
 thread_local! {
+    /// Runs on the unlinking thread after the host deletion and before the
+    /// inode table follows it, so a test can act inside that window.
+    pub(super) static AFTER_HOST_UNLINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_host_unlink() {
+    if let Some(hook) = AFTER_HOST_UNLINK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_host_unlink() {}
+
+#[cfg(test)]
+thread_local! {
     /// Runs right after a guest unlink or rename-over marks the removed
     /// inode retained, before the inode table drops its name.
     pub(super) static AFTER_RETAIN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -128,6 +146,7 @@ impl PassthroughFs {
                 }
             }
 
+            after_host_unlink();
             // Commit namespace bookkeeping before remapping: a remap error
             // cannot undo a successful host deletion.
             self.finish_unlink_path(path, retained);

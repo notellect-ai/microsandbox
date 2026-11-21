@@ -3895,3 +3895,170 @@ fn retain_skips_a_handle_holding_another_file() {
     assert!(data.retained.lock().unwrap().is_none());
     fs.handles.write().unwrap().remove(&u64::MAX);
 }
+
+/// An open by path inside the window between the host deletion and the
+/// inode table following it, while a Host process creates a new file under
+/// the name, must not attach the removed inode to the new file. A write
+/// through a handle the guest already holds cannot enter the window (the
+/// unlink suspends the file's mappings, which writes wait for); sent then,
+/// it must land in the removed file once the unlink finishes.
+#[test]
+fn open_and_write_racing_an_unlink_stay_on_the_removed_file() {
+    for host_recreates in [false, true] {
+        let temp = TempDir::new();
+        let fs = fs_for(&temp.path);
+        let (old, handle) = create_with(&fs, context(), c"data", 0o644, b"old contents");
+        let host_path = temp.path.join("data");
+
+        let (unlinked_tx, unlinked_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let _deadline = Deadline::start("open and write racing an unlink", SCOPE_LIMIT);
+        let in_window = std::thread::scope(|scope| {
+            let racer = scope.spawn(|| {
+                // Moved in: a Receiver cannot be shared with the scoped thread.
+                let unlinked_rx = unlinked_rx;
+                unlinked_rx
+                    .recv_timeout(STEP_LIMIT)
+                    .expect("unlink reaching its hook");
+                if host_recreates {
+                    std::fs::write(&host_path, b"host file").unwrap();
+                }
+                let opened = fs.open(context(), old, false, LINUX_O_RDWR as u32);
+                resume_tx.send(()).unwrap();
+                let mut reader = SourceReader {
+                    bytes: b"XYZ".to_vec(),
+                    pos: 0,
+                };
+                let written = fs.write(
+                    context(),
+                    old,
+                    handle,
+                    &mut reader,
+                    3,
+                    0,
+                    None,
+                    false,
+                    false,
+                    0,
+                );
+                (opened.map(|(handle, _)| handle.unwrap()), written)
+            });
+            remove_ops::AFTER_HOST_UNLINK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    unlinked_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(STEP_LIMIT)
+                        .expect("racing open finished");
+                }));
+            });
+            fs.unlink(context(), ROOT_INODE, c"data").unwrap();
+            racer.join().unwrap()
+        });
+
+        let (opened, written) = in_window;
+        match opened {
+            Ok(handle) => panic!("open of the removed inode got handle {handle}"),
+            Err(error) => {
+                let errno = error.raw_os_error();
+                assert!(
+                    errno == Some(LINUX_ESTALE) || (!host_recreates && errno == Some(LINUX_ENOENT)),
+                    "open in the unlink window (Host recreated: {host_recreates}): {error}"
+                );
+            }
+        }
+        assert_eq!(written.unwrap(), 3);
+        assert_eq!(read_all(&fs, old, handle).unwrap(), b"XYZ contents");
+        if host_recreates {
+            assert_eq!(std::fs::read(&host_path).unwrap(), b"host file");
+            let now = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+            assert_ne!(now.inode, old);
+            assert_eq!(now.attr.st_size, 9);
+        } else {
+            assert!(!host_path.exists());
+            expect_errno(fs.lookup(context(), ROOT_INODE, c"data"), LINUX_ENOENT);
+        }
+        fs.release(context(), old, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
+/// A Host process holding a file open without FILE_SHARE_DELETE makes the
+/// guest's unlink and rename fail. The failure must leave everything as it
+/// was: the names, their inodes, the guest's open handle and the contents.
+/// Once the Host lets go, both succeed.
+#[test]
+fn host_holding_a_file_without_share_delete_fails_unlink_and_rename_cleanly() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (data, handle) = create_with(&fs, context(), c"data", 0o644, b"data contents");
+    let (tmp, tmp_handle) = create_with(&fs, context(), c"tmp", 0o644, b"tmp contents");
+    fs.release(context(), tmp, 0, tmp_handle, false, false, None)
+        .unwrap();
+    let hold = |name: &str| {
+        StdOpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(temp.path.join(name))
+            .unwrap()
+    };
+    let unchanged = |fs: &PassthroughFs| {
+        assert_eq!(
+            fs.lookup(context(), ROOT_INODE, c"data").unwrap().inode,
+            data
+        );
+        assert_eq!(fs.lookup(context(), ROOT_INODE, c"tmp").unwrap().inode, tmp);
+        assert_eq!(read_all(fs, data, handle).unwrap(), b"data contents");
+        assert_eq!(
+            std::fs::read(temp.path.join("data")).unwrap(),
+            b"data contents"
+        );
+        assert_eq!(
+            std::fs::read(temp.path.join("tmp")).unwrap(),
+            b"tmp contents"
+        );
+    };
+    let refused = |result: io::Result<()>, step: &str| {
+        let error = result.expect_err(step);
+        assert!(
+            [Some(LINUX_EBUSY), Some(LINUX_EACCES)].contains(&error.raw_os_error()),
+            "{step}: {error}"
+        );
+    };
+
+    let held = hold("data");
+    refused(
+        fs.unlink(context(), ROOT_INODE, c"data"),
+        "unlink of a file the Host holds",
+    );
+    unchanged(&fs);
+    refused(
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0),
+        "rename over a file the Host holds",
+    );
+    unchanged(&fs);
+    drop(held);
+
+    let held = hold("tmp");
+    refused(
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0),
+        "rename of a file the Host holds",
+    );
+    unchanged(&fs);
+    drop(held);
+
+    fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+        .unwrap();
+    assert_eq!(
+        fs.lookup(context(), ROOT_INODE, c"data").unwrap().inode,
+        tmp
+    );
+    assert_eq!(read_all(&fs, data, handle).unwrap(), b"data contents");
+    fs.unlink(context(), ROOT_INODE, c"data").unwrap();
+    expect_errno(fs.lookup(context(), ROOT_INODE, c"data"), LINUX_ENOENT);
+    assert_eq!(read_all(&fs, data, handle).unwrap(), b"data contents");
+    fs.release(context(), data, 0, handle, false, false, None)
+        .unwrap();
+}
