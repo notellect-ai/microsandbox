@@ -200,6 +200,9 @@ impl PassthroughFs {
         &self,
         path: &Path,
     ) -> io::Result<Option<PreparedOwnedUnlink>> {
+        if self.cfg.owned_checkpoint.is_none() {
+            return Ok(None);
+        }
         let data = self.inodes.read().unwrap().by_path.get(path).cloned();
         let Some(data) = data else {
             return Ok(None);
@@ -368,6 +371,9 @@ impl PassthroughFs {
     /// file reachable through the guest's handle. Called before the path's
     /// stat store entry is moved or removed.
     pub(super) fn retain_open_file(&self, data: &InodeData) -> bool {
+        if data.inode != u64::MAX {
+            return false;
+        }
         let file = self
             .handles
             .read()

@@ -191,7 +191,7 @@ impl PassthroughFs {
             .by_inode
             .get(&inode)
             .cloned()
-            .ok_or_else(|| linux_error(LINUX_ESTALE))
+            .ok_or_else(|| linux_error(LINUX_EBADF))
     }
 
     pub(super) fn intern_path(&self, path: PathBuf) -> io::Result<Arc<InodeData>> {
