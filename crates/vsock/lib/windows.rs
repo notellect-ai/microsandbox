@@ -765,6 +765,8 @@ mod tests {
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 
+    use test_utils::{join_within, recv_within, with_deadline};
+
     use super::*;
 
     #[test]
@@ -864,7 +866,11 @@ mod tests {
             }
         }
         assert_eq!(&response, b"host");
-        host.join().unwrap();
+        join_within(
+            host,
+            "Host end exchanging one request",
+            Duration::from_secs(10),
+        );
     }
 
     //----------------------------------------------------------------------------------------------
@@ -1010,18 +1016,6 @@ mod tests {
             .collect()
     }
 
-    /// Run `host` on its own thread and wait at most DEADLINE for it, so a
-    /// relay that never lets go of the pipe fails instead of hanging.
-    fn within_deadline<T: Send + 'static>(host: impl FnOnce() -> T + Send + 'static) -> T {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(host());
-        });
-        receiver
-            .recv_timeout(DEADLINE)
-            .expect("Host end did not finish in time")
-    }
-
     #[test]
     fn host_replies_reach_the_guest_without_a_polling_interval() {
         let name = pipe_name("latency");
@@ -1047,7 +1041,7 @@ mod tests {
             assert_eq!(guest_read_up_to(&*endpoint, 8), request);
             round_trips.push(started.elapsed());
         }
-        host.join().unwrap();
+        join_within(host, "Host end echoing the round trips", DEADLINE);
         round_trips.sort();
         let median = round_trips[ROUNDS / 2];
         // A polling relay waits one Windows timer tick (about 15.6 ms) per
@@ -1074,7 +1068,7 @@ mod tests {
         let endpoint = guest_connect(&name);
         guest_write_all(&*endpoint, &pattern(LENGTH, 1));
         assert_eq!(guest_read_up_to(&*endpoint, LENGTH), pattern(LENGTH, 2));
-        host.join().unwrap();
+        join_within(host, "Host end exchanging the large streams", DEADLINE);
     }
 
     #[test]
@@ -1088,7 +1082,7 @@ mod tests {
             drop(server);
         });
         let endpoint = guest_connect(&name);
-        host.join().unwrap();
+        join_within(host, "Host end writing a partial reply", DEADLINE);
         assert_eq!(guest_read_up_to(&*endpoint, 1 << 20), b"partial reply");
         let deadline = Instant::now() + DEADLINE;
         loop {
@@ -1139,7 +1133,7 @@ mod tests {
                 Err(_) => break,
             }
         }
-        host.join().unwrap();
+        join_within(host, "Host end replying and closing", DEADLINE);
         // guest_read_up_to fails on any read error; the stream must end
         // cleanly after the reply.
         assert_eq!(guest_read_up_to(&*endpoint, 1 << 20), b"final reply");
@@ -1160,12 +1154,12 @@ mod tests {
             host_accept(&server);
             host_write_all(&server, &pattern(MAX_BUFFERED_BYTES, 5));
             filled_tx.send(()).unwrap();
-            drained_rx.recv().unwrap();
+            recv_within(&drained_rx, "Host waiting for the guest to drain", DEADLINE);
             assert_eq!(host_read_exact(&server, WRITE), pattern(WRITE, 6));
             host_write_all(&server, TAIL);
         });
         let endpoint = guest_connect(&name);
-        filled_rx.recv_timeout(DEADLINE).unwrap();
+        recv_within(&filled_rx, "Host filling the guest buffer", DEADLINE);
         // Let the last Host bytes reach the guest buffer, so it is full and
         // the relay has no read pending.
         std::thread::sleep(Duration::from_millis(200));
@@ -1181,27 +1175,31 @@ mod tests {
         // Once the write completes the relay must read again; nothing else
         // will wake it.
         assert_eq!(guest_read_up_to(&*endpoint, TAIL.len()), TAIL);
-        host.join().unwrap();
+        join_within(
+            host,
+            "Host end reading the write and sending the tail",
+            DEADLINE,
+        );
     }
 
     #[test]
     fn dropping_the_guest_end_during_a_pending_read_releases_the_pipe() {
         let name = pipe_name("dropread");
         let server = host_pipe(&name);
-        let accepted = Arc::new(std::sync::Barrier::new(2));
-        let host_accepted = Arc::clone(&accepted);
         let host = std::thread::spawn(move || {
             host_accept(&server);
-            host_accepted.wait();
             server
         });
         let endpoint = guest_connect(&name);
-        accepted.wait();
-        let server = host.join().unwrap();
+        let server = join_within(host, "Host end accepting the guest", DEADLINE);
         // The relay's read is pending: the Host has written nothing.
         std::thread::sleep(Duration::from_millis(50));
         drop(endpoint);
-        let result = within_deadline(move || host_read(&server, &mut [0_u8; 16]));
+        let result = with_deadline(
+            "Host read after the guest end dropped",
+            DEADLINE,
+            move || host_read(&server, &mut [0_u8; 16]),
+        );
         assert!(
             result.is_err(),
             "the relay kept its pipe end open: {result:?}"
@@ -1212,31 +1210,31 @@ mod tests {
     fn dropping_the_guest_end_during_a_blocked_write_releases_the_pipe() {
         let name = pipe_name("dropwrite");
         let server = host_pipe(&name);
-        let accepted = Arc::new(std::sync::Barrier::new(2));
-        let host_accepted = Arc::clone(&accepted);
         let host = std::thread::spawn(move || {
             host_accept(&server);
-            host_accepted.wait();
             server
         });
         let endpoint = guest_connect(&name);
-        accepted.wait();
-        let server = host.join().unwrap();
+        let server = join_within(host, "Host end accepting the guest", DEADLINE);
         // Far more than the pipe buffers while the Host reads nothing, so the
         // relay's write cannot complete.
         guest_write_all(&*endpoint, &pattern(1 << 20, 3));
         std::thread::sleep(Duration::from_millis(100));
         drop(endpoint);
-        let drained = within_deadline(move || {
-            let mut buf = vec![0_u8; 65_536];
-            let mut total = 0;
-            loop {
-                match host_read(&server, &mut buf) {
-                    Ok(read) => total += read,
-                    Err(error) => return (total, error),
+        let drained = with_deadline(
+            "Host draining after the guest end dropped",
+            DEADLINE,
+            move || {
+                let mut buf = vec![0_u8; 65_536];
+                let mut total = 0;
+                loop {
+                    match host_read(&server, &mut buf) {
+                        Ok(read) => total += read,
+                        Err(error) => return (total, error),
+                    }
                 }
-            }
-        });
+            },
+        );
         assert!(
             drained.0 < 1 << 20,
             "the whole write went through: {drained:?}"
@@ -1274,11 +1272,11 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        for guest in guests {
-            guest.join().unwrap();
+        for (index, guest) in guests.into_iter().enumerate() {
+            join_within(guest, &format!("guest connection {index}"), DEADLINE);
         }
-        for host in hosts {
-            host.join().unwrap();
+        for (index, host) in hosts.into_iter().enumerate() {
+            join_within(host, &format!("Host connection {index}"), DEADLINE);
         }
     }
 }

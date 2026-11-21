@@ -98,7 +98,14 @@ Known and left as they are (from a review of the v0.8.1 commits):
 - A detached spawn that hits ERROR_ACCESS_DENIED for another reason (an exe
   ACL, antivirus) also retries inside the job, with the same warning.
 
+`notellect-windows-check.yml` runs formatting, clippy and the tests of these
+commits that need no microVM on a GitHub Windows runner, on every push to a
+`notellect/*` branch; the release waits for it. Tests that boot a microVM run
+on Notellect's Windows VM. Every test step that waits (a read, write, join,
+recv or wait) has an explicit limit and fails naming that step; use
+`test_utils::{with_deadline, join_within, recv_within, Deadline}`.
+
 To move to a new upstream version, branch from its tag, cherry-pick these
 commits (the CI commit again deletes every upstream workflow but
-`notellect-release.yml`, including ones upstream added since), and push
-`vX.Y.Z-notellect.1`.
+`notellect-release.yml` and `notellect-windows-check.yml`, including ones
+upstream added since), and push `vX.Y.Z-notellect.1`.

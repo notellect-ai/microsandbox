@@ -20,6 +20,10 @@ use tempfile::TempDir;
 
 pub use test_macros::msb_test;
 
+mod deadline;
+
+pub use deadline::{Deadline, join_within, recv_within, with_deadline};
+
 /// Env var that gates per-test home isolation.
 ///
 /// When set (any value), [`init_isolated_home`] points microsandbox at a
