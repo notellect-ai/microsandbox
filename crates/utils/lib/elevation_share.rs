@@ -457,6 +457,37 @@ mod tests {
         };
         assert!(!mapping.is_null(), "{}", std::io::Error::last_os_error());
 
+        for (what, handle) in [("pipe", pipe), ("mapping", mapping)] {
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+            };
+            let info = 0x1 | 0x4 | 0x10;
+            let mut sd = null_mut();
+            let error = unsafe {
+                GetSecurityInfo(
+                    handle,
+                    SE_KERNEL_OBJECT,
+                    info,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut sd,
+                )
+            };
+            let mut text = null_mut();
+            let mut len = 0;
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    sd, 1, info, &mut text, &mut len,
+                )
+            };
+            let text = unsafe { std::slice::from_raw_parts(text, len as usize) };
+            eprintln!(
+                "EXP {what} error={error} sddl={}",
+                String::from_utf16_lossy(text)
+            );
+        }
         // libtest has already printed `test <name> ... ` without a newline.
         println!("\n{READY} {pipe_name} {mapping_name}");
         std::io::stdout().flush().unwrap();
