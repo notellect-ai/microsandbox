@@ -4010,7 +4010,8 @@ fn a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination() {
                 .recv_timeout(STEP_LIMIT)
                 .expect("rename reaching its retain hook");
             let inode = fs.lookup(context(), ROOT_INODE, c"data").unwrap().inode;
-            looked_up_tx.send(inode).unwrap();
+            // With the fix the lookup ends after the hook gave up waiting.
+            let _ = looked_up_tx.send(inode);
             inode
         });
         // Closed after the rename prepared the destination: the close finds
