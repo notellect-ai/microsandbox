@@ -400,6 +400,7 @@ impl TsiStreamProxy {
         let rx = MuxerRx::Reset {
             local_port: self.local_port,
             peer_port: self.peer_port,
+            fwd_cnt: self.tx_cnt.0,
         };
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }

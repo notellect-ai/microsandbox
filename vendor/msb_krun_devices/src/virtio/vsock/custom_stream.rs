@@ -204,6 +204,7 @@ impl CustomStreamProxy {
             MuxerRx::Reset {
                 local_port: self.local_port,
                 peer_port: self.peer_port,
+                fwd_cnt: self.tx_cnt.0,
             },
             &self.rxq,
             &self.queue,
@@ -910,6 +911,33 @@ mod tests {
         ));
     }
 
+    // A reset takes the guest's view of its send credit from the packet's
+    // buf_alloc and fwd_cnt, like every other packet. Once the guest has sent
+    // more than one window (CONN_TX_BUF_SIZE), a fwd_cnt of 0 would make its
+    // credit buf_alloc - (tx_cnt - 0) wrap to nothing: a socket that still
+    // holds unread data would get no send space and no POLLOUT.
+    #[test]
+    fn reset_after_more_than_one_window_carries_the_real_fwd_cnt() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = writable_proxy(mem);
+        configure_rx(&mut proxy, 1);
+        let sent = defs::CONN_TX_BUF_SIZE + 1024 * 1024;
+        proxy.pending_write.extend(std::iter::repeat_n(7u8, sent));
+        assert_eq!(proxy.flush_pending_write().unwrap(), sent);
+        assert_eq!(proxy.tx_cnt.0 as usize, sent);
+
+        proxy.push_reset();
+        assert_eq!(used_count(&proxy), 1);
+        let reset = rx_packet(&proxy, 0);
+        assert_eq!(reset.op(), uapi::VSOCK_OP_RST);
+        assert_eq!(reset.fwd_cnt() as usize, sent);
+        let guest_tx_cnt = sent as u32;
+        let guest_credit = reset
+            .buf_alloc()
+            .wrapping_sub(guest_tx_cnt.wrapping_sub(reset.fwd_cnt()));
+        assert_eq!(guest_credit, defs::CONN_TX_BUF_SIZE as u32);
+    }
+
     #[test]
     fn retries_credit_after_a_full_control_queue_without_more_application_data() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
@@ -918,7 +946,8 @@ mod tests {
         for port in 0..defs::MUXER_RXQ_SIZE {
             assert!(proxy.rxq.lock().unwrap().push(MuxerRx::Reset {
                 local_port: port as u32,
-                peer_port: 1
+                peer_port: 1,
+                fwd_cnt: 0
             }));
         }
         let packet = tx_packet(&mem, 1, b"x");
@@ -952,7 +981,8 @@ mod tests {
         for port in 0..defs::MUXER_RXQ_SIZE {
             assert!(proxy.rxq.lock().unwrap().push(MuxerRx::Reset {
                 local_port: port as u32,
-                peer_port: 1
+                peer_port: 1,
+                fwd_cnt: 0
             }));
         }
         proxy.sendmsg(&tx_packet(&mem, 1, b"x"));
