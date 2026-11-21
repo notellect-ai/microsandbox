@@ -3796,6 +3796,8 @@ fn open_racing_a_rename_over_does_not_reach_the_replacing_file() {
     let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
     let in_window = std::thread::scope(|scope| {
         let racer = scope.spawn(|| {
+            // Moved in: a Receiver cannot be shared with the scoped thread.
+            let renamed_rx = renamed_rx;
             renamed_rx.recv().unwrap();
             let opened = fs.open(context(), old, false, LINUX_O_RDWR as u32);
             if let Ok((Some(handle), _)) = &opened {
