@@ -1,0 +1,43 @@
+# Proof-only workflow for an upstream PR draft. It lives ONLY on the fork's
+# notellect/pr-proof/<name>[-unfixed] branches (one extra commit on top of the
+# PR branch); the PR branch itself never carries it.
+name: PR proof
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      # The new tests run first: an -unfixed branch must fail here.
+      - name: Tests
+        shell: bash
+        run: cargo test --locked --no-default-features -p microsandbox-filesystem --lib -- open_file_survives_unlink open_file_survives_rename_over a_lookup_of_a_hard_link_inside_the_unlink_window_keeps_the_inode_unretained an_unlink_after_a_host_replace_does_not_pin_the_hosts_file_to_the_old_inode retain_skips_a_handle_holding_another_file
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --locked --no-default-features -p microsandbox-filesystem --all-targets -- -D warnings
+      - name: All filesystem tests
+        shell: bash
+        run: cargo test --locked --no-default-features -p microsandbox-filesystem --lib
