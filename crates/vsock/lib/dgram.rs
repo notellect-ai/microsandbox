@@ -185,7 +185,11 @@ mod tests {
 
         endpoint.send(b"guest-event").unwrap();
         let mut request = [0; 32];
-        let (len, peer) = host.recv_from(&mut request).unwrap();
+        host.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let (len, peer) = host
+            .recv_from(&mut request)
+            .expect("Host receiving the guest datagram");
         assert_eq!(&request[..len], b"guest-event");
         let reply_path = peer.as_pathname().unwrap();
         assert!(

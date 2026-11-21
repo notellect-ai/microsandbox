@@ -88,11 +88,14 @@ jobs:
         shell: bash
         run: |
           cargo clippy --locked --all-targets \
-            -p microsandbox-vsock -p microsandbox-filesystem -p microsandbox-utils \
+            -p test-utils -p microsandbox-vsock -p microsandbox-filesystem -p microsandbox-utils \
             -p msb_krun_devices -p microsandbox-cli -- -D warnings
           cargo clippy --locked --lib --bins \
             -p microsandbox-runtime -p microsandbox -- -D warnings
           cargo clippy --locked -p microsandbox --test windows_job_breakaway -- -D warnings
+
+      - name: Test deadline helpers
+        run: cargo test --locked -p test-utils --lib
 
       - name: Test vsock named-pipe relay
         run: cargo test --locked -p microsandbox-vsock

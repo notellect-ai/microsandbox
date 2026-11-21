@@ -33,6 +33,9 @@ default = ["download-binaries", "embed-binaries"]
 download-binaries = ["embed-binaries", "microsandbox-utils/http-client"]
 embed-binaries = []
 
+[dev-dependencies]
+test-utils.workspace = true
+
 [build-dependencies]
 microsandbox-utils.workspace = true
 
