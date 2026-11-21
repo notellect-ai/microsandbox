@@ -315,10 +315,7 @@ impl PassthroughFs {
         let mut lost: Vec<PathBuf> = Vec::new();
         for (path, data) in moved {
             inodes.by_path.remove(&path);
-            if lost.iter().any(|lost| path.starts_with(lost)) {
-                displaced.push(data);
-                continue;
-            }
+            let _ = &lost;
             // Cached descendants must follow directory renames on bind mounts too.
             // An unrelated destination inode keeps its retained pin.
             let target = if path == old_path {
