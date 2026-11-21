@@ -46,6 +46,8 @@ pub enum MuxerRx {
     Reset {
         local_port: u32,
         peer_port: u32,
+        /// The connection's forwarded byte count; 0 when there is none.
+        fwd_cnt: u32,
     },
     OpRequest {
         local_port: u32,
@@ -289,6 +291,7 @@ impl VsockMuxer {
                 MuxerRx::Reset {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
+                    fwd_cnt: 0,
                 },
                 &self.rxq,
                 queue,
