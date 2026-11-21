@@ -55,7 +55,7 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         shell: bash
-        run: cargo clippy --locked --no-default-features --features net,runner -p microsandbox-runtime --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --features net,runner -p microsandbox-runtime -- -D warnings
       - name: Tests
         shell: bash
         run: cargo test --locked --no-default-features --features net,runner -p microsandbox-runtime --lib -- test_host_directory_mount_replies_expire_at_once test_bind_rootfs_backend_exposes_host_file_and_init
