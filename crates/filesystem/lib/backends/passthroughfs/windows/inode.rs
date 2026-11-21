@@ -227,7 +227,7 @@ impl PassthroughFs {
                 // now holds. Read it again under the lock.
                 identity = self.path_identity(&path)?;
             }
-            if identity.is_none() || data.identity.is_none() || data.identity == identity {
+            if identity.is_none() || data.identity.is_none() || data.identity == identity || data.inode != u64::MAX {
                 // A cached alias (hard link) can outlive the canonical name.
                 if identity.is_some() && data.identity == identity {
                     Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
