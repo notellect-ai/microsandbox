@@ -1286,28 +1286,29 @@ mod tests {
     // Fault injection
     //----------------------------------------------------------------------------------------------
 
-    /// Bytes the relay may hold beyond its guest buffer: one pending read
-    /// chunk plus both directions of the pipe's own buffers.
+    /// Bytes a stalled writer may have handed over beyond the relay's
+    /// MAX_BUFFERED_BYTES: one IO_CHUNK_SIZE operation in flight on the
+    /// relay's side, plus the pipe's own 4096-byte buffers in both
+    /// directions (test pipes are created with 4096-byte quotas).
     const RELAY_SLACK: usize = IO_CHUNK_SIZE + 2 * 4096;
 
-    /// A raw pipe handle another Host thread may use; the PipeHandle that
-    /// owns it outlives every such thread.
-    #[derive(Clone, Copy)]
-    struct SharedPipe(usize);
+    /// A Host pipe end several Host threads use at once. Each holds an Arc,
+    /// so the handle is closed only after the last of them is done with it,
+    /// even when a test fails part way.
+    struct SharedPipe(PipeHandle);
+
+    // Overlapped operations on one pipe handle may run from several threads.
+    unsafe impl Sync for SharedPipe {}
 
     impl SharedPipe {
-        fn of(pipe: &PipeHandle) -> Self {
-            Self(pipe.raw() as usize)
-        }
-
-        fn raw(self) -> HANDLE {
-            self.0 as HANDLE
+        fn raw(&self) -> HANDLE {
+            self.0.raw()
         }
     }
 
     /// A Host end opened for overlapped I/O, so one Host thread can read
     /// while another writes (synchronous handles serialize the two).
-    fn host_pipe_duplex(name: &str) -> PipeHandle {
+    fn host_pipe_duplex(name: &str) -> Arc<SharedPipe> {
         let wide = wide_null(OsStr::new(name));
         let server = unsafe {
             CreateNamedPipeW(
@@ -1322,12 +1323,12 @@ mod tests {
             )
         };
         assert_ne!(server, INVALID_HANDLE_VALUE);
-        PipeHandle(server)
+        Arc::new(SharedPipe(PipeHandle(server)))
     }
 
     /// Run one overlapped operation on `pipe` to completion.
     fn host_overlapped(
-        pipe: SharedPipe,
+        pipe: &SharedPipe,
         start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
     ) -> io::Result<usize> {
         let event = Event::new(true)?;
@@ -1349,14 +1350,14 @@ mod tests {
         Ok(transferred as usize)
     }
 
-    fn duplex_accept(pipe: SharedPipe) {
+    fn duplex_accept(pipe: &SharedPipe) {
         host_overlapped(pipe, |handle, overlapped| unsafe {
             ConnectNamedPipe(handle, overlapped)
         })
         .unwrap();
     }
 
-    fn duplex_read_exact(pipe: SharedPipe, count: usize) -> Vec<u8> {
+    fn duplex_read_exact(pipe: &SharedPipe, count: usize) -> Vec<u8> {
         let mut out = vec![0; count];
         let mut filled = 0;
         while filled < count {
@@ -1377,7 +1378,7 @@ mod tests {
         out
     }
 
-    fn duplex_write_all(pipe: SharedPipe, mut bytes: &[u8]) {
+    fn duplex_write_all(pipe: &SharedPipe, mut bytes: &[u8]) {
         while !bytes.is_empty() {
             let chunk = &bytes[..bytes.len().min(IO_CHUNK_SIZE)];
             let written = host_overlapped(pipe, |handle, overlapped| unsafe {
@@ -1441,10 +1442,19 @@ mod tests {
             server
         });
         let endpoint = guest_connect(&name);
-        // The guest reads nothing: the relay must stop reading once its
-        // buffer is full, which stalls the Host's writes.
-        let mut last = usize::MAX;
+        // The guest reads nothing: the relay must take a full buffer from
+        // the Host...
         let settle = Instant::now() + DEADLINE;
+        while sent.load(std::sync::atomic::Ordering::SeqCst) < MAX_BUFFERED_BYTES {
+            assert!(
+                Instant::now() < settle,
+                "the relay stopped reading after {} bytes, short of its buffer",
+                sent.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            std::thread::yield_now();
+        }
+        // ...and then stop reading, which stalls the Host's writes.
+        let mut last = usize::MAX;
         loop {
             std::thread::sleep(Duration::from_millis(200));
             let now = sent.load(std::sync::atomic::Ordering::SeqCst);
@@ -1455,7 +1465,7 @@ mod tests {
             last = now;
         }
         assert!(
-            last <= MAX_BUFFERED_BYTES + RELAY_SLACK + IO_CHUNK_SIZE,
+            (MAX_BUFFERED_BYTES..=MAX_BUFFERED_BYTES + RELAY_SLACK).contains(&last),
             "the relay took {last} bytes the guest has not read"
         );
         assert_eq!(guest_read_up_to(&*endpoint, LENGTH), pattern(LENGTH, 7));
@@ -1483,8 +1493,10 @@ mod tests {
             .expect("Host accepting the guest");
         let flood = pattern(LENGTH, 8);
         let accepted = guest_write_until_full(&*endpoint, &flood, Duration::from_millis(300));
+        // write() refuses only once MAX_BUFFERED_BYTES are queued, so the
+        // guest got at least that far.
         assert!(
-            accepted <= MAX_BUFFERED_BYTES + RELAY_SLACK + IO_CHUNK_SIZE,
+            (MAX_BUFFERED_BYTES..=MAX_BUFFERED_BYTES + RELAY_SLACK).contains(&accepted),
             "the relay accepted {accepted} bytes the Host has not read"
         );
         read_tx.send(()).unwrap();
@@ -1497,25 +1509,26 @@ mod tests {
         let name = pipe_name("bothways");
         let server = host_pipe_duplex(&name);
         const LENGTH: usize = 2 * MAX_BUFFERED_BYTES + 12_345;
-        let pipe = SharedPipe::of(&server);
         let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let pipe = Arc::clone(&server);
         let host_writer = std::thread::spawn(move || {
-            duplex_accept(pipe);
+            duplex_accept(&pipe);
             accepted_tx.send(()).unwrap();
-            duplex_write_all(pipe, &pattern(LENGTH, 9));
+            duplex_write_all(&pipe, &pattern(LENGTH, 9));
         });
         let endpoint = guest_connect(&name);
         accepted_rx
             .recv_timeout(DEADLINE)
             .expect("Host accepting the guest");
-        let host_reader = std::thread::spawn(move || duplex_read_exact(pipe, LENGTH));
+        let pipe = Arc::clone(&server);
+        let host_reader = std::thread::spawn(move || duplex_read_exact(&pipe, LENGTH));
         // The guest writes and reads together on one thread, as the muxer
         // does: neither direction may wait for the other to finish.
         let outgoing = pattern(LENGTH, 10);
         let mut sent = 0;
         let mut received = Vec::with_capacity(LENGTH);
         let mut chunk = vec![0; 70_000];
-        let deadline = Instant::now() + 6 * DEADLINE;
+        let deadline = Instant::now() + DEADLINE;
         while sent < LENGTH || received.len() < LENGTH {
             let mut progressed = false;
             if sent < LENGTH {
@@ -1614,7 +1627,10 @@ mod tests {
                 }
             }
         });
-        assert!(drained < 1 << 20, "the whole write went through: {error}");
+        assert!(
+            drained < 1 << 20,
+            "the whole write went through: {drained} bytes, then {error}"
+        );
         // The guest end reports the stream as finished, not as still busy.
         assert_eq!(endpoint.read(&mut [0_u8; 16]).unwrap(), 0);
         assert!(endpoint.write(b"more").is_err());
