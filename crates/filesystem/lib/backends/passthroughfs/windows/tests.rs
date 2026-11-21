@@ -4142,14 +4142,14 @@ fn an_unlink_after_a_host_replace_does_not_pin_the_hosts_file_to_the_old_inode()
 
         fs.unlink(context(), ROOT_INODE, c"data").unwrap();
         assert!(!temp.path.join("data").exists());
-        if let Some(inode) = fs.inodes.read().unwrap().by_inode.get(&data) {
-            if let Some(file) = inode.retained.lock().unwrap().as_ref() {
-                assert_ne!(
-                    mobility::file_identity(file).ok(),
-                    host_identity,
-                    "owned {owned}: the old inode pins the Host's file"
-                );
-            }
+        if let Some(inode) = fs.inodes.read().unwrap().by_inode.get(&data)
+            && let Some(file) = inode.retained.lock().unwrap().as_ref()
+        {
+            assert_ne!(
+                mobility::file_identity(file).ok(),
+                host_identity,
+                "owned {owned}: the old inode pins the Host's file"
+            );
         }
         fs.release(context(), data, 0, handle, false, false, None)
             .unwrap();
