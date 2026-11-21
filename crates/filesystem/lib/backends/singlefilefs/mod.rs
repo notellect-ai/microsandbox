@@ -875,6 +875,47 @@ mod tests {
         }
     }
 
+    // The runtime builds a single-file mount with the passthrough default
+    // timeouts. The guest kernel caches an entry and its attributes for the
+    // timeout each reply carries, so every reply for the file must carry
+    // zero: after a Host atomic replace the guest's next stat sees the new
+    // size, on every platform.
+    #[test]
+    fn replies_for_the_file_expire_at_once_after_a_host_replace() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("selected.txt");
+        let replacement = temp.path().join("replacement.txt");
+        std::fs::write(&source, b"old").unwrap();
+        let fs = SingleFileFs::new(
+            source.clone(),
+            "config.txt".to_string(),
+            PassthroughConfig {
+                root_dir: temp.path().to_path_buf(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let entry = fs.lookup(context(), ROOT_INODE, c"config.txt").unwrap();
+        assert_eq!(entry.attr.st_size, 3);
+        assert_eq!(entry.entry_timeout, Duration::ZERO);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
+
+        std::fs::write(&replacement, b"new contents").unwrap();
+        #[cfg(windows)]
+        std::fs::remove_file(&source).unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+
+        let (attr, timeout) = fs.getattr(context(), entry.inode, None).unwrap();
+        assert_eq!(attr.st_size, b"new contents".len() as _);
+        assert_eq!(timeout, Duration::ZERO);
+        let entry = fs.lookup(context(), ROOT_INODE, c"config.txt").unwrap();
+        assert_eq!(entry.attr.st_size, b"new contents".len() as _);
+        assert_eq!(entry.entry_timeout, Duration::ZERO);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
+    }
+
     #[test]
     fn replacement_keeps_the_old_open_handle_valid() {
         let temp = tempfile::tempdir().unwrap();
