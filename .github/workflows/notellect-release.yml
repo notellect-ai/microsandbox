@@ -1,0 +1,242 @@
+# Notellect's build of msb: upstream at the same version plus the commits on
+# this branch. Every other upstream workflow is removed so a tag here never
+# publishes upstream packages.
+#
+# The graph follows upstream's release.yml: the kernel source is fetched once,
+# each guest architecture's firmware (kernel.c) and agentd are built once, and
+# every host target links its own libkrunfw from that kernel.c and embeds the
+# matching agentd in msb. Pushing a v*-notellect.* tag publishes msb and
+# libkrunfw for every target with checksums.sha256; a manual run only builds.
+name: Notellect msb release
+
+on:
+  push:
+    tags: ["v*-notellect.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUST_TOOLCHAIN: "1.100.0"
+  LIBKRUNFW_ABI: "5"
+  LIBKRUNFW_VERSION: "5.6.1"
+
+jobs:
+  kernel-sources:
+    name: Kernel sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Prepare kernel source
+        uses: ./.github/actions/cache-libkrunfw-kernel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-source
+          path: vendor/libkrunfw/tarballs/*.tar.gz
+          compression-level: 0
+
+  firmware:
+    name: Firmware (${{ matrix.artifact }})
+    needs: kernel-sources
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { artifact: firmware-aarch64, runner: ubuntu-24.04-arm, make_args: "" }
+          - { artifact: firmware-x86_64, runner: ubuntu-latest, make_args: "" }
+          - { artifact: firmware-windows-x86_64, runner: ubuntu-latest, make_args: "OS=Windows kernel.c" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Install firmware build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-source
+          path: vendor/libkrunfw/tarballs
+
+      - name: Build firmware
+        working-directory: vendor/libkrunfw
+        run: make -j$(nproc) ${{ matrix.make_args }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: vendor/libkrunfw/kernel.c
+          if-no-files-found: error
+          compression-level: 0
+
+  agentd:
+    name: agentd (${{ matrix.arch }}-linux-musl)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+          - { arch: x86_64, runner: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and musl
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target ${{ matrix.arch }}-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Build agentd
+        run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.arch }}-unknown-linux-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentd-${{ matrix.arch }}
+          path: target/${{ matrix.arch }}-unknown-linux-musl/release/agentd
+          if-no-files-found: error
+          compression-level: 0
+
+  build:
+    name: msb (${{ matrix.target }})
+    needs: [firmware, agentd]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-aarch64, runner: macos-15, firmware: firmware-aarch64, agentd: agentd-aarch64, library: libkrunfw-darwin-aarch64.dylib }
+          - { target: linux-x86_64, runner: ubuntu-22.04, firmware: firmware-x86_64, agentd: agentd-x86_64, library: libkrunfw-linux-x86_64.so }
+          - { target: linux-aarch64, runner: ubuntu-22.04-arm, firmware: firmware-aarch64, agentd: agentd-aarch64, library: libkrunfw-linux-aarch64.so }
+          - { target: windows-x86_64, runner: windows-latest, firmware: firmware-windows-x86_64, agentd: agentd-x86_64, library: libkrunfw-windows-x86_64.dll, rust_target: x86_64-pc-windows-msvc, vs_arch: amd64 }
+          - { target: windows-aarch64, runner: windows-11-arm, firmware: firmware-aarch64, agentd: agentd-aarch64, library: libkrunfw-windows-aarch64.dll, rust_target: aarch64-pc-windows-msvc, vs_arch: arm64 }
+    env:
+      # msb embeds this agentd; the CLI builds without download-binaries, so
+      # nothing is fetched from an upstream release.
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}/agentd
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          if [ -n "${{ matrix.rust_target }}" ]; then rustup target add "${{ matrix.rust_target }}"; fi
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libcap-ng-dev
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.agentd }}
+          path: agentd
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.firmware }}
+          path: firmware
+
+      - name: Build libkrunfw (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          cc -fPIC -DABI_VERSION=$LIBKRUNFW_ABI -shared -Wl,-headerpad_max_install_names \
+            -o dist/${{ matrix.library }} firmware/kernel.c
+
+      - name: Build libkrunfw (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cc -fPIC -DABI_VERSION=$LIBKRUNFW_ABI -shared -Wl,-soname,libkrunfw.so.$LIBKRUNFW_ABI \
+            -o dist/${{ matrix.library }} firmware/kernel.c
+          strip dist/${{ matrix.library }}
+
+      - name: Build msb (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli --bin msb
+          cp target/release/msb dist/msb-${{ matrix.target }}
+
+      - name: Codesign msb (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --entitlements msb-entitlements.plist --force -s - dist/msb-${{ matrix.target }}
+
+      - name: Checkout libkrunfw sources (Windows)
+        if: runner.os == 'Windows'
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Build libkrunfw (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Copy-Item firmware\kernel.c vendor\libkrunfw\kernel.c -Force
+          & .\vendor\libkrunfw\scripts\build-windows.ps1 `
+            -SkipKernelBundle `
+            -AbiVersion $env:LIBKRUNFW_ABI `
+            -Architecture ${{ matrix.vs_arch }} `
+            -HostArchitecture ${{ matrix.vs_arch }} `
+            -Output libkrunfw.dll `
+            -ImportLibrary libkrunfw.lib
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item vendor\libkrunfw\libkrunfw.dll dist\${{ matrix.library }} -Force
+
+      - name: Build msb (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_arch }}
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli --bin msb --target ${{ matrix.rust_target }}
+          Copy-Item target\${{ matrix.rust_target }}\release\msb.exe dist\msb-${{ matrix.target }}.exe -Force
+
+      - name: Verify msb
+        shell: bash
+        run: for binary in dist/msb-*; do "$binary" --version; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msb-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: msb-*
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum msb-* libkrunfw-* > checksums.sha256
+          cat checksums.sha256
+          upstream="${GITHUB_REF_NAME%-notellect.*}"
+          gh release create "$GITHUB_REF_NAME" msb-* libkrunfw-* checksums.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Upstream $upstream plus the commits on branch notellect/$upstream (see NOTELLECT.md). msb embeds agentd, and libkrunfw is built from upstream $upstream's vendor/libkrunfw."
