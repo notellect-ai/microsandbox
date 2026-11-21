@@ -685,6 +685,21 @@ jobs:
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
           cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} dax_
 
+      - name: Test Windows filesystem open files after unlink
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} -- `
+            open_file_survives_ `
+            open_racing_a_rename_over_does_not_reach_the_replacing_file `
+            retain_skips_a_handle_holding_another_file `
+            open_and_write_racing_an_unlink_stay_on_the_removed_file `
+            a_lookup_of_a_hard_link_inside_the_unlink_window_keeps_the_inode_unretained `
+            an_unlink_after_a_host_replace_does_not_pin_the_hosts_file_to_the_old_inode `
+            host_holding_a_file_without_share_delete_fails_unlink_and_rename_cleanly
+
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
