@@ -4062,3 +4062,150 @@ fn host_holding_a_file_without_share_delete_fails_unlink_and_rename_cleanly() {
     fs.release(context(), data, 0, handle, false, false, None)
         .unwrap();
 }
+
+/// The Host replaces a file the guest has looked up and holds open, by
+/// deleting and renaming or by renaming over it. A fresh lookup must reach
+/// the new file with an inode of its own, an open through the old inode
+/// fails with ESTALE (so the guest kernel looks the name up again), and the
+/// handle the guest holds keeps reading the old file.
+#[test]
+fn a_host_replace_gives_the_name_a_new_inode() {
+    for delete_first in [true, false] {
+        let temp = TempDir::new();
+        let fs = fs_for(&temp.path);
+        let (old, handle) = create_with(&fs, context(), c"config", 0o644, b"old contents");
+        let path = temp.path.join("config");
+        let staged = temp.path.join("config.new");
+        std::fs::write(&staged, b"new").unwrap();
+        if delete_first {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::rename(&staged, &path).unwrap();
+
+        expect_errno(fs.open(context(), old, false, 0), LINUX_ESTALE);
+        let entry = fs.lookup(context(), ROOT_INODE, c"config").unwrap();
+        assert_ne!(entry.inode, old, "delete first: {delete_first}");
+        assert_eq!(entry.attr.st_size, 3);
+        let (new_handle, _) = fs.open(context(), entry.inode, false, 0).unwrap();
+        let new_handle = new_handle.unwrap();
+        assert_eq!(read_all(&fs, entry.inode, new_handle).unwrap(), b"new");
+        assert_eq!(read_all(&fs, old, handle).unwrap(), b"old contents");
+        // The name keeps its new inode on later lookups.
+        assert_eq!(
+            fs.lookup(context(), ROOT_INODE, c"config").unwrap().inode,
+            entry.inode
+        );
+        fs.release(context(), entry.inode, 0, new_handle, false, false, None)
+            .unwrap();
+        fs.release(context(), old, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
+/// A lookup of the destination name inside the window between the host
+/// rename and the inode table following it already finds the moved file.
+/// When the rename finishes, the name must keep that inode, valid and
+/// holding the moved contents, and the replaced inode must refuse opens.
+#[test]
+fn a_lookup_inside_the_rename_window_keeps_the_moved_inode() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (old, handle) = create_with(&fs, context(), c"data", 0o644, b"old contents");
+    fs.release(context(), old, 0, handle, false, false, None)
+        .unwrap();
+    let (new, handle) = create_with(&fs, context(), c"tmp", 0o644, b"new");
+    fs.release(context(), new, 0, handle, false, false, None)
+        .unwrap();
+
+    let (renamed_tx, renamed_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let _deadline = Deadline::start("lookup inside the rename window", SCOPE_LIMIT);
+    let in_window = std::thread::scope(|scope| {
+        let racer = scope.spawn(|| {
+            // Moved in: a Receiver cannot be shared with the scoped thread.
+            let renamed_rx = renamed_rx;
+            renamed_rx
+                .recv_timeout(STEP_LIMIT)
+                .expect("rename reaching its hook");
+            let entry = fs.lookup(context(), ROOT_INODE, c"data");
+            resume_tx.send(()).unwrap();
+            entry.map(|entry| entry.inode)
+        });
+        remove_ops::AFTER_HOST_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                renamed_tx.send(()).unwrap();
+                resume_rx
+                    .recv_timeout(STEP_LIMIT)
+                    .expect("racing lookup finished");
+            }));
+        });
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap();
+        racer.join().unwrap()
+    });
+
+    assert_eq!(in_window.unwrap(), new);
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+    assert_eq!(entry.inode, new);
+    assert_eq!(fs.getattr(context(), new, None).unwrap().0.st_size, 3);
+    let (handle, _) = fs.open(context(), new, false, 0).unwrap();
+    let handle = handle.unwrap();
+    assert_eq!(read_all(&fs, new, handle).unwrap(), b"new");
+    fs.release(context(), new, 0, handle, false, false, None)
+        .unwrap();
+    assert!(fs.open(context(), old, false, 0).is_err());
+    expect_errno(fs.lookup(context(), ROOT_INODE, c"tmp"), LINUX_ENOENT);
+}
+
+/// The Host replaces a directory whose child the guest has looked up, by
+/// deleting it and renaming another directory into its place. The child's
+/// name must reach the new directory's child (or nothing), never the cached
+/// inode of the old child, and the old directory inode refuses lookups.
+#[test]
+fn a_host_directory_replace_does_not_keep_old_children() {
+    for new_has_child in [true, false] {
+        let temp = TempDir::new();
+        let dir = temp.path.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("child"), b"old child").unwrap();
+        let fs = fs_for(&temp.path);
+        let old_dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
+        let old_child = fs.lookup(context(), old_dir, c"child").unwrap().inode;
+
+        let staged = temp.path.join("dir.new");
+        std::fs::create_dir(&staged).unwrap();
+        if new_has_child {
+            std::fs::write(staged.join("child"), b"new").unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::rename(&staged, &dir).unwrap();
+
+        let new_dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
+        assert_ne!(new_dir, old_dir, "new has child: {new_has_child}");
+        if new_has_child {
+            let child = fs.lookup(context(), new_dir, c"child").unwrap();
+            assert_ne!(child.inode, old_child);
+            assert_eq!(child.attr.st_size, 3);
+            let (handle, _) = fs.open(context(), child.inode, false, 0).unwrap();
+            let handle = handle.unwrap();
+            assert_eq!(read_all(&fs, child.inode, handle).unwrap(), b"new");
+            fs.release(context(), child.inode, 0, handle, false, false, None)
+                .unwrap();
+        } else {
+            expect_errno(fs.lookup(context(), new_dir, c"child"), LINUX_ENOENT);
+        }
+        assert!(fs.open(context(), old_child, false, 0).is_err());
+        expect_errno(fs.lookup(context(), old_dir, c"child"), LINUX_ESTALE);
+        let inodes = fs.inodes.read().unwrap();
+        for stale in [old_dir, old_child] {
+            assert!(
+                !inodes.by_inode.contains_key(&stale),
+                "inode {stale} still tracked (new has child: {new_has_child})"
+            );
+            assert!(
+                !inodes.by_path.values().any(|data| data.inode == stale),
+                "a name still leads to inode {stale} (new has child: {new_has_child})"
+            );
+        }
+    }
+}
