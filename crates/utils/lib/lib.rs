@@ -1,6 +1,7 @@
 //! Shared constants and utilities for the microsandbox project.
 
 pub mod copy;
+pub mod elevation_share;
 pub mod extent;
 pub mod format;
 pub mod log_text;
