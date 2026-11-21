@@ -4331,8 +4331,10 @@ enum MatrixWindow {
 const MATRIX_RACER_WAIT: Duration = Duration::from_millis(100);
 
 struct MatrixSetup {
-    /// The guest's open handle on the object the operation removes or moves.
-    held: (u64, u64),
+    /// The guest's open handle on the object the operation removes or moves
+    /// (none for a directory rename: Windows refuses to rename a directory
+    /// with an open file inside).
+    held: Option<(u64, u64)>,
     /// Inodes the guest has cached, with the contents of their own file
     /// (`None` for a directory).
     cached: Vec<(u64, Option<&'static [u8]>)>,
@@ -4370,7 +4372,7 @@ fn matrix_setup(fs: &PassthroughFs, root: &Path, guest: MatrixGuest) -> MatrixSe
             fs.release(context(), other, 0, handle, false, false, None)
                 .unwrap();
             MatrixSetup {
-                held: (data, held),
+                held: Some((data, held)),
                 cached: vec![(data, Some(b"old")), (other, Some(b"other"))],
                 paths: &["data", "other"],
                 dirs: Vec::new(),
@@ -4382,7 +4384,7 @@ fn matrix_setup(fs: &PassthroughFs, root: &Path, guest: MatrixGuest) -> MatrixSe
             fs.release(context(), tmp, 0, handle, false, false, None)
                 .unwrap();
             MatrixSetup {
-                held: (data, held),
+                held: Some((data, held)),
                 cached: vec![(data, Some(b"old")), (tmp, Some(b"new"))],
                 paths: &["data", "tmp", "moved"],
                 dirs: Vec::new(),
@@ -4393,9 +4395,8 @@ fn matrix_setup(fs: &PassthroughFs, root: &Path, guest: MatrixGuest) -> MatrixSe
             std::fs::write(root.join("dir").join("child"), b"child").unwrap();
             let dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
             let child = fs.lookup(context(), dir, c"child").unwrap().inode;
-            let (handle, _) = fs.open(context(), child, false, 0).unwrap();
             MatrixSetup {
-                held: (child, handle.unwrap()),
+                held: None,
                 cached: vec![(dir, None), (child, Some(b"child"))],
                 paths: &[
                     "dir",
@@ -4507,11 +4508,14 @@ impl MatrixRace<'_> {
                 }
             }
             MatrixRacer::ReleaseForget => {
-                let (inode, handle) = self.setup.held;
-                fs.release(context(), inode, 0, handle, false, false, None)
-                    .unwrap();
-                self.held_released.store(true, Ordering::Release);
-                fs.forget(context(), inode, 1);
+                if let Some((inode, handle)) = self.setup.held {
+                    fs.release(context(), inode, 0, handle, false, false, None)
+                        .unwrap();
+                    self.held_released.store(true, Ordering::Release);
+                }
+                for &(inode, _) in &self.setup.cached {
+                    fs.forget(context(), inode, 1);
+                }
             }
             MatrixRacer::Readdir => {
                 for &dir in std::iter::once(&ROOT_INODE).chain(&self.setup.dirs) {
@@ -4665,8 +4669,9 @@ fn run_matrix_cell(
     assert_matrix_tables(&fs, &cell, false);
 
     // The guest lets go of everything: its handles and its lookups.
-    if !held_released.load(Ordering::Acquire) {
-        let (inode, handle) = setup.held;
+    if let Some((inode, handle)) = setup.held
+        && !held_released.load(Ordering::Acquire)
+    {
         fs.release(context(), inode, 0, handle, false, false, None)
             .unwrap();
     }
