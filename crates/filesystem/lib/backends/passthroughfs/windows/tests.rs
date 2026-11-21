@@ -4411,15 +4411,14 @@ fn matrix_setup(fs: &PassthroughFs, root: &Path, guest: MatrixGuest) -> MatrixSe
     }
 }
 
-fn matrix_guest_op(fs: &PassthroughFs, guest: MatrixGuest) {
-    match guest {
-        MatrixGuest::Unlink => fs.unlink(context(), ROOT_INODE, c"data").unwrap(),
-        MatrixGuest::RenameOver => fs
-            .rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
-            .unwrap(),
-        MatrixGuest::RenameDir => fs
-            .rename(context(), ROOT_INODE, c"dir", ROOT_INODE, c"dir2", 0)
-            .unwrap(),
+fn matrix_guest_op(fs: &PassthroughFs, guest: MatrixGuest, cell: &str) {
+    let result = match guest {
+        MatrixGuest::Unlink => fs.unlink(context(), ROOT_INODE, c"data"),
+        MatrixGuest::RenameOver => fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0),
+        MatrixGuest::RenameDir => fs.rename(context(), ROOT_INODE, c"dir", ROOT_INODE, c"dir2", 0),
+    };
+    if let Err(error) = result {
+        panic!("{cell}: the guest operation failed: {error:?}");
     }
 }
 
@@ -4653,7 +4652,7 @@ fn run_matrix_cell(
             race.run(racer);
             let _ = racer_done_tx.send(());
         });
-        matrix_guest_op(&fs, guest);
+        matrix_guest_op(&fs, guest, &cell);
         racer_thread.join().unwrap();
     });
     remove_ops::AFTER_HOST_UNLINK.with(|slot| slot.borrow_mut().take());
