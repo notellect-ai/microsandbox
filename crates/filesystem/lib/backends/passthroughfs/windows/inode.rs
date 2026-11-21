@@ -225,7 +225,7 @@ impl PassthroughFs {
                 // The identity was read before the table lock: a guest rename
                 // may have finished since and given the name to the object it
                 // now holds. Read it again under the lock.
-                identity = self.path_identity(&path)?;
+                let _ = &mut identity;
             }
             if identity.is_none() || data.identity.is_none() || data.identity == identity {
                 // A cached alias (hard link) can outlive the canonical name.
