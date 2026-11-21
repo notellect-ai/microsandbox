@@ -83,7 +83,7 @@ impl PassthroughFs {
             // inode's own.
             let mut options = open_options_from_flags(flags, false)?;
             let file = options
-                .truncate(false)
+                .truncate(true)
                 .open(data.path())
                 .map_err(host_error)?;
             if mobility::file_identity(&file)? != identity {
