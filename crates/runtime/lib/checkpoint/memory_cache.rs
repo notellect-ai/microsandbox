@@ -553,48 +553,13 @@ pub(super) fn windows_file_identity(file: &File) -> io::Result<(u32, u32, u32)> 
 }
 
 /// Guest RAM must not inherit broad read permissions from a custom cache parent.
+///
+/// The grant names the account's user SID, which elevated and non-elevated runs of one
+/// Windows user share. OWNER RIGHTS would follow the owner instead, and an elevated run
+/// makes BUILTIN\Administrators the owner, which a later non-elevated run is not.
 #[cfg(windows)]
 fn restrict_cache_directory(path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
-    };
-    // OWNER RIGHTS follows the actual owner; SYSTEM is retained for OS maintenance. Children
-    // inherit these ACEs. This is local-user confidentiality, not an adversarial-host boundary.
-    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)\0"
-        .encode_utf16()
-        .collect();
-    let mut descriptor = std::ptr::null_mut();
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            1,
-            &mut descriptor,
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let success = unsafe {
-        SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            descriptor,
-        )
-    };
-    let result = if success == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    };
-    unsafe {
-        LocalFree(descriptor);
-    }
-    result
+    microsandbox_utils::private_file::harden_existing_directory(path)
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -1028,5 +993,48 @@ mod tests {
             .read_exact_at(&mut actual, cache.page_size * 2)
             .unwrap();
         assert_eq!(actual, bytes);
+    }
+
+    /// The cache grants the user's SID, not OWNER RIGHTS, so a directory an elevated run
+    /// created (owned by BUILTIN\Administrators) stays usable by a non-elevated run.
+    #[cfg(windows)]
+    #[test]
+    fn windows_cache_directories_grant_the_user_sid_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("memory");
+        let cache = MemoryCache::open(&root).unwrap();
+        for directory in [root.as_path(), cache.root.as_path()] {
+            let script = format!(
+                "$a = Get-Acl -LiteralPath '{}'; \
+                 $u = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \
+                 $r = $a.Access | ForEach-Object {{ \
+                   $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value + '|' + \
+                   $_.AccessControlType + '|' + $_.FileSystemRights + '|' + $_.InheritanceFlags }}; \
+                 'protected=' + $a.AreAccessRulesProtected; \
+                 'rules=' + ($r -join ';'); \
+                 'user=' + $u",
+                directory.display()
+            );
+            let output = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8_lossy(&output.stdout);
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|line| line.trim().strip_prefix(name))
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let user = field("user=");
+            assert!(user.starts_with("S-1-5-"), "{text}");
+            assert_eq!(field("protected="), "True", "{text}");
+            assert_eq!(
+                field("rules="),
+                format!("{user}|Allow|FullControl|ContainerInherit, ObjectInherit"),
+                "{text}"
+            );
+        }
     }
 }
