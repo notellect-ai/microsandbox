@@ -36,8 +36,7 @@ use tokio::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    SetHandleInformation,
+    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
@@ -1074,24 +1073,6 @@ fn spawn_runtime_command(
     } else {
         None
     };
-    #[cfg(windows)]
-    if matches!(_mode, SpawnMode::Detached) {
-        return match cmd.spawn() {
-            // A launcher job without JOB_OBJECT_LIMIT_BREAKAWAY_OK (Task Scheduler, some
-            // terminals and CI agents) makes CreateProcess with CREATE_BREAKAWAY_FROM_JOB fail
-            // with ERROR_ACCESS_DENIED. Jobs nest since Windows 8, so start the runtime inside
-            // the launcher's job instead; it then ends with that job, as it may.
-            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-                tracing::warn!(
-                    "detached spawn: the launcher's job object forbids breakaway, so the sandbox \
-                     runtime starts inside it and will be terminated when that job ends"
-                );
-                cmd.creation_flags(DETACHED_SPAWN_FLAGS);
-                cmd.spawn()
-            }
-            result => result,
-        };
-    }
     cmd.spawn()
 }
 
