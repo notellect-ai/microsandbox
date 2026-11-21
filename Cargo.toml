@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["sdk/rust/fuzz"]
+exclude = ["sdk/rust/fuzz", "vendor"]
 members = [
     "crates/agentd",
     "crates/cli",
@@ -232,3 +232,9 @@ russh-sftp = "2.3.0"
 [patch.crates-io]
 msb_krun = { git = "https://github.com/superradcompany/libkrun", rev = "77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3" }
 msb_krun_utils = { git = "https://github.com/superradcompany/libkrun", rev = "77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3" }
+
+# Notellect fork: msb_krun_devices from the libkrun rev above, with resets
+# that carry the Host's receive credit (see
+# vendor/msb_krun_devices/src/virtio/vsock/muxer_rxq.rs).
+[patch."https://github.com/superradcompany/libkrun"]
+msb_krun_devices = { path = "vendor/msb_krun_devices" }
