@@ -4060,6 +4060,102 @@ fn a_lookup_racing_a_rename_over_does_not_keep_the_closed_destination() {
     assert_eq!(std::fs::read(temp.path.join("data")).unwrap(), b"new");
 }
 
+/// A lookup of a hard link inside the unlink's window, after the Host
+/// removed the name, gives the unlinked inode its other name: the update
+/// must not leave it retained while it is still named.
+#[test]
+fn a_lookup_of_a_hard_link_inside_the_unlink_window_keeps_the_inode_unretained() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (data, handle) = create_with(&fs, context(), c"data", 0o644, b"linked");
+    std::fs::hard_link(temp.path.join("data"), temp.path.join("alias")).unwrap();
+
+    let _deadline = Deadline::start("hard link lookup in the unlink window", SCOPE_LIMIT);
+    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel::<()>();
+    let (looked_up_tx, looked_up_rx) = std::sync::mpsc::channel::<()>();
+    let looked_up = std::thread::scope(|scope| {
+        let looker = scope.spawn(|| {
+            let lookup_rx = lookup_rx;
+            lookup_rx
+                .recv_timeout(STEP_LIMIT)
+                .expect("unlink reaching its host unlink hook");
+            let inode = fs.lookup(context(), ROOT_INODE, c"alias").unwrap().inode;
+            looked_up_tx.send(()).unwrap();
+            inode
+        });
+        remove_ops::AFTER_HOST_UNLINK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                lookup_tx.send(()).unwrap();
+                looked_up_rx
+                    .recv_timeout(STEP_LIMIT)
+                    .expect("alias looked up");
+            }));
+        });
+        fs.unlink(context(), ROOT_INODE, c"data").unwrap();
+        remove_ops::AFTER_HOST_UNLINK.with(|hook| hook.borrow_mut().take());
+        looker.join().unwrap()
+    });
+
+    assert_eq!(looked_up, data, "the hard link names the same inode");
+    {
+        let inodes = fs.inodes.read().unwrap();
+        let inode = inodes.by_inode.get(&data).expect("named inode tracked");
+        assert!(
+            inode.retained.lock().unwrap().is_none(),
+            "a named inode is retained"
+        );
+        assert_eq!(inode.path(), temp.path.join("alias"));
+        assert!(!inodes.by_path.contains_key(&temp.path.join("data")));
+    }
+    fs.release(context(), data, 0, handle, false, false, None)
+        .unwrap();
+    fs.forget(context(), data, 2);
+    assert!(
+        !fs.inodes.read().unwrap().by_inode.contains_key(&data),
+        "the forgotten inode is still tracked"
+    );
+    let alias = fs.lookup(context(), ROOT_INODE, c"alias").unwrap().inode;
+    let (handle, _) = fs
+        .open(context(), alias, false, libc::O_RDONLY as u32)
+        .unwrap();
+    assert_eq!(read_all(&fs, alias, handle.unwrap()).unwrap(), b"linked");
+}
+
+/// The Host replaced the file at a guest-looked-up name, then the guest
+/// unlinks the name: the unlink removes the Host's file, but must not pin it
+/// as the content of the guest's old inode.
+#[test]
+fn an_unlink_after_a_host_replace_does_not_pin_the_hosts_file_to_the_old_inode() {
+    for owned in [false, true] {
+        let temp = TempDir::new();
+        let fs = if owned {
+            owned_fs_for(&temp.path, crate::OwnedDirectoryCheckpoint::default())
+        } else {
+            fs_for(&temp.path)
+        };
+        let (data, handle) = create_with(&fs, context(), c"data", 0o644, b"old");
+        let old_identity = fs.inodes.read().unwrap().by_inode[&data].identity;
+        std::fs::write(temp.path.join("host.tmp"), b"host file").unwrap();
+        std::fs::rename(temp.path.join("host.tmp"), temp.path.join("data")).unwrap();
+        let host_identity = fs.path_identity(&temp.path.join("data")).unwrap();
+        assert_ne!(old_identity, host_identity);
+
+        fs.unlink(context(), ROOT_INODE, c"data").unwrap();
+        assert!(!temp.path.join("data").exists());
+        if let Some(inode) = fs.inodes.read().unwrap().by_inode.get(&data) {
+            if let Some(file) = inode.retained.lock().unwrap().as_ref() {
+                assert_ne!(
+                    mobility::file_identity(file).ok(),
+                    host_identity,
+                    "owned {owned}: the old inode pins the Host's file"
+                );
+            }
+        }
+        fs.release(context(), data, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
 /// A Host process holding a file open without FILE_SHARE_DELETE makes the
 /// guest's unlink and rename fail. The failure must leave everything as it
 /// was: the names, their inodes, the guest's open handle and the contents.
