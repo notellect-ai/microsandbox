@@ -627,7 +627,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          # The test changes this process's token defaults; it prints whether the runner is elevated.
+          # The test re-runs itself as an emulated elevated runtime and checks access with a filtered (Administrators deny-only, Medium) token.
           cargo +stable test -p microsandbox-utils --lib --target ${{ matrix.rust_target }} elevation_share:: -- --nocapture
 
       - name: Test bind rootfs patches
