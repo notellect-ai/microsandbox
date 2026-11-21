@@ -301,7 +301,7 @@ impl PassthroughFs {
         }
     }
 
-    fn finish_removed_alias(&self, inodes: &mut InodeTable, data: &Arc<InodeData>) {
+    pub(super) fn finish_removed_alias(&self, inodes: &mut InodeTable, data: &Arc<InodeData>) {
         if let Some(path) = inodes
             .by_path
             .iter()
@@ -378,13 +378,24 @@ impl PassthroughFs {
             return;
         }
         let mut inodes = self.inodes.write().unwrap();
-        let replaced = inodes.by_path.remove(new_path);
+        let mut replaced = inodes.by_path.remove(new_path);
         let moved = inodes
             .by_path
             .iter()
             .filter(|(path, _)| path.starts_with(old_path))
             .map(|(path, data)| (path.clone(), data.clone()))
             .collect::<Vec<_>>();
+        // A lookup of the new name inside the window after the host rename
+        // already gave it to the moved object (and finished the replaced
+        // one): keep it there.
+        if moved.is_empty()
+            && let Some(data) = &replaced
+            && data.identity.is_some()
+            && self.path_identity(new_path).ok().flatten() == data.identity
+        {
+            inodes.by_path.insert(new_path.to_path_buf(), data.clone());
+            replaced = None;
+        }
         for (path, data) in moved {
             inodes.by_path.remove(&path);
             // Cached descendants must follow directory renames on bind mounts too.

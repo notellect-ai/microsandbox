@@ -4061,3 +4061,97 @@ fn host_holding_a_file_without_share_delete_fails_unlink_and_rename_cleanly() {
     fs.release(context(), data, 0, handle, false, false, None)
         .unwrap();
 }
+
+/// The Host replaces a file the guest has looked up and holds open, by
+/// deleting and renaming or by renaming over it. A fresh lookup must reach
+/// the new file with an inode of its own, an open through the old inode
+/// fails with ESTALE (so the guest kernel looks the name up again), and the
+/// handle the guest holds keeps reading the old file.
+#[test]
+fn a_host_replace_gives_the_name_a_new_inode() {
+    for delete_first in [true, false] {
+        let temp = TempDir::new();
+        let fs = fs_for(&temp.path);
+        let (old, handle) = create_with(&fs, context(), c"config", 0o644, b"old contents");
+        let path = temp.path.join("config");
+        let staged = temp.path.join("config.new");
+        std::fs::write(&staged, b"new").unwrap();
+        if delete_first {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::rename(&staged, &path).unwrap();
+
+        expect_errno(fs.open(context(), old, false, 0), LINUX_ESTALE);
+        let entry = fs.lookup(context(), ROOT_INODE, c"config").unwrap();
+        assert_ne!(entry.inode, old, "delete first: {delete_first}");
+        assert_eq!(entry.attr.st_size, 3);
+        let (new_handle, _) = fs.open(context(), entry.inode, false, 0).unwrap();
+        let new_handle = new_handle.unwrap();
+        assert_eq!(read_all(&fs, entry.inode, new_handle).unwrap(), b"new");
+        assert_eq!(read_all(&fs, old, handle).unwrap(), b"old contents");
+        // The name keeps its new inode on later lookups.
+        assert_eq!(
+            fs.lookup(context(), ROOT_INODE, c"config").unwrap().inode,
+            entry.inode
+        );
+        fs.release(context(), entry.inode, 0, new_handle, false, false, None)
+            .unwrap();
+        fs.release(context(), old, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
+/// A lookup of the destination name inside the window between the host
+/// rename and the inode table following it already finds the moved file.
+/// When the rename finishes, the name must keep that inode, valid and
+/// holding the moved contents, and the replaced inode must refuse opens.
+#[test]
+fn a_lookup_inside_the_rename_window_keeps_the_moved_inode() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (old, handle) = create_with(&fs, context(), c"data", 0o644, b"old contents");
+    fs.release(context(), old, 0, handle, false, false, None)
+        .unwrap();
+    let (new, handle) = create_with(&fs, context(), c"tmp", 0o644, b"new");
+    fs.release(context(), new, 0, handle, false, false, None)
+        .unwrap();
+
+    let (renamed_tx, renamed_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let _deadline = Deadline::start("lookup inside the rename window", SCOPE_LIMIT);
+    let in_window = std::thread::scope(|scope| {
+        let racer = scope.spawn(|| {
+            // Moved in: a Receiver cannot be shared with the scoped thread.
+            let renamed_rx = renamed_rx;
+            renamed_rx
+                .recv_timeout(STEP_LIMIT)
+                .expect("rename reaching its hook");
+            let entry = fs.lookup(context(), ROOT_INODE, c"data");
+            resume_tx.send(()).unwrap();
+            entry.map(|entry| entry.inode)
+        });
+        remove_ops::AFTER_HOST_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                renamed_tx.send(()).unwrap();
+                resume_rx
+                    .recv_timeout(STEP_LIMIT)
+                    .expect("racing lookup finished");
+            }));
+        });
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap();
+        racer.join().unwrap()
+    });
+
+    assert_eq!(in_window.unwrap(), new);
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+    assert_eq!(entry.inode, new);
+    assert_eq!(fs.getattr(context(), new, None).unwrap().0.st_size, 3);
+    let (handle, _) = fs.open(context(), new, false, 0).unwrap();
+    let handle = handle.unwrap();
+    assert_eq!(read_all(&fs, new, handle).unwrap(), b"new");
+    fs.release(context(), new, 0, handle, false, false, None)
+        .unwrap();
+    assert!(fs.open(context(), old, false, 0).is_err());
+    expect_errno(fs.lookup(context(), ROOT_INODE, c"tmp"), LINUX_ENOENT);
+}

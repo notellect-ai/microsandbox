@@ -197,11 +197,21 @@ impl PassthroughFs {
         let identity = self.path_identity(&path)?;
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.by_path.get(&path).cloned() {
-            // A cached alias (hard link) can outlive the canonical name.
-            if identity.is_some() && data.identity == identity {
-                Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+            if identity.is_none() || data.identity.is_none() || data.identity == identity {
+                // A cached alias (hard link) can outlive the canonical name.
+                if identity.is_some() && data.identity == identity {
+                    Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+                }
+                return Ok(data);
             }
-            return Ok(data);
+            // The Host replaced the object at this name. The cached inode
+            // still names the old object (its open handles keep working, and
+            // an open through it by path fails with ESTALE), so the name
+            // gets the inode of the object that holds it now. The old object
+            // lost its name as in an unlink: kept only while the guest has it
+            // open.
+            inodes.by_path.remove(&path);
+            self.finish_removed_alias(&mut inodes, &data);
         }
         if let Some(identity) = identity
             && let Some(data) = inodes.by_identity.get(&identity).cloned()
