@@ -4,6 +4,7 @@ use super::*;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::fs::FileExt;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TempDir {
@@ -3551,4 +3552,320 @@ fn dax_namespace_change_keeps_mapping(replace: bool, fail_refresh: bool) {
     )
     .unwrap();
     assert!(seen.lock().unwrap().is_empty());
+}
+
+fn create_with(
+    fs: &PassthroughFs,
+    ctx: Context,
+    name: &CStr,
+    mode: u32,
+    bytes: &[u8],
+) -> (u64, u64) {
+    let (entry, handle, _) = fs
+        .create(
+            ctx,
+            ROOT_INODE,
+            name,
+            S_IFREG | mode,
+            false,
+            (LINUX_O_CREAT | LINUX_O_RDWR | LINUX_O_TRUNC) as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+    let handle = handle.unwrap();
+    let mut reader = SourceReader {
+        bytes: bytes.to_vec(),
+        pos: 0,
+    };
+    fs.write(
+        ctx,
+        entry.inode,
+        handle,
+        &mut reader,
+        bytes.len() as u32,
+        0,
+        None,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+    (entry.inode, handle)
+}
+
+fn read_all(fs: &PassthroughFs, inode: u64, handle: u64) -> io::Result<Vec<u8>> {
+    let mut writer = CaptureWriter { bytes: Vec::new() };
+    fs.read(context(), inode, handle, &mut writer, 4096, 0, None, 0)?;
+    Ok(writer.bytes)
+}
+
+/// A file the guest still has open keeps working after its name is replaced
+/// or removed, as POSIX requires: fstat, read, write and chmod on the handle.
+fn open_file_survives_name_loss(replace: bool) {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let owner = Context {
+        uid: 111,
+        gid: 222,
+        pid: 0,
+    };
+    let (inode, handle) = create_with(&fs, owner, c"data", 0o640, b"old contents");
+
+    if replace {
+        let (tmp_inode, tmp_handle) = create_with(&fs, context(), c"tmp", 0o600, b"new");
+        fs.release(context(), tmp_inode, 0, tmp_handle, false, false, None)
+            .unwrap();
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap();
+        assert_eq!(std::fs::read(temp.path.join("data")).unwrap(), b"new");
+        let current = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+        assert_eq!(current.inode, tmp_inode);
+        assert_eq!(current.attr.st_size, 3);
+        assert_eq!(current.attr.st_mode & 0o7777, 0o600);
+    } else {
+        fs.unlink(context(), ROOT_INODE, c"data").unwrap();
+        assert!(!temp.path.join("data").exists());
+        expect_errno(fs.lookup(context(), ROOT_INODE, c"data"), LINUX_ENOENT);
+    }
+
+    // fstat through the inode (Linux sends no handle) and through the handle.
+    for fh in [None, Some(handle)] {
+        let (st, _) = fs.getattr(context(), inode, fh).unwrap();
+        assert_eq!(st.st_ino, inode);
+        assert_eq!(st.st_size, 12);
+        assert_eq!((st.st_uid, st.st_gid), (111, 222));
+        assert_eq!(st.st_mode, S_IFREG | 0o640);
+    }
+    assert_eq!(read_all(&fs, inode, handle).unwrap(), b"old contents");
+
+    let mut reader = SourceReader {
+        bytes: b" + more".to_vec(),
+        pos: 0,
+    };
+    fs.write(
+        context(),
+        inode,
+        handle,
+        &mut reader,
+        7,
+        12,
+        None,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        read_all(&fs, inode, handle).unwrap(),
+        b"old contents + more"
+    );
+    assert_eq!(fs.getattr(context(), inode, None).unwrap().0.st_size, 19);
+
+    let attr = stat64 {
+        st_mode: S_IFREG | 0o600,
+        ..Default::default()
+    };
+    let (st, _) = fs
+        .setattr(context(), inode, attr, Some(handle), SetattrValid::MODE)
+        .unwrap();
+    assert_eq!(st.st_mode, S_IFREG | 0o600);
+    fs.flush(context(), inode, handle, 0).unwrap();
+    fs.fsync(context(), inode, false, handle).unwrap();
+
+    // The surviving name is untouched by writes to the old object.
+    if replace {
+        assert_eq!(std::fs::read(temp.path.join("data")).unwrap(), b"new");
+    }
+
+    // The last release drops the detached inode.
+    fs.release(context(), inode, 0, handle, false, false, None)
+        .unwrap();
+    expect_errno(fs.getattr(context(), inode, None), LINUX_ESTALE);
+    assert!(!fs.inodes.read().unwrap().by_inode.contains_key(&inode));
+}
+
+#[test]
+fn open_file_survives_rename_over() {
+    open_file_survives_name_loss(true);
+}
+
+#[test]
+fn open_file_survives_unlink() {
+    open_file_survives_name_loss(false);
+}
+
+#[test]
+fn concurrent_replace_while_reading_never_fails_reads() {
+    const ROUNDS: usize = 300;
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let payload = |round: usize| format!("{{\"state\":\"round-{round:06}\"}}").into_bytes();
+    let (inode, handle) = create_with(&fs, context(), c"state.json", 0o644, &payload(0));
+    fs.release(context(), inode, 0, handle, false, false, None)
+        .unwrap();
+
+    let done = AtomicBool::new(false);
+    // Which round's payload each inode holds: a handle must read its own
+    // inode's file, never the one that replaced it.
+    let rounds = Mutex::new(std::collections::HashMap::from([(inode, 0usize)]));
+    let (reads, stale) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut reads = 0usize;
+            let mut stale = 0usize;
+            while !done.load(Ordering::Acquire) || reads == 0 {
+                // Like the guest: lookup, permission getattr, open, fstat
+                // (no handle), read, close.
+                let inode = fs
+                    .lookup(context(), ROOT_INODE, c"state.json")
+                    .unwrap()
+                    .inode;
+                let opened = fs
+                    .getattr(context(), inode, None)
+                    .and_then(|_| fs.open(context(), inode, false, 0));
+                let handle = match opened {
+                    Ok((handle, _)) => handle.unwrap(),
+                    Err(error) => {
+                        // The name was replaced after lookup; the guest kernel
+                        // retries the open with a fresh lookup, which must
+                        // find the replacing inode.
+                        assert_eq!(error.raw_os_error(), Some(LINUX_ESTALE));
+                        let now = fs.lookup(context(), ROOT_INODE, c"state.json").unwrap();
+                        assert_ne!(now.inode, inode, "ESTALE for a name that was not replaced");
+                        stale += 1;
+                        continue;
+                    }
+                };
+                let (st, _) = fs.getattr(context(), inode, None).unwrap();
+                let bytes = read_all(&fs, inode, handle).unwrap();
+                let round = rounds.lock().unwrap()[&inode];
+                assert_eq!(bytes, payload(round), "inode {inode} read another file");
+                assert_eq!(st.st_size as usize, bytes.len());
+                fs.release(context(), inode, 0, handle, false, false, None)
+                    .unwrap();
+                reads += 1;
+            }
+            (reads, stale)
+        });
+        for round in 1..=ROUNDS {
+            let (tmp, handle) =
+                create_with(&fs, context(), c"state.json.tmp", 0o644, &payload(round));
+            fs.release(context(), tmp, 0, handle, false, false, None)
+                .unwrap();
+            rounds.lock().unwrap().insert(tmp, round);
+            fs.rename(
+                context(),
+                ROOT_INODE,
+                c"state.json.tmp",
+                ROOT_INODE,
+                c"state.json",
+                0,
+            )
+            .unwrap();
+        }
+        done.store(true, Ordering::Release);
+        reader.join().unwrap()
+    });
+    assert!(reads > 0);
+    eprintln!("reads {reads}, stale opens retried {stale}");
+    // Every detached inode was dropped once its reader closed it.
+    let tracked = fs.inodes.read().unwrap().by_inode.len();
+    assert!(tracked <= 3, "leaked inodes: {tracked}");
+    assert_eq!(
+        std::fs::read(temp.path.join("state.json")).unwrap(),
+        payload(ROUNDS)
+    );
+}
+
+/// An open by path inside the window between the host rename and the inode
+/// table following it reaches the replacing file. It must fail with ESTALE
+/// (the guest then looks the name up again) instead of attaching a handle of
+/// the replaced inode to the new file, where its writes would land.
+#[test]
+fn open_racing_a_rename_over_does_not_reach_the_replacing_file() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (old, handle) = create_with(&fs, context(), c"data", 0o644, b"old contents");
+    fs.release(context(), old, 0, handle, false, false, None)
+        .unwrap();
+    let (new, handle) = create_with(&fs, context(), c"tmp", 0o644, b"new");
+    fs.release(context(), new, 0, handle, false, false, None)
+        .unwrap();
+
+    let (renamed_tx, renamed_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let in_window = std::thread::scope(|scope| {
+        let racer = scope.spawn(|| {
+            // Moved in: a Receiver cannot be shared with the scoped thread.
+            let renamed_rx = renamed_rx;
+            renamed_rx.recv().unwrap();
+            let opened = fs.open(context(), old, false, LINUX_O_RDWR as u32);
+            if let Ok((Some(handle), _)) = &opened {
+                let mut reader = SourceReader {
+                    bytes: b"XYZ".to_vec(),
+                    pos: 0,
+                };
+                fs.write(
+                    context(),
+                    old,
+                    *handle,
+                    &mut reader,
+                    3,
+                    0,
+                    None,
+                    false,
+                    false,
+                    0,
+                )
+                .unwrap();
+            }
+            resume_tx.send(()).unwrap();
+            opened.map(|(handle, _)| handle.unwrap())
+        });
+        remove_ops::AFTER_HOST_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                renamed_tx.send(()).unwrap();
+                resume_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("racing open finished");
+            }));
+        });
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap();
+        racer.join().unwrap()
+    });
+
+    expect_errno(in_window, LINUX_ESTALE);
+    assert_eq!(std::fs::read(temp.path.join("data")).unwrap(), b"new");
+    assert_eq!(
+        fs.lookup(context(), ROOT_INODE, c"data").unwrap().inode,
+        new
+    );
+    expect_errno(fs.getattr(context(), old, None), LINUX_ESTALE);
+    assert!(!fs.inodes.read().unwrap().by_inode.contains_key(&old));
+}
+
+/// A handle whose file is not its inode's object is never pinned as that
+/// inode's retained file.
+#[test]
+fn retain_skips_a_handle_holding_another_file() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let (old, handle) = create_with(&fs, context(), c"data", 0o644, b"old");
+    fs.release(context(), old, 0, handle, false, false, None)
+        .unwrap();
+    std::fs::write(temp.path.join("other"), b"other").unwrap();
+    let other = File::open(temp.path.join("other")).unwrap();
+    fs.handles.write().unwrap().insert(
+        u64::MAX,
+        Arc::new(HandleData {
+            inode: old,
+            flags: 0,
+            file: Mutex::new(other),
+        }),
+    );
+    let data = fs.inode(old).unwrap();
+    assert!(!fs.retain_open_file(&data));
+    assert!(data.retained.lock().unwrap().is_none());
+    fs.handles.write().unwrap().remove(&u64::MAX);
 }

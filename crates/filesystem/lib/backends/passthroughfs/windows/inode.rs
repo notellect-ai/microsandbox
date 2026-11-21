@@ -109,11 +109,20 @@ impl PassthroughFs {
                     Some(current.saturating_sub(count))
                 });
         }
-        self.reap_owned_inode(inode);
+        self.reap_retained_inode(inode);
     }
 
-    pub(super) fn reap_owned_inode(&self, inode: u64) {
-        if self.cfg.owned_checkpoint.is_none() || inode <= INIT_INODE {
+    /// Drop a retained (unlinked) inode once nothing in the guest can reach it.
+    pub(super) fn reap_retained_inode(&self, inode: u64) {
+        if inode <= INIT_INODE
+            || !self
+                .inodes
+                .read()
+                .unwrap()
+                .by_inode
+                .get(&inode)
+                .is_some_and(|data| data.retained.lock().unwrap().is_some())
+        {
             return;
         }
         // Directory enumeration holds its snapshot lock while interning names. Do not
@@ -134,12 +143,7 @@ impl PassthroughFs {
         };
         if data.retained.lock().unwrap().is_none()
             || data.lookups.load(Ordering::Acquire) != 0
-            || self
-                .handles
-                .read()
-                .unwrap()
-                .values()
-                .any(|handle| handle.inode == inode)
+            || self.has_open_handle(inode)
         {
             return;
         }
@@ -176,6 +180,9 @@ impl PassthroughFs {
         self.entry_from_metadata(&metadata, data.as_ref())
     }
 
+    /// An inode that is no longer tracked lost its name after the guest looked
+    /// it up (open files are retained). ESTALE, unlike EBADF, makes the guest
+    /// kernel redo path-based calls such as open and stat with a fresh lookup.
     pub(super) fn inode(&self, inode: u64) -> io::Result<Arc<InodeData>> {
         self.inodes
             .read()
@@ -183,18 +190,45 @@ impl PassthroughFs {
             .by_inode
             .get(&inode)
             .cloned()
-            .ok_or_else(|| linux_error(LINUX_EBADF))
+            .ok_or_else(|| linux_error(LINUX_ESTALE))
     }
 
     pub(super) fn intern_path(&self, path: PathBuf) -> io::Result<Arc<InodeData>> {
-        let identity = self.path_identity(&path)?;
+        let mut identity = self.path_identity(&path)?;
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.by_path.get(&path).cloned() {
-            // A cached alias (hard link) can outlive the canonical name.
-            if identity.is_some() && data.identity == identity {
-                Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+            if identity.is_some() && data.identity.is_some() && data.identity != identity {
+                // The identity was read before the table lock: a guest rename
+                // may have finished since and given the name to the object it
+                // now holds. Read it again under the lock.
+                identity = self.path_identity(&path)?;
             }
-            return Ok(data);
+            if identity.is_none() || data.identity.is_none() || data.identity == identity {
+                // A cached alias (hard link) can outlive the canonical name.
+                if identity.is_some() && data.identity == identity {
+                    Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+                }
+                return Ok(data);
+            }
+            // The Host replaced the object at this name. The cached inode
+            // still names the old object (its open handles keep working, and
+            // an open through it by path fails with ESTALE), so the name
+            // gets the inode of the object that holds it now. The old object
+            // lost its name as in an unlink: kept only while the guest has it
+            // open. Names cached under a replaced directory go with it; a
+            // child the Host moved into the new object is found again by its
+            // identity.
+            let stale = inodes
+                .by_path
+                .range(path.clone()..)
+                .take_while(|(cached, _)| cached.starts_with(&path))
+                .map(|(cached, _)| cached.clone())
+                .collect::<Vec<_>>();
+            for cached in stale {
+                if let Some(old) = inodes.by_path.remove(&cached) {
+                    self.finish_removed_alias(&mut inodes, &old);
+                }
+            }
         }
         if let Some(identity) = identity
             && let Some(data) = inodes.by_identity.get(&identity).cloned()
@@ -336,6 +370,43 @@ impl PassthroughFs {
 
         let path = self.child_path(parent, name)?;
         self.entry_for_path(path)
+    }
+
+    /// Register an open file. An inode removed while it was being opened is
+    /// stale: the guest kernel retries the open with a fresh lookup.
+    pub(super) fn insert_handle(&self, inode: u64, flags: u32, file: File) -> io::Result<u64> {
+        // Hold the inode table so a concurrent unlink or rename-over either sees
+        // this handle and retains the inode, or has already dropped it.
+        let inodes = self.inodes.read().unwrap();
+        let Some(data) = inodes.by_inode.get(&inode) else {
+            return Err(linux_error(LINUX_ESTALE));
+        };
+        // A path open that raced a rename-over reached the replacing file:
+        // the inode's own object is gone from that name, so the guest must
+        // look the name up again rather than write into the new file.
+        if let Some(identity) = data.identity
+            && mobility::file_identity(&file)? != identity
+        {
+            return Err(linux_error(LINUX_ESTALE));
+        }
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handles.write().unwrap().insert(
+            handle,
+            Arc::new(HandleData {
+                inode,
+                flags,
+                file: Mutex::new(file),
+            }),
+        );
+        Ok(handle)
+    }
+
+    pub(super) fn has_open_handle(&self, inode: u64) -> bool {
+        self.handles
+            .read()
+            .unwrap()
+            .values()
+            .any(|handle| handle.inode == inode)
     }
 
     pub(super) fn handle(&self, inode: u64, handle: u64) -> io::Result<Arc<HandleData>> {
