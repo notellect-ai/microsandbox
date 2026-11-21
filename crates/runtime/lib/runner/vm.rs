@@ -742,6 +742,13 @@ fn run(
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
+    // An elevated runtime stays stoppable by the same account's non-elevated runs (its pipes
+    // are shared where they are created). Best effort; a failure only keeps the default.
+    #[cfg(windows)]
+    if let Err(error) = microsandbox_utils::elevation_share::protect_runtime_process() {
+        tracing::warn!(%error, "could not let non-elevated runs stop this runtime");
+    }
+
     let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
 
     // Each physical port gets an independent byte budget and wake domain.

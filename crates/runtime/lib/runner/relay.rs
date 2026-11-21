@@ -1243,7 +1243,7 @@ impl AgentListener {
                 options.first_pipe_instance(true);
             }
 
-            let server = options.create(&self.pipe_name)?;
+            let server = super::create_shared_pipe(&options, &self.pipe_name)?;
             if first_pipe_instance {
                 self.first_pipe_instance = false;
             }

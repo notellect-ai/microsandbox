@@ -26,3 +26,23 @@ pub(crate) mod storage_observation;
 pub mod vm;
 pub(crate) mod workload_control;
 pub(crate) mod writeback;
+
+/// Create a named pipe server instance that a non-elevated run of this account can also
+/// open when this runtime is the full half of a split token. Falls back to the default
+/// security (and logs why) if the shared descriptor cannot be built.
+#[cfg(windows)]
+pub(crate) fn create_shared_pipe(
+    options: &tokio::net::windows::named_pipe::ServerOptions,
+    name: impl AsRef<std::ffi::OsStr>,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    match microsandbox_utils::elevation_share::shared_pipe_security() {
+        Ok(Some(mut security)) => unsafe {
+            options.create_with_security_attributes_raw(name, security.as_ptr().cast())
+        },
+        Ok(None) => options.create(name),
+        Err(error) => {
+            tracing::warn!(%error, "could not share a runtime pipe with non-elevated runs");
+            options.create(name)
+        }
+    }
+}
