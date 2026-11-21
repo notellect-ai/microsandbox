@@ -408,6 +408,8 @@ impl PassthroughFs {
         retained: Option<PreparedOwnedUnlink>,
     ) {
         if old_path == new_path {
+            // rename_file prepares nothing for a rename onto itself.
+            debug_assert!(retained.is_none());
             return;
         }
         let mut inodes = self.inodes.write().unwrap();
