@@ -1116,7 +1116,8 @@ mod tests {
                $_.AccessControlType + '|' + $_.FileSystemRights + '|' + $_.InheritanceFlags }; \
              'protected=' + $a.AreAccessRulesProtected; \
              'rules=' + ($r -join ';'); \
-             'user=' + $u";
+             'user=' + $u; \
+             'sddl=' + $a.Sddl";
         let output = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("MSB_TEST_ACL_PATH", path)
@@ -1162,54 +1163,81 @@ mod tests {
         }
     }
 
-    /// Reopening a cache whose directories already carry the target DACL must not set it
-    /// again: setting a DACL rewrites the inherited entries of every existing child.
-    ///
-    /// The probe is a child whose DACL is written empty with SetFileSecurityW, which does
-    /// not apply inheritance. Any DACL write on its parent through SetSecurityInfo would
-    /// propagate the parent's inheritable grant into it.
+    /// Writes `sddl`'s DACL and its control bits to `path` with SetFileSecurityW, which does
+    /// not apply inheritance from the parent or to children.
     #[cfg(windows)]
-    #[test]
-    fn windows_reopen_leaves_a_restricted_cache_as_is() {
+    fn write_dacl(path: &Path, sddl: &str) {
         use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
         use windows_sys::Win32::Security::{
-            ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl,
-            InitializeSecurityDescriptor, SECURITY_DESCRIPTOR, SetFileSecurityW,
-            SetSecurityDescriptorDacl,
+            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW,
         };
 
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("memory");
-        let cache = MemoryCache::open(&root).unwrap();
-        let probe = cache.root.join("probe");
-        std::fs::write(&probe, b"probe").unwrap();
-
-        let mut acl = [0usize; 8];
-        let acl = acl.as_mut_ptr() as *mut ACL;
-        assert_ne!(unsafe { InitializeAcl(acl, 64, ACL_REVISION) }, 0);
-        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
-        let descriptor = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
-        assert_ne!(unsafe { InitializeSecurityDescriptor(descriptor, 1) }, 0);
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         assert_ne!(
-            unsafe { SetSecurityDescriptorDacl(descriptor, 1, acl, 0) },
-            0
-        );
-        let wide: Vec<u16> = probe.as_os_str().encode_wide().chain(Some(0)).collect();
-        assert_ne!(
-            unsafe { SetFileSecurityW(wide.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) },
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            },
             0,
             "{}",
             io::Error::last_os_error()
         );
-        let before = windows_acl(&probe);
-        assert_eq!(windows_acl_field(&before, "rules="), "", "{before}");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let written =
+            unsafe { SetFileSecurityW(wide.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+        let error = io::Error::last_os_error();
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        assert_ne!(written, 0, "{error}");
+    }
 
+    /// PROBE EXPERIMENT: prints how a child's DACL reacts to hardening its parent.
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_experiment() {
+        use microsandbox_utils::private_file::harden_existing_directory;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("memory");
+        let cache = MemoryCache::open(&root).unwrap();
+        let plain = cache.root.join("plain");
+        let inherited = cache.root.join("inherited");
+        std::fs::write(&plain, b"p").unwrap();
+        std::fs::write(&inherited, b"i").unwrap();
+        let report = |step: &str| {
+            println!(
+                "EXP {step} parent: {}",
+                windows_acl_field(&windows_acl(&cache.root), "sddl=")
+            );
+            println!(
+                "EXP {step} plain: {}",
+                windows_acl_field(&windows_acl(&plain), "sddl=")
+            );
+            println!(
+                "EXP {step} inherited: {}",
+                windows_acl_field(&windows_acl(&inherited), "sddl=")
+            );
+        };
+        report("initial");
+        write_dacl(&plain, "D:");
+        write_dacl(&inherited, "D:AI");
+        report("emptied");
+        harden_existing_directory(&cache.root).unwrap();
+        report("after-identical-harden");
+        write_dacl(&cache.root, "D:PAI(A;OICI;FA;;;SY)");
+        report("parent-changed");
+        harden_existing_directory(&cache.root).unwrap();
+        report("after-changing-harden");
+        write_dacl(&plain, "D:");
+        write_dacl(&inherited, "D:AI");
         MemoryCache::open(&root).unwrap();
-        let after = windows_acl(&probe);
-        assert_eq!(
-            windows_acl_field(&after, "rules="),
-            "",
-            "reopening rewrote the cache's DACL and propagated it to children: {after}"
-        );
+        report("after-reopen");
     }
 }
