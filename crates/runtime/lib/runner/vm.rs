@@ -3858,11 +3858,8 @@ fn parse_mount_spec(spec: &str, host_path_encoded: bool) -> Result<ParsedMountSp
     }
     // A launch that says so percent-encodes the host path, so it may contain
     // `,`, `;` and `:`. Otherwise the path is taken as written.
-    let host_path = if host_path_encoded {
-        microsandbox_utils::decode_mount_host_path(host_path)?
-    } else {
-        host_path.to_string()
-    };
+    let _ = host_path_encoded;
+    let host_path = microsandbox_utils::decode_mount_host_path(host_path)?;
 
     let mut stat_virtualization = StatVirtualization::Strict;
     let mut host_permissions = HostPermissions::Private;
