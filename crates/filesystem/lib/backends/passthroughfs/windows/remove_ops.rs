@@ -61,6 +61,24 @@ fn after_host_unlink() {
 #[cfg(not(test))]
 fn after_host_unlink() {}
 
+#[cfg(test)]
+thread_local! {
+    /// Runs right after a guest unlink or rename-over marks the removed
+    /// inode retained, before the inode table drops its name.
+    pub(super) static AFTER_RETAIN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_retain() {
+    if let Some(hook) = AFTER_RETAIN.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_retain() {}
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -311,6 +329,7 @@ impl PassthroughFs {
         };
         *data.retained.lock().unwrap() = Some(file);
         *data.retained_stat.lock().unwrap() = stat_file;
+        after_retain();
         Some(data)
     }
 
