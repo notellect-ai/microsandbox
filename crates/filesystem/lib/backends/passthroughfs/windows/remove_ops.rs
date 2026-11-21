@@ -316,6 +316,9 @@ impl PassthroughFs {
         let Some(data) = pinned else {
             return;
         };
+        if data.inode != u64::MAX {
+            return;
+        }
         if let Some(path) = inodes
             .by_path
             .iter()
