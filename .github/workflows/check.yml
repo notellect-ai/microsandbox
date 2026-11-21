@@ -639,7 +639,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --no-default-features --features net,runner -p microsandbox-runtime --lib --target ${{ matrix.rust_target }} host_path
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo +stable test --no-default-features --features local,net -p microsandbox --lib --target ${{ matrix.rust_target }} wire_separators mount_host_path
+          cargo +stable test --no-default-features --features local,net -p microsandbox --lib --target ${{ matrix.rust_target }} -- wire_separators mount_host_path
 
       - name: Test host paths, metrics registries, and confined volumes
         shell: pwsh
