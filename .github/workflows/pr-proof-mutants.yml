@@ -1,0 +1,55 @@
+# Proof-only: each job applies one mutation to the relay (a regression the new
+# tests are meant to catch) and runs the one test aimed at it. Every job is
+# EXPECTED TO FAIL in its "Test" step.
+name: PR proof (mutants)
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**-mutants"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  mutant:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [read_uncapped, write_uncapped, write_shutdown_drops_queue, full_shutdown_keeps_writing, close_ignored, shared_event]
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Apply mutant
+        shell: bash
+        run: python .github/mutate.py ${{ matrix.mutant }} crates/vsock/lib/windows.rs >> "$GITHUB_ENV"
+      - name: Build
+        shell: bash
+        run: cargo test --locked -p microsandbox-vsock --lib --no-run
+      - name: Other tests (informational, does any older test catch this mutant?)
+        continue-on-error: true
+        shell: bash
+        run: cargo test --locked -p microsandbox-vsock --lib -- --skip "$TEST"
+      - name: Test
+        shell: bash
+        run: |
+          # Fail the job (as the mutant should) only if the test ran and failed;
+          # a filter that matches nothing must not count as a failure.
+          set +e
+          cargo test --locked -p microsandbox-vsock --lib -- --exact "$TEST" 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          grep -q '^running 1 test$' test.log || { echo "::warning::filter matched no test"; exit 0; }
+          exit $status
