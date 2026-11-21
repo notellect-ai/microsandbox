@@ -5,6 +5,28 @@ use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use super::*;
 
 //--------------------------------------------------------------------------------------------------
+// Test hooks
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on the looking-up thread after a lookup read the host identity of
+    /// a name and before it takes the inode table, so a test can act there.
+    pub(super) static AFTER_PATH_IDENTITY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_path_identity() {
+    if let Some(hook) = AFTER_PATH_IDENTITY.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_path_identity() {}
+
+//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
@@ -195,14 +217,42 @@ impl PassthroughFs {
     }
 
     pub(super) fn intern_path(&self, path: PathBuf) -> io::Result<Arc<InodeData>> {
-        let identity = self.path_identity(&path)?;
+        let mut identity = self.path_identity(&path)?;
+        after_path_identity();
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.by_path.get(&path).cloned() {
-            // A cached alias (hard link) can outlive the canonical name.
-            if identity.is_some() && data.identity == identity {
-                Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+            if identity.is_some() && data.identity.is_some() && data.identity != identity {
+                // The identity was read before the table lock: a guest rename
+                // may have finished since and given the name to the object it
+                // now holds. Read it again under the lock.
+                identity = self.path_identity(&path)?;
             }
-            return Ok(data);
+            if identity.is_none() || data.identity.is_none() || data.identity == identity {
+                // A cached alias (hard link) can outlive the canonical name.
+                if identity.is_some() && data.identity == identity {
+                    Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
+                }
+                return Ok(data);
+            }
+            // The host replaced the object at this name. The cached inode
+            // still names the old object (its open handles keep working, and
+            // an open through it by path fails with ESTALE), so the name
+            // gets the inode of the object that holds it now. The old object
+            // lost its name as in an unlink: kept only while the guest has it
+            // open. Names cached under a replaced directory go with it; a
+            // child the host moved into the new object is found again by its
+            // identity.
+            let stale = inodes
+                .by_path
+                .range(path.clone()..)
+                .take_while(|(cached, _)| cached.starts_with(&path))
+                .map(|(cached, _)| cached.clone())
+                .collect::<Vec<_>>();
+            for cached in stale {
+                if let Some(old) = inodes.by_path.remove(&cached) {
+                    self.finish_removed_alias(&mut inodes, &old);
+                }
+            }
         }
         if let Some(identity) = identity
             && let Some(data) = inodes.by_identity.get(&identity).cloned()
