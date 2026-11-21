@@ -7,6 +7,10 @@ release tags `vX.Y.Z-notellect.N`. Pushing such a tag builds `msb` (with agentd
 embedded) and `libkrunfw` for macOS, Linux and Windows from this source, as
 upstream's release does, and publishes them with `checksums.sha256`.
 
+For v0.8.1 the branch is `notellect/v0.8.1-ci`, not `notellect/v0.8.1`: the
+CI commit was reworked after `notellect/v0.8.1` was pushed, and that branch
+is left as it was. Release tags for v0.8.1 are cut from `notellect/v0.8.1-ci`.
+
 Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
 `snapshot restore` mount flags were dropped because 0.8 boots snapshots with
 `create --from-snapshot`, which takes every create flag):
