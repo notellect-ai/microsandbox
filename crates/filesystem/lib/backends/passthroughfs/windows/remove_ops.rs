@@ -332,8 +332,8 @@ impl PassthroughFs {
     /// Drop the name of a guest unlink, retaining the prepared inode under
     /// the same table lock.
     fn finish_unlink_path(&self, path: &Path, retained: Option<PreparedOwnedUnlink>) {
-        let mut inodes = self.inodes.write().unwrap();
         let pinned = self.retain_owned_unlink(retained);
+        let mut inodes = self.inodes.write().unwrap();
         let removed = inodes.by_path.remove(path);
         if let Some(data) = &removed {
             self.finish_removed_alias(&mut inodes, data);
@@ -446,8 +446,8 @@ impl PassthroughFs {
             debug_assert!(retained.is_none());
             return;
         }
-        let mut inodes = self.inodes.write().unwrap();
         let pinned = self.retain_owned_unlink(retained);
+        let mut inodes = self.inodes.write().unwrap();
         let mut replaced = inodes.by_path.remove(new_path);
         // A lookup of the new name inside the window after the host rename
         // already gave it to the moved object: keep it there.
