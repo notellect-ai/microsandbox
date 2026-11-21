@@ -41,4 +41,11 @@ jobs:
         run: cargo test --locked -p microsandbox-vsock --lib --no-run
       - name: Test
         shell: bash
-        run: cargo test --locked -p microsandbox-vsock --lib -- --exact "$TEST"
+        run: |
+          # Fail the job (as the mutant should) only if the test ran and failed;
+          # a filter that matches nothing must not count as a failure.
+          set +e
+          cargo test --locked -p microsandbox-vsock --lib -- --exact "$TEST" 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          grep -q '^running 1 test$' test.log || { echo "::warning::filter matched no test"; exit 0; }
+          exit $status
