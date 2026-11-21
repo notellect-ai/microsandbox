@@ -685,6 +685,16 @@ jobs:
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
           cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} dax_
 
+      - name: Test Windows filesystem host directory moves
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }} -- `
+            a_host_directory_move_onto_stale_cached_children_finishes_them `
+            a_stale_child_closed_before_a_host_move_takes_its_name_is_dropped
+
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
