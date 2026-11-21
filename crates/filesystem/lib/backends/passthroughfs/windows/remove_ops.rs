@@ -348,6 +348,7 @@ impl PassthroughFs {
     /// A lookup inside the window can give the prepared inode another name
     /// (a hard link elsewhere) before the update runs: it is then not removed
     /// by it, and keeps its name, so it must not stay retained.
+    #[allow(dead_code)]
     fn unpin_if_named(inodes: &InodeTable, pinned: Option<Arc<InodeData>>) {
         let Some(data) = pinned else {
             return;
