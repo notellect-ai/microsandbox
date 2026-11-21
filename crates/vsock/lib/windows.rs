@@ -761,8 +761,8 @@ mod tests {
     use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
     use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 
     use super::*;
@@ -1280,5 +1280,403 @@ mod tests {
         for host in hosts {
             host.join().unwrap();
         }
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Fault injection
+    //----------------------------------------------------------------------------------------------
+
+    /// Bytes the relay may hold beyond its guest buffer: one pending read
+    /// chunk plus both directions of the pipe's own buffers.
+    const RELAY_SLACK: usize = IO_CHUNK_SIZE + 2 * 4096;
+
+    /// A raw pipe handle another Host thread may use; the PipeHandle that
+    /// owns it outlives every such thread.
+    #[derive(Clone, Copy)]
+    struct SharedPipe(usize);
+
+    impl SharedPipe {
+        fn of(pipe: &PipeHandle) -> Self {
+            Self(pipe.raw() as usize)
+        }
+
+        fn raw(self) -> HANDLE {
+            self.0 as HANDLE
+        }
+    }
+
+    /// A Host end opened for overlapped I/O, so one Host thread can read
+    /// while another writes (synchronous handles serialize the two).
+    fn host_pipe_duplex(name: &str) -> PipeHandle {
+        let wide = wide_null(OsStr::new(name));
+        let server = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server, INVALID_HANDLE_VALUE);
+        PipeHandle(server)
+    }
+
+    /// Run one overlapped operation on `pipe` to completion.
+    fn host_overlapped(
+        pipe: SharedPipe,
+        start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
+    ) -> io::Result<usize> {
+        let event = Event::new(true)?;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event.0;
+        if start(pipe.raw(), &mut overlapped) == 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                // ConnectNamedPipe: the client connected before the call.
+                Some(code) if code == ERROR_PIPE_CONNECTED as i32 => return Ok(0),
+                Some(code) if code == ERROR_IO_PENDING as i32 => {}
+                _ => return Err(error),
+            }
+        }
+        let mut transferred = 0;
+        if unsafe { GetOverlappedResult(pipe.raw(), &overlapped, &mut transferred, 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(transferred as usize)
+    }
+
+    fn duplex_accept(pipe: SharedPipe) {
+        host_overlapped(pipe, |handle, overlapped| unsafe {
+            ConnectNamedPipe(handle, overlapped)
+        })
+        .unwrap();
+    }
+
+    fn duplex_read_exact(pipe: SharedPipe, count: usize) -> Vec<u8> {
+        let mut out = vec![0; count];
+        let mut filled = 0;
+        while filled < count {
+            let rest = &mut out[filled..];
+            let read = host_overlapped(pipe, |handle, overlapped| unsafe {
+                ReadFile(
+                    handle,
+                    rest.as_mut_ptr(),
+                    rest.len().min(IO_CHUNK_SIZE) as u32,
+                    std::ptr::null_mut(),
+                    overlapped,
+                )
+            })
+            .unwrap();
+            assert!(read > 0);
+            filled += read;
+        }
+        out
+    }
+
+    fn duplex_write_all(pipe: SharedPipe, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let chunk = &bytes[..bytes.len().min(IO_CHUNK_SIZE)];
+            let written = host_overlapped(pipe, |handle, overlapped| unsafe {
+                WriteFile(
+                    handle,
+                    chunk.as_ptr(),
+                    chunk.len() as u32,
+                    std::ptr::null_mut(),
+                    overlapped,
+                )
+            })
+            .unwrap();
+            bytes = &bytes[written..];
+        }
+    }
+
+    /// Write to the guest end until it refuses more for `quiet`: the bytes
+    /// it accepted.
+    fn guest_write_until_full(
+        endpoint: &dyn VsockStreamBackend,
+        bytes: &[u8],
+        quiet: Duration,
+    ) -> usize {
+        let deadline = Instant::now() + DEADLINE;
+        let mut accepted = 0;
+        let mut refused_since: Option<Instant> = None;
+        while accepted < bytes.len() {
+            match endpoint.write(&bytes[accepted..]) {
+                Ok(count) => {
+                    accepted += count;
+                    refused_since = None;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let since = *refused_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= quiet {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "guest write never filled up");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("guest write failed: {error}"),
+            }
+        }
+        accepted
+    }
+
+    #[test]
+    fn a_host_flood_stops_at_the_guest_buffer_and_then_arrives_whole() {
+        let name = pipe_name("floodin");
+        let server = host_pipe(&name);
+        const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host_sent = Arc::clone(&sent);
+        let host = std::thread::spawn(move || {
+            host_accept(&server);
+            let flood = pattern(LENGTH, 7);
+            for chunk in flood.chunks(IO_CHUNK_SIZE) {
+                host_write_all(&server, chunk);
+                host_sent.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+            server
+        });
+        let endpoint = guest_connect(&name);
+        // The guest reads nothing: the relay must stop reading once its
+        // buffer is full, which stalls the Host's writes.
+        let mut last = usize::MAX;
+        let settle = Instant::now() + DEADLINE;
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let now = sent.load(std::sync::atomic::Ordering::SeqCst);
+            if now == last {
+                break;
+            }
+            assert!(Instant::now() < settle, "the Host flood never stalled");
+            last = now;
+        }
+        assert!(
+            last <= MAX_BUFFERED_BYTES + RELAY_SLACK + IO_CHUNK_SIZE,
+            "the relay took {last} bytes the guest has not read"
+        );
+        assert_eq!(guest_read_up_to(&*endpoint, LENGTH), pattern(LENGTH, 7));
+        drop(join_in_time(host));
+    }
+
+    #[test]
+    fn guest_writes_stop_at_the_buffer_while_the_host_reads_nothing_and_then_arrive_whole() {
+        let name = pipe_name("floodout");
+        let server = host_pipe(&name);
+        const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (read_tx, read_rx) = std::sync::mpsc::channel::<()>();
+        let host = std::thread::spawn(move || {
+            host_accept(&server);
+            accepted_tx.send(()).unwrap();
+            read_rx
+                .recv_timeout(DEADLINE)
+                .expect("Host waiting until the guest is refused");
+            host_read_exact(&server, LENGTH)
+        });
+        let endpoint = guest_connect(&name);
+        accepted_rx
+            .recv_timeout(DEADLINE)
+            .expect("Host accepting the guest");
+        let flood = pattern(LENGTH, 8);
+        let accepted = guest_write_until_full(&*endpoint, &flood, Duration::from_millis(300));
+        assert!(
+            accepted <= MAX_BUFFERED_BYTES + RELAY_SLACK + IO_CHUNK_SIZE,
+            "the relay accepted {accepted} bytes the Host has not read"
+        );
+        read_tx.send(()).unwrap();
+        guest_write_all(&*endpoint, &flood[accepted..]);
+        assert_eq!(join_in_time(host), flood);
+    }
+
+    #[test]
+    fn large_streams_both_ways_at_once_arrive_whole() {
+        let name = pipe_name("bothways");
+        let server = host_pipe_duplex(&name);
+        const LENGTH: usize = 2 * MAX_BUFFERED_BYTES + 12_345;
+        let pipe = SharedPipe::of(&server);
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let host_writer = std::thread::spawn(move || {
+            duplex_accept(pipe);
+            accepted_tx.send(()).unwrap();
+            duplex_write_all(pipe, &pattern(LENGTH, 9));
+        });
+        let endpoint = guest_connect(&name);
+        accepted_rx
+            .recv_timeout(DEADLINE)
+            .expect("Host accepting the guest");
+        let host_reader = std::thread::spawn(move || duplex_read_exact(pipe, LENGTH));
+        // The guest writes and reads together on one thread, as the muxer
+        // does: neither direction may wait for the other to finish.
+        let outgoing = pattern(LENGTH, 10);
+        let mut sent = 0;
+        let mut received = Vec::with_capacity(LENGTH);
+        let mut chunk = vec![0; 70_000];
+        let deadline = Instant::now() + 6 * DEADLINE;
+        while sent < LENGTH || received.len() < LENGTH {
+            let mut progressed = false;
+            if sent < LENGTH {
+                match endpoint.write(&outgoing[sent..]) {
+                    Ok(count) => {
+                        sent += count;
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("guest write failed after {sent} bytes: {error}"),
+                }
+            }
+            if received.len() < LENGTH {
+                match endpoint.read(&mut chunk) {
+                    Ok(0) => panic!("stream ended after {} bytes", received.len()),
+                    Ok(read) => {
+                        received.extend_from_slice(&chunk[..read]);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("guest read failed: {error}"),
+                }
+            }
+            if !progressed {
+                assert!(
+                    Instant::now() < deadline,
+                    "both ways stalled: sent {sent}, received {}",
+                    received.len()
+                );
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(received, pattern(LENGTH, 9));
+        join_in_time(host_writer);
+        assert_eq!(join_in_time(host_reader), outgoing);
+        drop(server);
+    }
+
+    #[test]
+    fn a_guest_write_shutdown_mid_stream_still_delivers_what_was_queued() {
+        let name = pipe_name("shutwrite");
+        let server = host_pipe(&name);
+        const LENGTH: usize = 1 << 20;
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (shut_tx, shut_rx) = std::sync::mpsc::channel::<()>();
+        let host = std::thread::spawn(move || {
+            host_accept(&server);
+            accepted_tx.send(()).unwrap();
+            shut_rx
+                .recv_timeout(DEADLINE)
+                .expect("Host waiting for the guest shutdown");
+            let received = host_read_exact(&server, LENGTH);
+            host_write_all(&server, b"reply after shutdown");
+            (server, received)
+        });
+        let endpoint = guest_connect(&name);
+        accepted_rx
+            .recv_timeout(DEADLINE)
+            .expect("Host accepting the guest");
+        // Queued while the Host reads nothing, so most of it is still in the
+        // relay when the guest shuts its write side.
+        guest_write_all(&*endpoint, &pattern(LENGTH, 11));
+        endpoint.shutdown(VsockShutdown::Write).unwrap();
+        assert!(endpoint.write(b"late").is_err());
+        shut_tx.send(()).unwrap();
+        let (server, received) = join_in_time(host);
+        assert_eq!(received, pattern(LENGTH, 11));
+        // The read side stays open.
+        assert_eq!(
+            guest_read_up_to(&*endpoint, 20),
+            b"reply after shutdown".to_vec()
+        );
+        drop(server);
+    }
+
+    #[test]
+    fn a_guest_full_shutdown_mid_write_releases_the_pipe() {
+        let name = pipe_name("shutboth");
+        let server = host_pipe(&name);
+        let host = std::thread::spawn(move || {
+            host_accept(&server);
+            server
+        });
+        let endpoint = guest_connect(&name);
+        let server = join_in_time(host);
+        guest_write_all(&*endpoint, &pattern(1 << 20, 12));
+        std::thread::sleep(Duration::from_millis(100));
+        endpoint.shutdown(VsockShutdown::Both).unwrap();
+        let (drained, error) = within_deadline(move || {
+            let mut buf = vec![0_u8; 65_536];
+            let mut total = 0;
+            loop {
+                match host_read(&server, &mut buf) {
+                    Ok(read) => total += read,
+                    Err(error) => return (total, error),
+                }
+            }
+        });
+        assert!(drained < 1 << 20, "the whole write went through: {error}");
+        // The guest end reports the stream as finished, not as still busy.
+        assert_eq!(endpoint.read(&mut [0_u8; 16]).unwrap(), 0);
+        assert!(endpoint.write(b"more").is_err());
+    }
+
+    #[test]
+    fn a_host_disconnect_mid_write_ends_the_guest_stream() {
+        let name = pipe_name("disconnect");
+        let server = host_pipe(&name);
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (disconnect_tx, disconnect_rx) = std::sync::mpsc::channel::<()>();
+        let host = std::thread::spawn(move || {
+            host_accept(&server);
+            accepted_tx.send(()).unwrap();
+            disconnect_rx
+                .recv_timeout(DEADLINE)
+                .expect("Host waiting to disconnect");
+            // Discards what the relay wrote and breaks its pending I/O.
+            assert_ne!(unsafe { DisconnectNamedPipe(server.raw()) }, 0);
+            server
+        });
+        let endpoint = guest_connect(&name);
+        accepted_rx
+            .recv_timeout(DEADLINE)
+            .expect("Host accepting the guest");
+        guest_write_all(&*endpoint, &pattern(1 << 20, 13));
+        std::thread::sleep(Duration::from_millis(100));
+        disconnect_tx.send(()).unwrap();
+        let server = join_in_time(host);
+        // Writes fail and reads end within the deadline; neither keeps
+        // reporting WouldBlock.
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            match endpoint.write(b"more") {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
+                Ok(_) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "guest writes kept going after the Host disconnected"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        loop {
+            match endpoint.read(&mut [0_u8; 16]) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(0) | Err(_) => break,
+                Ok(read) => panic!("guest read {read} bytes the Host never sent"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the guest stream never ended after the Host disconnected"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(server);
+    }
+
+    /// Join `thread` within DEADLINE, re-raising its panic.
+    fn join_in_time<T: Send + 'static>(thread: std::thread::JoinHandle<T>) -> T {
+        within_deadline(move || thread.join())
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 }
