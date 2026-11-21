@@ -61,6 +61,24 @@ fn after_host_unlink() {
 #[cfg(not(test))]
 fn after_host_unlink() {}
 
+#[cfg(test)]
+thread_local! {
+    /// Runs right after a guest unlink or rename-over marks the removed
+    /// inode retained, before the inode table drops its name.
+    pub(super) static AFTER_RETAIN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_retain() {
+    if let Some(hook) = AFTER_RETAIN.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_retain() {}
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -131,8 +149,7 @@ impl PassthroughFs {
             after_host_unlink();
             // Commit namespace bookkeeping before remapping: a remap error
             // cannot undo a successful host deletion.
-            self.retain_owned_unlink(retained);
-            self.remove_inode_path(path);
+            self.finish_unlink_path(path, retained);
             if let Some(store) = &self.stat_store {
                 store.remove(path)?;
             }
@@ -148,8 +165,7 @@ impl PassthroughFs {
             None
         };
         let finish = || {
-            self.retain_owned_unlink(retained);
-            self.rename_inode_path(old_path, new_path);
+            self.rename_inode_path(old_path, new_path, retained);
             if let Some(store) = &self.stat_store {
                 store.rename(old_path, new_path)?;
             }
@@ -273,7 +289,11 @@ impl PassthroughFs {
         }))
     }
 
-    pub(super) fn retain_owned_unlink(&self, prepared: Option<PreparedOwnedUnlink>) {
+    /// Called with the inode table locked, by the table update that drops
+    /// the name: a lookup between the two would see a retained inode that
+    /// still has its name, finish it as replaced by the Host and keep it
+    /// (retained), and the update would then never reap it.
+    fn retain_owned_unlink(&self, prepared: Option<PreparedOwnedUnlink>) {
         if let Some(PreparedOwnedUnlink {
             data,
             file,
@@ -289,11 +309,19 @@ impl PassthroughFs {
             };
             *data.retained.lock().unwrap() = Some(file);
             *data.retained_stat.lock().unwrap() = stat_file;
+            after_retain();
         }
     }
 
     pub(super) fn remove_inode_path(&self, path: &Path) {
+        self.finish_unlink_path(path, None);
+    }
+
+    /// Drop the name of a guest unlink, retaining the prepared inode under
+    /// the same table lock.
+    fn finish_unlink_path(&self, path: &Path, retained: Option<PreparedOwnedUnlink>) {
         let mut inodes = self.inodes.write().unwrap();
+        self.retain_owned_unlink(retained);
         if let Some(data) = inodes.by_path.remove(path) {
             self.finish_removed_alias(&mut inodes, &data);
             drop(inodes);
@@ -373,11 +401,17 @@ impl PassthroughFs {
         true
     }
 
-    pub(super) fn rename_inode_path(&self, old_path: &Path, new_path: &Path) {
+    pub(super) fn rename_inode_path(
+        &self,
+        old_path: &Path,
+        new_path: &Path,
+        retained: Option<PreparedOwnedUnlink>,
+    ) {
         if old_path == new_path {
             return;
         }
         let mut inodes = self.inodes.write().unwrap();
+        self.retain_owned_unlink(retained);
         let mut replaced = inodes.by_path.remove(new_path);
         let moved = inodes
             .by_path
