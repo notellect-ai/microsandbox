@@ -4156,6 +4156,33 @@ fn an_unlink_after_a_host_replace_does_not_pin_the_hosts_file_to_the_old_inode()
     }
 }
 
+/// A directory the Host moves onto a name whose stale children are still
+/// cached (the guest removed the emptied directory, and its child's entry
+/// stayed): the moved child takes the cached name, and the stale inode that
+/// held it is finished, not left tracked without a name.
+#[test]
+fn a_host_directory_move_onto_stale_cached_children_finishes_them() {
+    let temp = TempDir::new();
+    for (path, contents) in [("d/c", "moved"), ("e/c", "stale")] {
+        std::fs::create_dir_all(temp.path.join(path).parent().unwrap()).unwrap();
+        std::fs::write(temp.path.join(path), contents).unwrap();
+    }
+    let fs = fs_for(&temp.path);
+    let moved = matrix_lookup(&fs, "d/c").unwrap().inode;
+    let stale = matrix_lookup(&fs, "e/c").unwrap().inode;
+    std::fs::remove_file(temp.path.join("e/c")).unwrap();
+    fs.rmdir(context(), ROOT_INODE, c"e").unwrap();
+    std::fs::rename(temp.path.join("d"), temp.path.join("e")).unwrap();
+
+    matrix_lookup(&fs, "e").unwrap();
+    assert_eq!(matrix_lookup(&fs, "e/c").unwrap().inode, moved);
+    assert!(
+        !fs.inodes.read().unwrap().by_inode.contains_key(&stale),
+        "the stale child is still tracked"
+    );
+    assert_matrix_tables(&fs, "host directory move onto stale children", true);
+}
+
 /// A Host process holding a file open without FILE_SHARE_DELETE makes the
 /// guest's unlink and rename fail. The failure must leave everything as it
 /// was: the names, their inodes, the guest's open handle and the contents.
