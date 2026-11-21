@@ -4155,3 +4155,56 @@ fn a_lookup_inside_the_rename_window_keeps_the_moved_inode() {
     assert!(fs.open(context(), old, false, 0).is_err());
     expect_errno(fs.lookup(context(), ROOT_INODE, c"tmp"), LINUX_ENOENT);
 }
+
+/// The Host replaces a directory whose child the guest has looked up, by
+/// deleting it and renaming another directory into its place. The child's
+/// name must reach the new directory's child (or nothing), never the cached
+/// inode of the old child, and the old directory inode refuses lookups.
+#[test]
+fn a_host_directory_replace_does_not_keep_old_children() {
+    for new_has_child in [true, false] {
+        let temp = TempDir::new();
+        let dir = temp.path.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("child"), b"old child").unwrap();
+        let fs = fs_for(&temp.path);
+        let old_dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
+        let old_child = fs.lookup(context(), old_dir, c"child").unwrap().inode;
+
+        let staged = temp.path.join("dir.new");
+        std::fs::create_dir(&staged).unwrap();
+        if new_has_child {
+            std::fs::write(staged.join("child"), b"new").unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::rename(&staged, &dir).unwrap();
+
+        let new_dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
+        assert_ne!(new_dir, old_dir, "new has child: {new_has_child}");
+        if new_has_child {
+            let child = fs.lookup(context(), new_dir, c"child").unwrap();
+            assert_ne!(child.inode, old_child);
+            assert_eq!(child.attr.st_size, 3);
+            let (handle, _) = fs.open(context(), child.inode, false, 0).unwrap();
+            let handle = handle.unwrap();
+            assert_eq!(read_all(&fs, child.inode, handle).unwrap(), b"new");
+            fs.release(context(), child.inode, 0, handle, false, false, None)
+                .unwrap();
+        } else {
+            expect_errno(fs.lookup(context(), new_dir, c"child"), LINUX_ENOENT);
+        }
+        assert!(fs.open(context(), old_child, false, 0).is_err());
+        expect_errno(fs.lookup(context(), old_dir, c"child"), LINUX_ESTALE);
+        let inodes = fs.inodes.read().unwrap();
+        for stale in [old_dir, old_child] {
+            assert!(
+                !inodes.by_inode.contains_key(&stale),
+                "inode {stale} still tracked (new has child: {new_has_child})"
+            );
+            assert!(
+                !inodes.by_path.values().any(|data| data.inode == stale),
+                "a name still leads to inode {stale} (new has child: {new_has_child})"
+            );
+        }
+    }
+}

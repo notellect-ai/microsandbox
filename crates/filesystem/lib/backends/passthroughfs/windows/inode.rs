@@ -209,9 +209,20 @@ impl PassthroughFs {
             // an open through it by path fails with ESTALE), so the name
             // gets the inode of the object that holds it now. The old object
             // lost its name as in an unlink: kept only while the guest has it
-            // open.
-            inodes.by_path.remove(&path);
-            self.finish_removed_alias(&mut inodes, &data);
+            // open. Names cached under a replaced directory go with it; a
+            // child the Host moved into the new object is found again by its
+            // identity.
+            let stale = inodes
+                .by_path
+                .range(path.clone()..)
+                .take_while(|(cached, _)| cached.starts_with(&path))
+                .map(|(cached, _)| cached.clone())
+                .collect::<Vec<_>>();
+            for cached in stale {
+                if let Some(old) = inodes.by_path.remove(&cached) {
+                    self.finish_removed_alias(&mut inodes, &old);
+                }
+            }
         }
         if let Some(identity) = identity
             && let Some(data) = inodes.by_identity.get(&identity).cloned()
