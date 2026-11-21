@@ -315,6 +315,8 @@ mod tests {
     use super::SharedObject;
 
     const CHILD_ENV: &str = "MSB_TEST_ELEVATION_SHARE_CHILD";
+    /// What the child prints, followed by the pipe and mapping names, once they exist.
+    const READY: &str = "elevation-share-child-ready";
     const WRITE_DAC: u32 = 0x0004_0000;
     const WRITE_OWNER: u32 = 0x0008_0000;
     /// The child is killed, and the test fails, if the parent has not finished by then.
@@ -453,7 +455,8 @@ mod tests {
         };
         assert!(!mapping.is_null(), "{}", std::io::Error::last_os_error());
 
-        println!("ready {pipe_name} {mapping_name}");
+        // libtest has already printed `test <name> ... ` without a newline.
+        println!("\n{READY} {pipe_name} {mapping_name}");
         std::io::stdout().flush().unwrap();
         // Stay alive, holding the pipe and the mapping, until the parent closes stdin.
         let mut line = String::new();
@@ -574,8 +577,8 @@ mod tests {
         let mut line = String::new();
         while stdout.read_line(&mut line).unwrap() > 0 {
             transcript.push_str(&line);
-            if let Some(rest) = line.trim().strip_prefix("ready ") {
-                ready = Some(rest.to_string());
+            if let Some((_, rest)) = line.trim().split_once(READY) {
+                ready = Some(rest.trim().to_string());
                 break;
             }
             line.clear();
