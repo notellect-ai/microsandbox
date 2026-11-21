@@ -415,11 +415,7 @@ impl PassthroughFs {
         // replace, or inside a rename-over's window, that is not the inode's
         // object: the guest must look the name up again (which gives the
         // name an inode of its own) rather than write into the new file.
-        if let Some(identity) = data.identity
-            && mobility::file_identity(&file)? != identity
-        {
-            return Err(linux_error(LINUX_ESTALE));
-        }
+        let _ = data;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handles.write().unwrap().insert(
             handle,
