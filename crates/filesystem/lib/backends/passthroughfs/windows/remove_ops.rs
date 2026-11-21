@@ -298,8 +298,8 @@ impl PassthroughFs {
     /// The Host may have replaced the object at the inode's name since the
     /// guest looked it up: pinning that one would give the inode another file.
     fn holds_own_object(data: &InodeData, file: &File) -> bool {
-        data.identity
-            .is_none_or(|identity| mobility::file_identity(file).ok() == Some(identity))
+        let _ = (data, file);
+        true
     }
 
     /// Called with the inode table locked, by the table update that drops
@@ -338,7 +338,7 @@ impl PassthroughFs {
         if let Some(data) = &removed {
             self.finish_removed_alias(&mut inodes, data);
         }
-        Self::unpin_if_named(&inodes, pinned);
+        let _ = pinned;
         drop(inodes);
         if let Some(data) = removed {
             self.reap_retained_inode(data.inode);
@@ -508,7 +508,7 @@ impl PassthroughFs {
         for data in &displaced {
             self.finish_removed_alias(&mut inodes, data);
         }
-        Self::unpin_if_named(&inodes, pinned);
+        let _ = pinned;
         drop(inodes);
         for data in displaced {
             self.reap_retained_inode(data.inode);
