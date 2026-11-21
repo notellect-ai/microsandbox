@@ -4370,6 +4370,58 @@ fn host_holding_a_file_without_share_delete_fails_unlink_and_rename_cleanly() {
         .unwrap();
 }
 
+/// A Host process that publishes a file by rename keeps a DELETE handle open
+/// on it for a moment after the new name appears (the rename is set through a
+/// handle opened with DELETE access, closed after the call). A guest that
+/// polls for the name and reads it lands in that moment. Passthroughfs opens
+/// Host files sharing read, write and delete, so the guest's lookup, open and
+/// read succeed; a Host reader that leaves out FILE_SHARE_DELETE is refused.
+#[test]
+fn guest_reads_a_file_the_host_holds_with_delete_access() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    const DELETE: u32 = 0x0001_0000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    let path = temp.path.join("response.json");
+    let staged = temp.path.join("response.json.tmp");
+    std::fs::write(&staged, b"published").unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+    // The publisher's handle, as it is between the rename and its close.
+    let publisher = StdOpenOptions::new()
+        .access_mode(DELETE | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&path)
+        .unwrap();
+    let plain = StdOpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .expect_err("a reader without FILE_SHARE_DELETE must collide with the handle");
+    assert_eq!(
+        plain.raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION),
+        "{plain}"
+    );
+
+    let entry = fs.lookup(context(), ROOT_INODE, c"response.json").unwrap();
+    assert_eq!(entry.attr.st_size, 9);
+    let (handle, _) = fs.open(context(), entry.inode, false, 0).unwrap();
+    let handle = handle.unwrap();
+    assert_eq!(read_all(&fs, entry.inode, handle).unwrap(), b"published");
+    drop(publisher);
+    // The guest's open handle does not stop the Host from removing the file.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(read_all(&fs, entry.inode, handle).unwrap(), b"published");
+    fs.release(context(), entry.inode, 0, handle, false, false, None)
+        .unwrap();
+}
+
 /// The Host replaces a file the guest has looked up and holds open, by
 /// deleting and renaming or by renaming over it. A fresh lookup must reach
 /// the new file with an inode of its own, an open through the old inode
