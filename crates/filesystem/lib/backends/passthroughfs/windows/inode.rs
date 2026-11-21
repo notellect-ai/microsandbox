@@ -358,11 +358,6 @@ impl PassthroughFs {
         // A path open that raced a rename-over reached the replacing file:
         // the inode's own object is gone from that name, so the guest must
         // look the name up again rather than write into the new file.
-        if let Some(identity) = data.identity
-            && mobility::file_identity(&file)? != identity
-        {
-            return Err(linux_error(LINUX_ESTALE));
-        }
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.handles.write().unwrap().insert(
             handle,
