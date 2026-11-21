@@ -309,7 +309,7 @@ mod tests {
     use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_WRITE,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_WRITE, TerminateProcess,
     };
 
     use super::SharedObject;
@@ -317,6 +317,8 @@ mod tests {
     const CHILD_ENV: &str = "MSB_TEST_ELEVATION_SHARE_CHILD";
     const WRITE_DAC: u32 = 0x0004_0000;
     const WRITE_OWNER: u32 = 0x0008_0000;
+    /// The child is killed, and the test fails, if the parent has not finished by then.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
@@ -412,7 +414,9 @@ mod tests {
             return;
         }
         let user = super::current_user_sid().unwrap();
+        eprintln!("child: emulating an elevated runtime");
         emulate_elevated_runtime(&user);
+        eprintln!("child: creating the pipe and the mapping");
 
         let id = std::process::id();
         let pipe_name = format!(r"\\.\pipe\msb-elevation-share-test-{id}");
@@ -454,6 +458,7 @@ mod tests {
         // Stay alive, holding the pipe and the mapping, until the parent closes stdin.
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
+        eprintln!("child: stdin closed, exiting");
         unsafe {
             CloseHandle(pipe);
             CloseHandle(mapping);
@@ -552,6 +557,17 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
+        let (finished, deadline) = std::sync::mpsc::channel::<()>();
+        let watchdog_target = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) } as usize;
+        assert_ne!(watchdog_target, 0, "{}", std::io::Error::last_os_error());
+        let watchdog = std::thread::spawn(move || {
+            if deadline.recv_timeout(DEADLINE).is_err() {
+                eprintln!("parent: deadline passed, killing the child");
+                unsafe { TerminateProcess(watchdog_target as HANDLE, 1) };
+                return true;
+            }
+            false
+        });
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         let mut ready = None;
         let mut transcript = String::new();
@@ -568,6 +584,7 @@ mod tests {
             let status = child.wait().unwrap();
             panic!("child did not get ready ({status}):\n{transcript}");
         };
+        eprintln!("parent: child ready: {ready}");
         let (pipe_name, mapping_name) = ready.split_once(' ').unwrap();
         let (pipe_name, mapping_name) = (pipe_name.to_string(), mapping_name.to_string());
 
@@ -580,6 +597,7 @@ mod tests {
                 "{}",
                 std::io::Error::last_os_error()
             );
+            eprintln!("parent: impersonating the filtered token");
             let stop = can_open_process(
                 pid,
                 PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -599,6 +617,7 @@ mod tests {
                 )
             };
             let pipe_error = std::io::Error::last_os_error();
+            eprintln!("parent: pipe opened: {}", pipe != INVALID_HANDLE_VALUE);
             let pipe_ok = pipe != INVALID_HANDLE_VALUE;
             if pipe_ok {
                 unsafe { CloseHandle(pipe) };
@@ -628,8 +647,13 @@ mod tests {
         .join()
         .unwrap();
         unsafe { CloseHandle(filtered as HANDLE) };
+        eprintln!("parent: closing the child's stdin");
         drop(child.stdin.take());
         let status = child.wait().unwrap();
+        let _ = finished.send(());
+        let killed = watchdog.join().unwrap();
+        unsafe { CloseHandle(watchdog_target as HANDLE) };
+        assert!(!killed, "the test did not finish within {DEADLINE:?}");
 
         let (stop, write_dac, write_owner, vm_write, pipe, mapping) = results;
         println!(
