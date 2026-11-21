@@ -249,7 +249,8 @@ mod tests {
 
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
         SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::{
@@ -274,6 +275,11 @@ mod tests {
             )
         };
         assert_eq!(error, 0, "GetSecurityInfo");
+        descriptor_string(sd, info)
+    }
+
+    /// The SDDL text of `sd` for `info`; frees `sd`.
+    fn descriptor_string(sd: *mut core::ffi::c_void, info: u32) -> String {
         let mut text = null_mut();
         let mut len = 0;
         assert_ne!(
@@ -297,12 +303,36 @@ mod tests {
         value
     }
 
+    /// How SDDL writes `sid`. Well-known accounts get an alias: the built-in
+    /// Administrator, which GitHub's Windows runners run as, is `LA`.
+    fn sddl_trustee(sid: &str) -> String {
+        let text: Vec<u16> = format!("O:{sid}").encode_utf16().chain(Some(0)).collect();
+        let mut sd = null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    null_mut(),
+                )
+            },
+            0,
+            "parse O:{sid}"
+        );
+        let owner = descriptor_string(sd, OWNER_SECURITY_INFORMATION);
+        owner
+            .strip_prefix("O:")
+            .unwrap_or_else(|| panic!("owner SDDL {owner}"))
+            .to_string()
+    }
+
     /// Run elevated (as the Windows CI and test VM are) this checks the real grants; run
     /// normally it checks the calls are harmless no-ops that leave the user granted.
     #[test]
     fn objects_and_runtime_process_grant_the_user_sid() {
         let handle = super::windows::open_token(windows_sys::Win32::Security::TOKEN_QUERY).unwrap();
-        let user = super::windows::user_sid_string(&handle).unwrap();
+        let user = sddl_trustee(&super::windows::user_sid_string(&handle).unwrap());
         let elevated = super::windows::elevated(&handle).unwrap();
         super::share_current_process_with_user().expect("share");
         // A second call is a no-op for the default DACL and reapplies the same process SD.
