@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["sdk/rust/fuzz", "vendor"]
+exclude = ["sdk/rust/fuzz", "vendor/msb_krun_devices"]
 members = [
     "crates/agentd",
     "crates/cli",
@@ -47,6 +47,7 @@ members = [
     "sdk/node-ts",
     "sdk/python",
     "sdk/go/native",
+    "vendor/msb_krun_vmm",
 ]
 
 [workspace.package]

@@ -1221,11 +1221,25 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
     }
 }
 
+/// CONFIG_HZ of the libkrunfw kernel booted from the kernel bundle on Windows
+/// x86_64 (vendor/libkrunfw/config-libkrunfw-windows_x86_64). The
+/// `bundled_kernel_hz_matches_libkrunfw_config` test reads that config, so a
+/// libkrunfw update that changes HZ fails the test instead of booting guests
+/// with a wrong loops-per-jiffy.
+#[cfg(any(
+    test,
+    all(target_os = "windows", target_arch = "x86_64", not(feature = "tee"))
+))]
+const BUNDLED_KERNEL_HZ: u64 = 250;
+
 // Assemble a fresh command line so a failed boot does not modify the resources.
+// `kernel_hz` is the guest kernel's CONFIG_HZ when the builder knows it (the
+// bundled libkrunfw kernel), and None for any other payload.
 fn initial_kernel_cmdline(
     payload_cmdline: Option<&str>,
     prolog: Option<&str>,
     tsc_frequency_hz: Option<u64>,
+    kernel_hz: Option<u64>,
 ) -> std::result::Result<Cmdline, StartMicrovmError> {
     let mut cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
 
@@ -1236,6 +1250,16 @@ fn initial_kernel_cmdline(
     // tsc_early_khz later in the kernel command line can override this default.
     if let Some(khz) = tsc_frequency_hz.map(|hz| hz / 1000).filter(|khz| *khz != 0) {
         cmdline.insert("tsc_early_khz", &khz.to_string())?;
+        // Every vCPU otherwise calibrates its delay loop at boot; under WHP
+        // the secondary CPUs' calibration against the timer fails and falls
+        // back to the slow path, which costs about 150 ms of guest boot. With
+        // the TSC as delay source, Linux's own value is tsc_khz * 1000 / HZ
+        // (tsc_init sets lpj_fine that way), so pass exactly that. Only for a
+        // kernel whose HZ is known: with a wrong HZ, udelay would be off by
+        // the same factor. A caller's lpj later in the command line wins.
+        if let Some(hz) = kernel_hz.filter(|hz| *hz != 0) {
+            cmdline.insert("lpj", &(khz * 1000 / hz).to_string())?;
+        }
     }
     cmdline.insert_str(payload_cmdline.or(prolog).unwrap_or(DEFAULT_KERNEL_CMDLINE))?;
     Ok(cmdline)
@@ -1314,10 +1338,16 @@ pub fn build_microvm_paused(
     #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
     let tsc_frequency_hz = None;
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee")))]
+    let kernel_hz = matches!(payload, Payload::KernelCopy).then_some(BUNDLED_KERNEL_HZ);
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee"))))]
+    let kernel_hz = None;
+
     let mut kernel_cmdline = initial_kernel_cmdline(
         payload_config.kernel_cmdline.as_deref(),
         vm_resources.kernel_cmdline.prolog.as_deref(),
         tsc_frequency_hz,
+        kernel_hz,
     )?;
 
     // The krun_env segment carries caller-controlled guest env; a non-cmdline-safe byte in it
@@ -4885,7 +4915,8 @@ pub mod tests {
                 } else {
                     (None, Some(caller))
                 };
-                let cmdline = initial_kernel_cmdline(payload, prolog, Some(3_600_024_432)).unwrap();
+                let cmdline =
+                    initial_kernel_cmdline(payload, prolog, Some(3_600_024_432), None).unwrap();
                 assert_eq!(cmdline.as_str(), expected);
             }
         }
@@ -4893,10 +4924,98 @@ pub mod tests {
 
     #[test]
     fn initial_kernel_cmdline_without_clock_keeps_existing_defaults() {
-        for frequency in [None, Some(0), Some(999)] {
-            let cmdline = initial_kernel_cmdline(None, None, frequency).unwrap();
-            assert_eq!(cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
+        // Without a usable TSC frequency there is no lpj either, even for a
+        // kernel whose HZ is known.
+        for kernel_hz in [None, Some(BUNDLED_KERNEL_HZ)] {
+            for frequency in [None, Some(0), Some(999)] {
+                let cmdline = initial_kernel_cmdline(None, None, frequency, kernel_hz).unwrap();
+                assert_eq!(cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
+            }
         }
+    }
+
+    #[test]
+    fn initial_kernel_cmdline_presets_lpj_from_the_tsc_frequency() {
+        // The Windows test VM's host: Linux reported tsc 3792.883 MHz and
+        // computed lpj=15171532 itself.
+        let cmdline = initial_kernel_cmdline(
+            None,
+            Some("quiet"),
+            Some(3_792_883_517),
+            Some(BUNDLED_KERNEL_HZ),
+        )
+        .unwrap();
+        assert_eq!(cmdline.as_str(), "tsc_early_khz=3792883 lpj=15171532 quiet");
+
+        // lpj is the kernel's tsc_khz * 1000 / HZ, from the same truncated kHz
+        // value passed as tsc_early_khz, for whatever HZ the kernel has.
+        for (hz, khz, lpj) in [
+            (250, 1, 4),
+            (250, 2_100_000, 8_400_000),
+            (100, 3_792_883, 37_928_830),
+            (300, 3_792_883, 12_642_943),
+            (1000, 3_792_883, 3_792_883),
+        ] {
+            let cmdline =
+                initial_kernel_cmdline(None, Some("quiet"), Some(khz * 1000 + 999), Some(hz))
+                    .unwrap();
+            assert_eq!(
+                cmdline.as_str(),
+                format!("tsc_early_khz={khz} lpj={lpj} quiet"),
+                "HZ={hz}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_kernel_cmdline_presets_no_lpj_for_a_kernel_of_unknown_hz() {
+        for kernel_hz in [None, Some(0)] {
+            let cmdline =
+                initial_kernel_cmdline(None, Some("quiet"), Some(3_792_883_517), kernel_hz)
+                    .unwrap();
+            assert_eq!(cmdline.as_str(), "tsc_early_khz=3792883 quiet");
+        }
+    }
+
+    #[test]
+    fn initial_kernel_cmdline_lets_a_caller_lpj_win() {
+        // Both come before the caller's arguments and before `--`, so a
+        // caller's lpj is the later one, which Linux keeps; one after `--`
+        // belongs to init and is left alone.
+        for use_payload in [false, true] {
+            let caller = "quiet lpj=1000 -- lpj=7";
+            let (payload, prolog) = if use_payload {
+                (Some(caller), Some("ignored-prolog"))
+            } else {
+                (None, Some(caller))
+            };
+            let cmdline =
+                initial_kernel_cmdline(payload, prolog, Some(3_792_883_517), Some(250)).unwrap();
+            assert_eq!(
+                cmdline.as_str(),
+                "tsc_early_khz=3792883 lpj=15171532 quiet lpj=1000 -- lpj=7"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_kernel_hz_matches_libkrunfw_config() {
+        // The kernel bundle is libkrunfw built from vendor/libkrunfw (see
+        // notellect-release.yml); on Windows x86_64 from this config.
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../libkrunfw/config-libkrunfw-windows_x86_64");
+        let text = std::fs::read_to_string(&config).unwrap_or_else(|err| {
+            panic!(
+                "cannot read {}: {err}; run `git submodule update --init vendor/libkrunfw`",
+                config.display()
+            )
+        });
+        let values: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("CONFIG_HZ="))
+            .collect();
+        assert_eq!(values.len(), 1, "CONFIG_HZ lines in {}", config.display());
+        assert_eq!(values[0].parse::<u64>().unwrap(), BUNDLED_KERNEL_HZ);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
