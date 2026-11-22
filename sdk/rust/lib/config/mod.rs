@@ -399,7 +399,7 @@ pub struct OciSandboxDefaults {
 }
 
 /// Host runtime performance policy.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(ConfigPatch)]
 #[config_patch(serde)]
@@ -414,7 +414,7 @@ pub struct RuntimeConfig {
     /// On Windows, let non-elevated runs in the same sign-in session reach sandboxes that an
     /// elevated (administrator) run starts: they can connect to, exec in and stop them. Off
     /// keeps the UAC boundary, and a non-elevated run gets an access-denied error explaining
-    /// it.
+    /// it. Defaults to on in this fork (upstream defaults to off); see NOTELLECT.md.
     pub share_elevated_sandboxes: bool,
 }
 
@@ -730,6 +730,16 @@ impl Default for BlockWritebackConfig {
         // Auto is portable: Linux bounds dirty data and shares a derived pool, while other hosts
         // treat the unconfigured policy as a no-op.
         Self::Auto { pool_mib: None }
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            block_writeback: BlockWritebackConfig::default(),
+            placement_profiles: BTreeMap::new(),
+            share_elevated_sandboxes: true,
+        }
     }
 }
 
@@ -1295,16 +1305,17 @@ mod tests {
     }
 
     #[test]
-    fn test_share_elevated_sandboxes_defaults_off_and_asks_the_launcher_only_when_on() {
-        let default: GlobalConfig = serde_json::from_str("{}").unwrap();
-        let opted_in: GlobalConfig =
-            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
+    fn test_share_elevated_sandboxes_defaults_on_and_asks_the_launcher_only_when_on() {
+        let opted_in: GlobalConfig = serde_json::from_str("{}").unwrap();
+        let opted_out: GlobalConfig =
+            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":false}}"#).unwrap();
 
-        assert!(!default.runtime.share_elevated_sandboxes);
         assert!(opted_in.runtime.share_elevated_sandboxes);
+        assert!(GlobalConfig::default().runtime.share_elevated_sandboxes);
+        assert!(!opted_out.runtime.share_elevated_sandboxes);
         for elevated in [false, true] {
             assert!(
-                !default
+                !opted_out
                     .share_elevated_sandboxes_with(|| unreachable!("asked with the setting off"))
                     .unwrap()
             );
