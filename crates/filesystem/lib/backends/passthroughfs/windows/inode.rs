@@ -1,30 +1,23 @@
 //! Inode, handle, and lookup helpers for the Windows passthrough backend.
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 
 use super::*;
 
 //--------------------------------------------------------------------------------------------------
-// Test hooks
+// Constants
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 thread_local! {
     /// Runs on the looking-up thread after a lookup read the host identity of
     /// a name and before it takes the inode table, so a test can act there.
-    pub(super) static AFTER_PATH_IDENTITY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_PATH_IDENTITY: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
 }
-
-#[cfg(test)]
-fn after_path_identity() {
-    if let Some(hook) = AFTER_PATH_IDENTITY.with(|hook| hook.borrow_mut().take()) {
-        hook();
-    }
-}
-
-#[cfg(not(test))]
-fn after_path_identity() {}
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -454,3 +447,17 @@ impl PassthroughFs {
             .ok_or_else(|| linux_error(LINUX_EBADF))
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+fn after_path_identity() {
+    if let Some(hook) = AFTER_PATH_IDENTITY.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_path_identity() {}

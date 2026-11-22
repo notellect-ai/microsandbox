@@ -3554,7 +3554,7 @@ fn dax_namespace_change_keeps_mapping(replace: bool, fail_refresh: bool) {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Open files after unlink and rename-over
+// Tests: open files after unlink and rename-over
 //--------------------------------------------------------------------------------------------------
 
 /// How long a test waits for one step of another thread.
@@ -3904,7 +3904,7 @@ fn an_unlink_after_a_host_replace_does_not_pin_the_hosts_file_to_the_old_inode()
 }
 
 //--------------------------------------------------------------------------------------------------
-// Guest renames and names cached under the destination
+// Tests: guest renames and names cached under the destination
 //--------------------------------------------------------------------------------------------------
 
 /// Every name and identity points at a tracked inode, and every tracked inode
@@ -4118,7 +4118,7 @@ fn a_directory_rename_window_replace_drops_the_lost_childs_descendants() {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Names the host replaced
+// Tests: names the host replaced
 //--------------------------------------------------------------------------------------------------
 
 /// The host replaces a file the guest has looked up and holds open, by
