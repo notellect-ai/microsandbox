@@ -412,7 +412,7 @@ fn main() {
             return;
         }
         Commands::LaunchProtocol => {
-            let mut capabilities =
+            let capabilities =
                 serde_json::to_value(microsandbox_runtime::launch::LaunchCapabilities {
                     storage_reader: microsandbox_filesystem::agentd::EMBEDDED_STORAGE_READER,
                     protected_guest_state: true,
@@ -434,10 +434,10 @@ fn main() {
                     exec_limits: true,
                     multi_tenant: cfg!(feature = "net"),
                     share_elevated_sandboxes: cfg!(windows),
+                    deferred_command_bindings: true,
+                    restored_exec_limits: true,
                 })
                 .expect("serialize capabilities");
-            capabilities["deferred_command_bindings"] = true.into();
-            capabilities["restored_exec_limits"] = true.into();
             println!("{capabilities}");
             return;
         }

@@ -132,6 +132,16 @@ pub struct LaunchCapabilities {
     /// Older runtimes omit this capability and reject the field.
     #[serde(default)]
     pub share_elevated_sandboxes: bool,
+
+    /// Deferred command bindings are resolved by the runtime.
+    /// Older runtimes omit this capability.
+    #[serde(default)]
+    pub deferred_command_bindings: bool,
+
+    /// Captured execution limits are restored by the runtime.
+    /// Older runtimes omit this capability.
+    #[serde(default)]
+    pub restored_exec_limits: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.
