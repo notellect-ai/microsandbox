@@ -5182,6 +5182,24 @@ fn host_open_budget_for_lookup_getattr_and_readdir() {
             .unwrap()
             .ino;
         assert_eq!(child.inode, ino);
+
+        // readdirplus reads each listed child's attributes like getattr does.
+        let opens = host_opens();
+        let attributes = fs
+            .snapshot_entry_attributes(&DirSnapshotEntry {
+                inode: ino,
+                name: b"f007.txt".to_vec(),
+                offset: 0,
+                file_type: DT_REG,
+            })
+            .unwrap();
+        assert_eq!(
+            host_opens() - opens,
+            3 + override_reads,
+            "readdirplus child"
+        );
+        assert_eq!(attributes.attr.st_nlink, 1);
+        assert_eq!(attributes.attr.st_size, 1);
     }
 }
 
@@ -5223,44 +5241,126 @@ fn readdir_and_lookup_agree_on_inodes_types_and_hard_links() {
 }
 
 /// A guest symlink is a regular Host file whose stat override says S_IFLNK;
-/// readdir reports the type getattr reports, not the Host file type.
+/// readdir reports the type getattr reports, not the Host file type, from the
+/// ADS store, the sidecar store and storeless in-memory metadata alike. With
+/// stat virtualization off it reports the Host type.
 #[test]
 fn readdir_reports_the_virtual_entry_type() {
-    let temp = TempDir::new();
-    let fs = fs_for(&temp.path);
-    fs.symlink(
-        context(),
-        c"target.txt",
-        ROOT_INODE,
-        c"link",
-        Extensions::default(),
-    )
-    .unwrap();
-    fs.mkdir(
-        context(),
-        ROOT_INODE,
-        c"dir",
-        S_IFDIR | 0o755,
-        0,
-        Extensions::default(),
-    )
-    .unwrap();
-    std::fs::write(temp.path.join("host.txt"), b"h").unwrap();
-
-    // A fresh mount reads the types from the stored overrides, not memory.
-    for fs in [fs, fs_for(&temp.path)] {
-        let entries = fs.dir_entries(ROOT_INODE).unwrap();
-        let listed = |name: &[u8]| {
-            entries
-                .iter()
-                .find(|entry| entry.name == name)
-                .unwrap()
-                .type_
-        };
-        assert_eq!(listed(b"link"), DT_LNK);
-        assert_eq!(listed(b"dir"), DT_DIR);
-        assert_eq!(listed(b"host.txt"), DT_REG);
-        let link = fs.lookup(context(), ROOT_INODE, c"link").unwrap();
-        assert_eq!(link.attr.st_mode & S_IFMT, S_IFLNK);
+    #[derive(Clone, Copy, Debug)]
+    enum Store {
+        Ads,
+        Sidecar,
+        Storeless,
     }
+    for store in [Store::Ads, Store::Sidecar, Store::Storeless] {
+        let temp = TempDir::new();
+        let mount = || {
+            let mut fs = fs_for(&temp.path);
+            match store {
+                Store::Ads => assert_ads_store(&fs),
+                Store::Sidecar => fs.stat_store = Some(StatStore::sidecar(&fs.root)),
+                Store::Storeless => fs.stat_store = None,
+            }
+            fs
+        };
+        let fs = mount();
+        fs.symlink(
+            context(),
+            c"target.txt",
+            ROOT_INODE,
+            c"link",
+            Extensions::default(),
+        )
+        .unwrap();
+        fs.mkdir(
+            context(),
+            ROOT_INODE,
+            c"dir",
+            S_IFDIR | 0o755,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        std::fs::write(temp.path.join("host.txt"), b"h").unwrap();
+
+        // A fresh mount reads the types from the stored overrides, not memory;
+        // storeless metadata lives only in the mount that wrote it.
+        let mounts = match store {
+            Store::Storeless => vec![fs],
+            _ => vec![fs, mount()],
+        };
+        for fs in mounts {
+            let entries = fs.dir_entries(ROOT_INODE).unwrap();
+            let listed = |name: &[u8]| {
+                entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap_or_else(|| panic!("{store:?}: {name:?} not listed"))
+                    .type_
+            };
+            assert_eq!(listed(b"link"), DT_LNK, "{store:?}");
+            assert_eq!(listed(b"dir"), DT_DIR, "{store:?}");
+            assert_eq!(listed(b"host.txt"), DT_REG, "{store:?}");
+            let link = fs.lookup(context(), ROOT_INODE, c"link").unwrap();
+            assert_eq!(link.attr.st_mode & S_IFMT, S_IFLNK, "{store:?}");
+        }
+    }
+
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("dir")).unwrap();
+    std::fs::write(temp.path.join("file"), b"f").unwrap();
+    let fs = external_fs_for(&temp.path, false, false);
+    let entries = fs.dir_entries(ROOT_INODE).unwrap();
+    let listed = |name: &[u8]| {
+        entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
+            .type_
+    };
+    assert_eq!(listed(b"dir"), DT_DIR);
+    assert_eq!(listed(b"file"), DT_REG);
+}
+
+/// A listing longer than one batch: every name once, offsets in order, more
+/// than one batch read, and the same entries through the `read_dir` fallback
+/// that filesystems without batched listings take.
+#[test]
+fn readdir_lists_every_batch_and_the_fallback_agrees() {
+    const CHILDREN: usize = 1000;
+    let temp = TempDir::new();
+    let long = "n".repeat(120);
+    for index in 0..CHILDREN {
+        std::fs::write(temp.path.join(format!("{long}{index:04}")), b"x").unwrap();
+    }
+    std::fs::create_dir(temp.path.join("sub")).unwrap();
+    let fs = external_fs_for(&temp.path, false, false);
+
+    let enumerations = host_enumerations();
+    let batched = fs.dir_entries(ROOT_INODE).unwrap();
+    // About 190 records of 352 bytes fit in 64 KiB: six batches and the end.
+    assert!(host_enumerations() - enumerations >= 4);
+    assert_eq!(batched.len(), CHILDREN + 3);
+    let offsets: Vec<u64> = batched.iter().map(|entry| entry.offset).collect();
+    assert_eq!(offsets, (1..=batched.len() as u64).collect::<Vec<_>>());
+    let mut names: Vec<&[u8]> = batched.iter().map(|entry| entry.name).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), CHILDREN + 3);
+
+    LISTING_CLASS_UNSUPPORTED.with(|unsupported| unsupported.set(true));
+    let enumerations = host_enumerations();
+    let fallback = fs.dir_entries(ROOT_INODE);
+    LISTING_CLASS_UNSUPPORTED.with(|unsupported| unsupported.set(false));
+    let fallback = fallback.unwrap();
+    assert_eq!(host_enumerations() - enumerations, 1);
+    let key = |entries: &[DirEntry<'static>]| {
+        let mut key: Vec<(Vec<u8>, u64, u32)> = entries
+            .iter()
+            .map(|entry| (entry.name.to_vec(), entry.ino, entry.type_))
+            .collect();
+        key.sort();
+        key
+    };
+    assert_eq!(key(&fallback), key(&batched));
 }

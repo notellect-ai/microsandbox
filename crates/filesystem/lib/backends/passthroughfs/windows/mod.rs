@@ -445,6 +445,7 @@ thread_local! {
     static HOST_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HOST_ENUMERATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LISTING_IDS_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LISTING_CLASS_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Count Host opens made by the lookup, getattr and readdir paths (tests only).
@@ -453,11 +454,25 @@ fn count_host_open() {
     HOST_OPENS.with(|opens| opens.set(opens.get() + 1));
 }
 
-/// Tests take the non-NTFS path of readdir (identity read per child) on NTFS.
+/// Tests take the path of readdir that reads identity per child on NTFS.
+#[cfg(test)]
 fn listing_ids_disabled() -> bool {
-    #[cfg(test)]
-    return LISTING_IDS_DISABLED.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    LISTING_IDS_DISABLED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn listing_ids_disabled() -> bool {
+    false
+}
+
+/// Tests take the `read_dir` fallback for filesystems without batched listings.
+#[cfg(test)]
+fn listing_class_unsupported() -> bool {
+    LISTING_CLASS_UNSUPPORTED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn listing_class_unsupported() -> bool {
     false
 }
 
