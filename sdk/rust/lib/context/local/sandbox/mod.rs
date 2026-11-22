@@ -1583,7 +1583,6 @@ fn sandbox_replaced(name: &str, expected_id: i32, actual_id: i32) -> crate::Micr
 fn drain_shutdown_error(error: crate::MicrosandboxError) -> crate::MicrosandboxError {
     match error {
         error @ crate::MicrosandboxError::SandboxReplaced { .. } => error,
-        error if elevation_share::has_elevated_sandbox_denial(&error) => error,
         error => crate::MicrosandboxError::Runtime(format!(
             "windows drain requires the agent shutdown path, but the agent endpoint is unavailable: {error}"
         )),
