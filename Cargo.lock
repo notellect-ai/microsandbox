@@ -854,12 +854,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.72.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f72209734318d0b619a5e0f5129918b848c416e122a3c4ce054e03cb87b726f"
+dependencies = [
+ "bitflags 2.11.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.12.1",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 2.1.2",
+ "shlex",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bitfield"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b45721c9db4c7a20899d05efb7ad9235f50b256e980db30ffb229abf732934c3"
+dependencies = [
+ "bitfield-macros",
+]
+
+[[package]]
+name = "bitfield-macros"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0cb6f3d4773a2107b94cbeccaa5b5f0b35a88389b5d522d13d659f64317b22d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1176,6 +1214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1286,6 +1333,17 @@ dependencies = [
  "crypto-common 0.2.2",
  "inout 0.2.2",
  "zeroize",
+]
+
+[[package]]
+name = "clang-sys"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -3572,6 +3630,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b3f7cef34251886990511df1c61443aa928499d598a9473929ab5a90a527304"
 
 [[package]]
+name = "iocuddle"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8972d5be69940353d5347a1344cb375d9b457d6809b428b05bb1ca2fb9ce007"
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3613,6 +3677,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itertools"
@@ -3698,6 +3771,21 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kbs-types"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2119e8aaa1382675e879f0cbc95fc948d28284d134896f57676b8ef2c90212e"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sm3",
+ "strum 0.27.2",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4808,6 +4896,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "msb_krun_display"
+version = "0.1.46"
+source = "git+https://github.com/superradcompany/libkrun?rev=77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3#77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3"
+dependencies = [
+ "bindgen",
+ "bitflags 2.11.1",
+ "log",
+ "static_assertions",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "msb_krun_hvf"
 version = "0.1.46"
 source = "git+https://github.com/superradcompany/libkrun?rev=77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3#77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3"
@@ -4817,6 +4917,19 @@ dependencies = [
  "log",
  "msb_krun_arch",
  "serde",
+]
+
+[[package]]
+name = "msb_krun_input"
+version = "0.1.46"
+source = "git+https://github.com/superradcompany/libkrun?rev=77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3#77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3"
+dependencies = [
+ "bindgen",
+ "bitflags 2.11.1",
+ "libc",
+ "log",
+ "static_assertions",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4863,12 +4976,15 @@ dependencies = [
 [[package]]
 name = "msb_krun_vmm"
 version = "0.1.46"
-source = "git+https://github.com/superradcompany/libkrun?rev=77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3#77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3"
 dependencies = [
  "bincode",
+ "bitfield",
+ "bitflags 2.11.1",
  "bzip2",
  "crossbeam-channel",
  "flate2",
+ "iocuddle",
+ "kbs-types",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
@@ -4879,12 +4995,16 @@ dependencies = [
  "msb_krun_arch_gen",
  "msb_krun_cpuid",
  "msb_krun_devices",
+ "msb_krun_display",
  "msb_krun_hvf",
+ "msb_krun_input",
  "msb_krun_kernel",
  "msb_krun_polly",
  "msb_krun_utils",
  "nix 0.30.1",
  "serde",
+ "serde_json",
+ "tdx",
  "windows-sys 0.61.2",
  "zstd 0.13.4",
 ]
@@ -6002,7 +6122,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7017,7 +7137,7 @@ dependencies = [
  "derive-where",
  "derive_more",
  "futures-util",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "mac_address",
  "ouroboros",
@@ -7077,7 +7197,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91fa8c81c20fc8cfe78d22d9a2721ca5ef151dc4a8a7b372de218aaba33733fa"
 dependencies = [
  "heck 0.5.0",
- "itertools",
+ "itertools 0.14.0",
  "pluralizer",
  "proc-macro2",
  "quote",
@@ -7575,6 +7695,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "sm3"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebb9a3b702d0a7e33bc4d85a14456633d2b165c2ad839c5fd9a8417c1ab15860"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7941,6 +8070,9 @@ name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros 0.27.2",
+]
 
 [[package]]
 name = "strum"
@@ -8209,6 +8341,21 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "tdx"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83943e37cf46979f711ad11489c641fa058fd0fae92c122d1fc26a664e82acab"
+dependencies = [
+ "bitflags 2.11.1",
+ "iocuddle",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "uuid",
+ "vmm-sys-util",
+]
 
 [[package]]
 name = "tempfile"

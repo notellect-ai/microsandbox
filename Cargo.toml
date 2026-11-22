@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["sdk/rust/fuzz", "vendor"]
+exclude = ["sdk/rust/fuzz", "vendor/msb_krun_devices"]
 members = [
     "crates/agentd",
     "crates/cli",
@@ -47,6 +47,7 @@ members = [
     "sdk/node-ts",
     "sdk/python",
     "sdk/go/native",
+    "vendor/msb_krun_vmm",
 ]
 
 [workspace.package]
@@ -235,6 +236,9 @@ msb_krun_utils = { git = "https://github.com/superradcompany/libkrun", rev = "77
 
 # Notellect fork: msb_krun_devices from the libkrun rev above, with resets
 # that carry the Host's receive credit (see
-# vendor/msb_krun_devices/src/virtio/vsock/muxer_rxq.rs).
+# vendor/msb_krun_devices/src/virtio/vsock/muxer_rxq.rs), and msb_krun_vmm
+# from the same rev, which gives x86 guests loops-per-jiffy from the Host TSC
+# frequency (see initial_kernel_cmdline in vendor/msb_krun_vmm/src/builder.rs).
 [patch."https://github.com/superradcompany/libkrun"]
 msb_krun_devices = { path = "vendor/msb_krun_devices" }
+msb_krun_vmm = { path = "vendor/msb_krun_vmm" }
