@@ -8,10 +8,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY,
-    FILE_REMOTE_PROTOCOL_INFO, FILE_SUPPORTS_OPEN_BY_FILE_ID, FileIdBothDirectoryInfo,
-    FileIdBothDirectoryRestartInfo, FileRemoteProtocolInfo, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW,
+    FILE_REMOTE_PROTOCOL_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+    FileRemoteProtocolInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
 };
+
+use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_OPEN_BY_FILE_ID;
 
 use super::*;
 
