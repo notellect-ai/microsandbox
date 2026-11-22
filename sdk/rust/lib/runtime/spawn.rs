@@ -2256,9 +2256,8 @@ fn machine_cli_args(
     startup_pipe: Option<&OsStr>,
     launcher_can_share: impl FnOnce() -> MicrosandboxResult<bool>,
 ) -> MicrosandboxResult<(Vec<OsString>, LaunchConfig)> {
-    let share_elevated_sandboxes = local
-        .config()
-        .share_elevated_sandboxes_with(launcher_can_share)?;
+    let _ = launcher_can_share;
+    let share_elevated_sandboxes = false;
 
     // `visible` stays on the process argv: a small set of operator-readable
     // labels (name, id, sizing, fds) so the sandbox is identifiable in `ps`
