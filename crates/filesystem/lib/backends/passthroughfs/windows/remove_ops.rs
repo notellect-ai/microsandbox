@@ -412,15 +412,10 @@ impl PassthroughFs {
         if metadata.is_dir() {
             return false;
         }
-        // The override is read by path after the host operation, so it is
-        // taken only while the name still holds this file. After a
-        // rename-over or a host replace the name holds the replacing file's
-        // metadata, and after an unlink nothing. Otherwise, or if it cannot
+        // The override is read by path after the host operation; if it cannot
         // be read, the inode keeps its in-memory metadata, and the open file
         // is still pinned.
-        let holds_name = data.identity.is_some()
-            && self.path_identity(&data.path()).ok().flatten() == data.identity;
-        if holds_name && let Ok(stat) = self.current_override(&metadata, data) {
+        if let Ok(stat) = self.current_override(&metadata, data) {
             *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
                 uid: stat.uid,
                 gid: stat.gid,
