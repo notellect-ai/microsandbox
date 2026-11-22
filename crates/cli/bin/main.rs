@@ -354,6 +354,7 @@ fn normalize_sandbox_bools(argv: &mut Vec<OsString>) {
 }
 
 fn main() {
+    microsandbox_utils::perf_mark(&format!("cli:main {}", std::env::args().nth(1).unwrap_or_default()));
     // Ensure terminal echo is restored even if a panic aborts the process
     // (release profile sets `panic = "abort"`, so Drop impls don't run).
     microsandbox_cli::ui::install_panic_hook();

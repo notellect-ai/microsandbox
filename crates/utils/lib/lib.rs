@@ -12,6 +12,8 @@ pub mod secret;
 pub mod size;
 pub mod ttl_reverse_index;
 pub mod wake_pipe;
+pub mod perf_mark;
+pub use perf_mark::perf_mark;
 
 //--------------------------------------------------------------------------------------------------
 // Constants: Directory Layout

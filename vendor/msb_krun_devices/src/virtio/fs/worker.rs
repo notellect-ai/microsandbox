@@ -42,6 +42,7 @@ pub struct FsWorker<F: FileSystem + Sync + 'static> {
     exit_code: Arc<AtomicI32>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Option<Sender<WorkerMessage>>,
+    perf_reqs: u64,
 }
 
 /// Queue ownership returned after the worker reaches a reversible stop boundary.
@@ -79,6 +80,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             exit_code,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
+            perf_reqs: 0,
         }
     }
 
@@ -161,6 +163,21 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
     }
 
     fn handle_event(&mut self, queue_index: usize) {
+        let perf_on = crate::perf::enabled();
+        let perf_t0 = if perf_on { crate::perf::now_ns() } else { 0 };
+        let perf_key = crate::perf::event_key(&self.queue_evts[queue_index]);
+        if perf_on {
+            crate::perf::woke(perf_key, perf_t0);
+        }
+        self.perf_reqs = 0;
+        self.handle_event_inner(queue_index);
+        if perf_on {
+            crate::perf::FS_HANDLE_EVENT.add(crate::perf::now_ns() - perf_t0);
+            crate::perf::FS_REQS_PER_WAKE.add(self.perf_reqs);
+        }
+    }
+
+    fn handle_event_inner(&mut self, queue_index: usize) {
         debug!("Fs: queue event: {queue_index}");
         if let Err(e) = self.queue_evts[queue_index].read() {
             error!("Failed to get queue event: {e:?}");
@@ -188,6 +205,8 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
     }
 
     fn process_queue(&mut self, queue_index: usize) -> bool {
+        let perf_on = crate::perf::enabled();
+        let perf_key = crate::perf::event_key(&self.queue_evts[queue_index]);
         let queue = &mut self.queues[queue_index];
         loop {
             // A FUSE operation is synchronous once consumed. Between descriptors, observe stop
@@ -200,9 +219,11 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                     return true;
                 }
             }
+            let perf_t_pop = if perf_on { crate::perf::now_ns() } else { 0 };
             let Some(head) = queue.pop(&self.mem) else {
                 return false;
             };
+            self.perf_reqs += 1;
             let reader = Reader::new(&self.mem, head.clone())
                 .map_err(FsError::QueueReader)
                 .unwrap();
@@ -210,6 +231,9 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
+            if perf_on {
+                crate::perf::FS_POP.add(crate::perf::now_ns() - perf_t_pop);
+            }
             let used_len = match self.server.handle_message(
                 reader,
                 writer,
@@ -230,12 +254,22 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 }
             };
 
+            let perf_t_used = if perf_on { crate::perf::now_ns() } else { 0 };
             if let Err(e) = queue.add_used(&self.mem, head.index, used_len) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
+            if perf_on {
+                crate::perf::FS_ADD_USED.add(crate::perf::now_ns() - perf_t_used);
+            }
 
             if queue.needs_notification(&self.mem).unwrap() {
+                let perf_t_sig = if perf_on { crate::perf::now_ns() } else { 0 };
                 self.interrupt.signal_used_queue();
+                if perf_on {
+                    let t = crate::perf::now_ns();
+                    crate::perf::FS_SIGNAL.add(t - perf_t_sig);
+                    crate::perf::signaled(perf_key, t);
+                }
             }
         }
     }

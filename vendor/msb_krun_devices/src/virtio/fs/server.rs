@@ -138,7 +138,10 @@ impl<F: FileSystem + Sync> Server<F> {
                 return reply_error(io::Error::from_raw_os_error(errno), in_header.unique, w);
             }
         }
-        match in_header.opcode {
+        let perf_on = crate::perf::enabled();
+        let perf_t0 = if perf_on { crate::perf::now_ns() } else { 0 };
+        let perf_opcode = in_header.opcode;
+        let perf_result = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
             x if x == Opcode::Getattr as u32 => self.getattr(in_header, r, w),
@@ -221,7 +224,11 @@ impl<F: FileSystem + Sync> Server<F> {
                 in_header.unique,
                 w,
             ),
+        };
+        if perf_on {
+            crate::perf::fuse_op(perf_opcode, crate::perf::now_ns() - perf_t0);
         }
+        perf_result
     }
 
     fn lookup(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {

@@ -797,6 +797,7 @@ impl LocalContext {
 
         ensure_sigchld_handler_uses_alt_stack_before_spawn().await?;
 
+        microsandbox_utils::perf_mark("sdk:spawn");
         // Spawn and Windows lock release form one handoff, before waiting for startup JSON.
         let child = {
             match spawn_runtime_command(
@@ -897,6 +898,7 @@ impl LocalContext {
             }
         }
 
+        microsandbox_utils::perf_mark("sdk:spawned");
         let startup_result = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             read_startup_line(startup_process.child_mut(), startup_pipe),
@@ -923,6 +925,7 @@ impl LocalContext {
             }
         };
 
+        microsandbox_utils::perf_mark("sdk:startup_json");
         if startup.startup_events {
             startup_process.handle_mut().startup_reader = Some(reader);
         }
