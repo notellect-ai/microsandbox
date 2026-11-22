@@ -203,13 +203,7 @@ impl PassthroughFs {
                 // now holds. Read it again under the lock.
                 identity = self.path_identity(&path)?;
             }
-            // The mount root keeps its inode whatever the Host did to it: the
-            // guest cannot look it up again.
-            if data.inode == ROOT_INODE
-                || identity.is_none()
-                || data.identity.is_none()
-                || data.identity == identity
-            {
+            if identity.is_none() || data.identity.is_none() || data.identity == identity {
                 // A cached alias (hard link) can outlive the canonical name.
                 if identity.is_some() && data.identity == identity {
                     let displaced = Self::follow_host_rename(&mut inodes, &data, &path, |p| {
