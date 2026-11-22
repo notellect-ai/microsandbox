@@ -1,6 +1,11 @@
 //! Inode, handle, and lookup helpers for the Windows passthrough backend.
 
-use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+use std::os::windows::io::AsRawHandle;
+
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+};
 
 use super::*;
 
@@ -266,15 +271,18 @@ impl PassthroughFs {
     }
 
     /// A name a moved descendant took from a stale cached entry: that inode
-    /// lost it as in an unlink. An inode the guest still has open, as a file
-    /// or a directory, stays tracked, as it was before this repair: its open
-    /// handles keep working, and a lookup of the name the host moved it to
-    /// finds it again by its identity. Until then its path still names the
-    /// displaced entry, so metadata read by path is that of the entry now
-    /// there, also as before this repair.
+    /// lost it as in an unlink. An inode the guest still has open stays
+    /// tracked: reads and writes through its open handles keep working, and
+    /// a lookup of the name the host moved it to finds it again by its
+    /// identity. A directory handle holds no host handle to find that name
+    /// from, so an open directory keeps its old path until that lookup.
     fn finish_displaced(&self, inodes: &mut InodeTable, displaced: Vec<Arc<InodeData>>) {
         for data in displaced {
-            if self.has_open_handle(data.inode) || self.has_open_dir_handle(data.inode) {
+            if self.has_open_handle(data.inode) {
+                self.follow_open_handle(&data);
+                continue;
+            }
+            if self.has_open_dir_handle(data.inode) {
                 continue;
             }
             self.finish_removed_alias(inodes, &data);
@@ -287,6 +295,80 @@ impl PassthroughFs {
             .unwrap()
             .values()
             .any(|handle| handle.inode == inode)
+    }
+
+    /// Point a displaced inode the guest still has open at the name its file
+    /// has now, read from an open handle, so that metadata read and set by
+    /// path reaches that file and not the one that took its old name. A file
+    /// the host moved out of the mount, deleted, or gave a name the guest
+    /// cannot see keeps its old path.
+    fn follow_open_handle(&self, data: &InodeData) {
+        match self.open_file_path(data) {
+            Ok(Some(path)) => *data.path.write().unwrap() = path,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    ?error,
+                    inode = data.inode,
+                    "cannot read an open file's host name"
+                );
+            }
+        }
+    }
+
+    /// The path under the mount root that names the file an open handle of
+    /// `data` holds. `None` when the handle holds another object or the name
+    /// is not one the guest can reach.
+    fn open_file_path(&self, data: &InodeData) -> io::Result<Option<PathBuf>> {
+        let Some(identity) = data.identity else {
+            return Ok(None);
+        };
+        let host = {
+            let handles = self.handles.read().unwrap();
+            let Some(handle) = handles.values().find(|handle| handle.inode == data.inode) else {
+                return Ok(None);
+            };
+            let file = handle.file.lock().unwrap();
+            if mobility::file_identity(&file)? != identity {
+                return Ok(None);
+            }
+            final_path(&file)?
+        };
+
+        let root = StdOpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&self.root)
+            .map_err(host_error)?;
+        let Ok(relative) = host.strip_prefix(final_path(&root)?) else {
+            return Ok(None);
+        };
+        let mut path = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Ok(None);
+            };
+            let Some(name) = name.to_str() else {
+                return Ok(None);
+            };
+            if is_reserved_name(name) {
+                return Ok(None);
+            }
+            let Ok(name) = std::ffi::CString::new(name) else {
+                return Ok(None);
+            };
+            if validate_component(&name).is_err() {
+                return Ok(None);
+            }
+            path.push(name.to_str().expect("validated as UTF-8"));
+        }
+
+        // The name is read again by path: the host may have moved the file
+        // once more since the handle was asked.
+        if path == self.root || self.path_identity(&path)? != Some(identity) {
+            return Ok(None);
+        }
+        Ok(Some(path))
     }
 
     /// A directory renamed on the host takes its cached descendants along:
@@ -394,5 +476,36 @@ impl PassthroughFs {
             .filter(|data| data.inode == inode)
             .cloned()
             .ok_or_else(|| linux_error(LINUX_EBADF))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// The normalized host path of an open file, in the `\\?\` form
+/// `std::fs::canonicalize` returns (`\\?\C:\...` or `\\?\UNC\...`).
+fn final_path(file: &File) -> io::Result<PathBuf> {
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // SAFETY: the handle is open for the duration of the call, and the
+        // buffer is writable for the length passed, counted in UTF-16 units.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle() as HANDLE,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len < buffer.len() {
+            buffer.truncate(len);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        // Too small: `len` is the size needed, terminating null included.
+        buffer.resize(len.max(buffer.len() + 1), 0);
     }
 }

@@ -3760,3 +3760,47 @@ fn a_stale_child_open_when_a_host_move_takes_its_name_stays_usable() {
     fs.release(context(), stale, 0, handle, false, false, None)
         .unwrap();
 }
+
+/// A stale child the guest still has open when a host directory move takes
+/// its cached name keeps reporting and changing its own file: getattr and
+/// chmod through it must not reach the moved file that holds the name now.
+#[test]
+fn a_stale_child_open_when_a_host_move_takes_its_name_keeps_its_metadata() {
+    let temp = TempDir::new();
+    for (path, contents) in [("d/c", "moved"), ("e/c", "stale contents")] {
+        std::fs::create_dir_all(temp.path.join(path).parent().unwrap()).unwrap();
+        std::fs::write(temp.path.join(path), contents).unwrap();
+    }
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+    let moved = lookup_relative(&fs, "d/c").unwrap();
+    let stale = lookup_relative(&fs, "e/c").unwrap().inode;
+    let (handle, _) = fs
+        .open(context(), stale, false, LINUX_O_RDWR as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+
+    std::fs::rename(temp.path.join("e/c"), temp.path.join("kept")).unwrap();
+    fs.rmdir(context(), ROOT_INODE, c"e").unwrap();
+    std::fs::rename(temp.path.join("d"), temp.path.join("e")).unwrap();
+    lookup_relative(&fs, "e").unwrap();
+    assert_eq!(lookup_relative(&fs, "e/c").unwrap().inode, moved.inode);
+
+    let (st, _) = fs.getattr(context(), stale, Some(handle)).unwrap();
+    let attr = stat64 {
+        st_mode: S_IFREG | 0o600,
+        ..Default::default()
+    };
+    fs.setattr(context(), stale, attr, Some(handle), SetattrValid::MODE)
+        .unwrap();
+
+    assert_eq!(st.st_size, 14);
+    let entry = lookup_relative(&fs, "e/c").unwrap();
+    assert_eq!(entry.attr.st_size, 5);
+    assert_eq!(entry.attr.st_mode, moved.attr.st_mode);
+    let kept = lookup_relative(&fs, "kept").unwrap();
+    assert_eq!(kept.inode, stale);
+    assert_eq!(kept.attr.st_mode, S_IFREG | 0o600);
+    fs.release(context(), stale, 0, handle, false, false, None)
+        .unwrap();
+}
