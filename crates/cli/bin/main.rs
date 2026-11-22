@@ -367,6 +367,11 @@ fn main() {
         unsafe { std::env::set_var("MSB_PATH", &exe) };
     }
 
+    // Launch checks of this executable read its advertisement in-process.
+    // Registered first, so the captured file is the one that started. If it
+    // fails, they probe this executable as before.
+    let _ = microsandbox::runtime::register_own_runtime(own_launch_capabilities);
+
     // Handle --tree before Cli::parse() so it works even when
     // required arguments (e.g. `msb run --tree`) are missing.
     if std::env::args_os().any(|arg| arg == "--tree")
@@ -838,11 +843,6 @@ fn run_async_command_anyhow(
         builder
     };
     let runtime = builder.enable_all().build()?;
-    // Launch checks of this executable read its advertisement in-process. If
-    // registration fails, they probe it as before.
-    if let Err(error) = microsandbox::runtime::register_own_runtime(own_launch_capabilities) {
-        tracing::debug!(%error, "launch checks will probe the running executable");
-    }
 
     runtime.block_on(async move {
         let mut cleanup_backend = None;

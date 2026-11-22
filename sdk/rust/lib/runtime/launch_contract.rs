@@ -1114,10 +1114,16 @@ pub(crate) async fn require_storage_reader(path: &Path) -> MicrosandboxResult<()
 /// Register the running executable's launch advertisement. A launch check of
 /// a runtime that is this same file (same canonical path and identity as now)
 /// is then answered without spawning `msb __launch-protocol`. The identity is
-/// captured here, so a file replaced afterwards is probed as usual. Only the
-/// first registration counts.
+/// captured here, so call it as early as possible; a file replaced afterwards
+/// is probed as usual. Only the first registration counts. For the msb CLI:
+/// the advertisement must be what this executable prints to that probe.
+#[doc(hidden)]
 pub fn register_own_runtime(advertise: fn() -> LaunchCapabilities) -> std::io::Result<()> {
-    let path = std::fs::canonicalize(std::env::current_exe()?)?;
+    register_runtime_at(&std::env::current_exe()?, advertise)
+}
+
+fn register_runtime_at(path: &Path, advertise: fn() -> LaunchCapabilities) -> std::io::Result<()> {
+    let path = std::fs::canonicalize(path)?;
     let file = File::open(&path)?;
     let identity = FileIdentity::capture(&file)?;
     let _ = OWN_RUNTIME.set(OwnRuntime {
@@ -1239,7 +1245,6 @@ fn parse_version(bytes: &[u8]) -> MicrosandboxResult<Version> {
     parsed.ok_or_else(|| MicrosandboxError::Runtime("unrecognized runtime version response".into()))
 }
 
-/// A consistent, actionable refusal for features that cannot be downgraded.
 /// Restored execution limits and deferred command bindings are honored only by
 /// runtimes that advertise them; older ones would drop them silently.
 fn require_restore_guard(
@@ -1260,6 +1265,7 @@ fn require_restore_guard(
     Ok(())
 }
 
+/// A consistent, actionable refusal for features that cannot be downgraded.
 fn upgrade_required(feature: &str) -> String {
     format!(
         "selected msb runtime does not support {feature}; \
@@ -2364,13 +2370,33 @@ mod tests {
         .unwrap()
     }
 
-    /// The test binary stands in for msb: run with `__launch-protocol` it
-    /// prints libtest output, not an advertisement, so any probe of it fails
-    /// the check that made it.
+    /// A registered file is answered in-process; the same path after a
+    /// replacement, another name of the same file and a copy are probed. The
+    /// file is not executable, so every probe of it fails the check that made it.
     #[tokio::test]
     async fn launch_checks_of_the_registered_running_executable_never_probe() {
-        register_own_runtime(all_capabilities).unwrap();
-        let own = std::env::current_exe().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir
+            .path()
+            .join(if cfg!(windows) { "msb.exe" } else { "msb" });
+        std::fs::write(&own, b"not an executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(bounded_probe(&own, "__launch-protocol").await.is_err());
+        register_runtime_at(&own, all_capabilities).unwrap();
+        // Drop the cached answer (and its open handle) even when an assert fails.
+        struct Evict(PathBuf);
+        impl Drop for Evict {
+            fn drop(&mut self) {
+                if let Ok(mut cached) = CAPABILITIES.try_lock() {
+                    cached.remove(&self.0);
+                }
+            }
+        }
+        let _evict = Evict(std::fs::canonicalize(&own).unwrap());
 
         let mut probed = Vec::new();
         let mut check = |name: &'static str, ok: bool| {
@@ -2418,11 +2444,21 @@ mod tests {
         );
         assert!(probed.is_empty(), "checks that probed: {probed:?}");
 
-        // A byte-identical copy at another path is another runtime: probed.
-        let dir = tempfile::tempdir().unwrap();
-        let copy = dir.path().join(own.file_name().unwrap());
+        // Another name of the same file is another runtime path: probed.
+        let link = dir.path().join("linked");
+        std::fs::hard_link(&own, &link).unwrap();
+        assert!(require_protected_guest_state(&link).await.is_err());
+        // So is a byte-identical copy.
+        let copy = dir.path().join("copy");
         std::fs::copy(&own, &copy).unwrap();
         assert!(require_protected_guest_state(&copy).await.is_err());
+        // A replacement at the registered path is not the registered file.
+        std::fs::remove_file(&link).unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"not an executable").unwrap();
+        std::fs::rename(&staged, &own).unwrap();
+        let error = require_protected_guest_state(&own).await.unwrap_err();
+        assert!(error.to_string().contains("Probe failed"), "{error}");
     }
 
     #[test]
