@@ -31,6 +31,8 @@ use microsandbox_db::{DbReadConnection, DbWriteConnection};
 use microsandbox_image::{Digest, GlobalCache};
 #[cfg(unix)]
 use microsandbox_runtime::ipc::SandboxSocketPaths;
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use sea_orm::{
     ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::Expr,
@@ -482,6 +484,10 @@ impl LocalContext {
                 match self.request_agent_shutdown(name, model.id).await {
                     Ok(()) => {}
                     Err(error @ crate::MicrosandboxError::SandboxReplaced { .. }) => {
+                        return Err(error);
+                    }
+                    // Kept as it is, so callers can still recognize and explain it.
+                    Err(error) if elevation_share::has_elevated_sandbox_denial(&error) => {
                         return Err(error);
                     }
                     Err(error) => {
