@@ -195,6 +195,11 @@ pub struct Config {
     #[cfg(windows)]
     pub startup_pipe: Option<String>,
 
+    /// Share this runtime's pipes with the same account's non-elevated runs when it runs
+    /// elevated (the launch's `share_elevated_sandboxes`).
+    #[cfg(windows)]
+    pub share_elevated_sandboxes: bool,
+
     /// Read end of the attached-parent watchdog pipe.
     #[cfg(unix)]
     pub parent_watchdog: Option<OwnedFd>,
@@ -741,6 +746,11 @@ fn run(
     setup_log_capture(&config.log_dir, config.forward_output)?;
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
+
+    // Before any pipe exists: an elevated runtime keeps the UAC boundary unless the launch
+    // opted in to sharing its pipes with the same account's non-elevated runs.
+    #[cfg(windows)]
+    super::elevation::share_with_non_elevated(config.share_elevated_sandboxes)?;
 
     let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
 

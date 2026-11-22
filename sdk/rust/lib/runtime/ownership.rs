@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use microsandbox_db::entity::run;
+use microsandbox_utils::elevation_share;
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -156,7 +157,7 @@ impl RuntimeProcess {
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(elevation_share::explain_access_denied(error).into()),
             }
         }
     }
