@@ -4005,9 +4005,12 @@ mod tests {
         let opted_in: GlobalConfigPatch =
             serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
         let opted_in = test_local_backend_with(opted_in);
+        let opted_out: GlobalConfigPatch =
+            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":false}}"#).unwrap();
+        let opted_out = test_local_backend_with(opted_out);
         let default = test_local_backend();
 
-        for (local, opt_in) in [(&default, false), (&opted_in, true)] {
+        for (local, opt_in) in [(&opted_out, false), (&default, true), (&opted_in, true)] {
             for elevated in [false, true] {
                 let mut asked = false;
                 let launch = render_launch_on(local, &config, || {

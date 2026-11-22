@@ -52,14 +52,20 @@ Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
   of OWNER RIGHTS. An elevated run makes BUILTIN\Administrators the owner of
   what it creates, so with OWNER RIGHTS a later non-elevated run of the same
   user was denied the cache. The user SID is the same in both runs.
-- On Windows, an elevated `msb` and its runtime make the user SID the
-  default owner of what they create (named pipes grant their creator owner)
-  and give the metrics mapping and events a default DACL of the user SID and
-  SYSTEM instead of Administrators and SYSTEM, and the runtime gives its own process
-  a Medium label and grants the user only identity, wait and terminate
-  rights. A later non-elevated run of the same user can then exec into, stop
-  and remove a sandbox that an elevated run left running, without being able
-  to take over the elevated process.
+- On Windows, `runtime.share_elevated_sandboxes` defaults to on (upstream
+  default: off). An elevated `msb` (the full half of a UAC split token) then
+  tells its runtime to create its agent, control and console pipes with a
+  security descriptor that grants the sign-in's logon SID read and write (no
+  new pipe instances). Both halves of the split token carry that SID and no
+  other logon does, so a later non-elevated run in the same sign-in session can
+  exec into, stop and remove a sandbox an elevated run left running, while
+  another logon of the same user (RDP, SSH, a service, an S4U task) cannot. The runtime process keeps Windows' default security, which already
+  gives that session wait and terminate but not WRITE_DAC; the metrics mapping
+  is reachable through the session object directory's ACL. The upstream PR is
+  the same code with the default off; with it off, a non-elevated run gets an
+  access-denied error that explains the cause. This replaces the earlier fork
+  design (user SID as owner), which let a medium process gain WRITE_DAC on the
+  elevated runtime.
 - On Windows, vsock blocks on the Host named pipe instead of polling it every
   10 ms, and a Host that replies and closes delivers its reply, then EOF.
 - A vsock reset carries the Host's receive credit (buf_alloc and the
@@ -73,12 +79,11 @@ Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
 Known and left as they are (from a review of the v0.8.1 commits):
 
 - Intentional: the elevated-run sharing above weakens the UAC boundary for
-  this user. Every named object an elevated runtime creates (guest RAM
-  mapping, events, agent and control pipes) grants the same user's
-  medium-integrity processes full access and carries no High label, so any
-  medium process of that user can write guest memory or talk to the elevated
-  runtime's pipes. The runtime process object itself grants only identity,
-  wait and terminate. Notellect accepts this for a single-user desktop tool.
+  this user: any medium-integrity process of that user in the same sign-in
+  session can talk to the elevated runtime's pipes (exec, stop). It cannot
+  take over the runtime process. Runs in another sign-in session (RDP, fast
+  user switching, over-the-shoulder elevation) are not reached. Notellect
+  accepts this for a single-user desktop tool.
 - Windows open-after-unlink: the retain fallback reads a removed file's
   ownership and mode from its old path's stat store entry, which after a
   rename-over (ADS store) is the new file's and after an unlink is gone; a
