@@ -155,17 +155,6 @@ impl PassthroughFs {
             .mode
             .map_or(host, dirent_type_from_mode))
     }
-
-    pub(super) fn parent_entry(&self, data: &InodeData) -> io::Result<Entry> {
-        let path = data.path();
-        let parent_path = path.parent().unwrap_or(&self.root);
-        let parent_path = if data.inode == ROOT_INODE || !parent_path.starts_with(&self.root) {
-            self.root.clone()
-        } else {
-            parent_path.to_path_buf()
-        };
-        self.entry_for_path(parent_path)
-    }
 }
 
 //--------------------------------------------------------------------------------------------------
