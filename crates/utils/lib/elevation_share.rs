@@ -18,9 +18,14 @@
 //! PROCESS_TERMINATE`, enough to find and wait for the runtime but never to read its memory or
 //! change its security. Each sign-in has its own logon SID, so this holds only for
 //! non-elevated runs in the same sign-in session as the elevated one; clients open the runtime
-//! process before any pipe, so runs in other sessions cannot reach the sandbox either way. Other kernel objects the runtime creates without explicit security,
-//! such as the metrics registry mapping, get the same default DACL, so the filtered token can
-//! open them for reading, which is all metrics readers ask for.
+//! process before any pipe, so runs in other sessions cannot reach the sandbox either way.
+//!
+//! Named kernel objects the runtime creates without explicit security, such as the metrics
+//! registry mapping, do not get the token's default DACL: they inherit the inheritable ACEs of
+//! the session's object directory, which grant SYSTEM, Administrators and the logon SID full
+//! access, and they get no integrity label (only processes, threads and tokens get the
+//! creator's). The filtered token can therefore open the mapping for reading and writing,
+//! with or without the opt-in; metrics readers only read it.
 //!
 //! When the user opts in (`runtime.share_elevated_sandboxes`), the runtime's pipes get an
 //! explicit security descriptor that also grants the user SID of the runtime's token; nothing
@@ -512,11 +517,9 @@ mod tests {
         };
         assert_ne!(pipe, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
         // Default security, as the metrics registry creates its mapping (no explicit
-        // descriptor). A named object in an object directory takes its DACL from the
-        // directory's inheritable ACEs when it has any, not from the token's default DACL,
-        // and only process, thread and token objects get the creator's High label; the
-        // descriptor printed here is what the filtered token's opens below are checked
-        // against.
+        // descriptor). The mapping inherits the session object directory's ACEs, full access
+        // for SYSTEM, Administrators and the logon SID, rather than the token's default DACL,
+        // and gets no label; the printed descriptor shows it.
         let mapping_name = format!("Local\\msb-elevation-share-test-{id}");
         let mapping = unsafe {
             CreateFileMappingW(
