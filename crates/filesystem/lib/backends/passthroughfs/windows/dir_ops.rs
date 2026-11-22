@@ -1,5 +1,7 @@
 //! Directory enumeration helpers for the Windows passthrough backend.
 
+use std::ffi::CString;
+
 use super::*;
 
 //--------------------------------------------------------------------------------------------------
@@ -37,13 +39,29 @@ impl PassthroughFs {
         Ok(snapshot.as_ref().unwrap().clone())
     }
 
-    pub(super) fn snapshot_entry_attributes(&self, entry: &DirSnapshotEntry) -> io::Result<Entry> {
+    pub(super) fn snapshot_entry_attributes(
+        &self,
+        parent: u64,
+        entry: &DirSnapshotEntry,
+    ) -> io::Result<Entry> {
         if self.cfg.inject_init && entry.inode == INIT_INODE {
             return Ok(init_entry(self.cfg.entry_timeout, self.cfg.attr_timeout));
         }
-        let data = self.inode(entry.inode)?;
-        let metadata = self.inode_metadata(&data)?;
-        self.entry_from_metadata(&metadata, data.as_ref())
+        let attributes = self.inode(entry.inode).and_then(|data| {
+            let metadata = self.inode_metadata(&data)?;
+            self.entry_from_metadata(&metadata, data.as_ref())
+        });
+        match attributes {
+            // The host put another file at the name after the listing (and
+            // the listed inode may be gone since): report what the name
+            // holds now, as a lookup would.
+            Err(error) if error.raw_os_error() == Some(LINUX_ESTALE) => {
+                let name =
+                    CString::new(entry.name.clone()).map_err(|_| linux_error(LINUX_EINVAL))?;
+                self.entry_for_path(self.child_path(parent, &name)?)
+            }
+            attributes => attributes,
+        }
     }
 
     pub(super) fn dir_entries(&self, inode: u64) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
@@ -97,18 +115,15 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
-            let path = entry.path();
             // A rejected reparse point must not hide its ordinary siblings.
             // Direct lookup and access still enforce the same reparse guard.
-            let metadata = match self.safe_metadata(&path) {
-                Ok(metadata) => metadata,
+            let full_entry = match self.entry_for_path(entry.path()) {
+                Ok(full_entry) => full_entry,
                 Err(error) if error.raw_os_error() == Some(LINUX_ELOOP) => continue,
                 Err(error) => return Err(error),
             };
-            let child = self.intern_path(path)?;
-            let full_entry = self.entry_from_metadata(&metadata, child.as_ref())?;
             let dir_entry = DirEntry {
-                ino: child.inode,
+                ino: full_entry.inode,
                 offset: entries.len() as u64 + 1,
                 type_: dirent_type_from_mode(full_entry.attr.st_mode),
                 name: leak_name(name.to_bytes()),
