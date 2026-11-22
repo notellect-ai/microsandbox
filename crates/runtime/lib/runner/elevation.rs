@@ -63,10 +63,6 @@ fn share_with_non_elevated_as(
     security: impl FnOnce() -> io::Result<SharedSecurity>,
 ) -> RuntimeResult<()> {
     set_pipe_security(None);
-    if !opt_in {
-        return Ok(());
-    }
-
     let elevation = elevation().map_err(|error| {
         RuntimeError::Custom(format!(
             "could not read this process's token elevation type while \
