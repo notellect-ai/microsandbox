@@ -48,7 +48,7 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION_TYPE,
     TOKEN_GROUPS, TOKEN_QUERY, TokenElevationType, TokenElevationTypeFull,
-    TokenElevationTypeLimited, TokenLogonSid,
+    TokenElevationTypeLimited, TokenLogonSid, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -171,7 +171,7 @@ pub fn elevation_type() -> io::Result<TOKEN_ELEVATION_TYPE> {
 /// [`shares_with_non_elevated`] first; without sharing, create the pipe with its default
 /// security instead.
 pub fn shared_pipe_security() -> io::Result<SharedSecurity> {
-    pipe_security_for(&current_logon_sid()?)
+    pipe_security_for(&current_user_sid()?)
 }
 
 /// Explain an error a client got connecting to a sandbox's pipe.
@@ -239,6 +239,35 @@ fn pipe_security_for(logon: &str) -> io::Result<SharedSecurity> {
 /// grants.
 pub fn current_logon_sid() -> io::Result<String> {
     logon_sid_string(&open_token()?)
+}
+
+fn current_user_sid() -> io::Result<String> {
+    let token = open_token()?;
+    let mut buffer = vec![0usize; 64];
+    let mut length = 0;
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * size_of::<usize>()) as u32,
+            &mut length,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let mut text = null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+    let value = String::from_utf16_lossy(unsafe { from_raw_parts(text, len) });
+    unsafe { LocalFree(text.cast()) };
+    Ok(value)
 }
 
 fn open_token() -> io::Result<Token> {
