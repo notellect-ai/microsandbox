@@ -225,7 +225,7 @@ impl PassthroughFs {
             return Ok(None);
         }
         after_pin_check();
-        let stat_file = self.pin_owned_stat(&file, current)?;
+        let stat_file = self.pin_owned_stat(path, current)?;
         Ok(Some(PreparedOwnedUnlink {
             data,
             file,
@@ -274,7 +274,11 @@ impl PassthroughFs {
         // made while the file has no name is stored with the file, where a
         // lookup of another hard link reads it. Without it the change stays
         // in memory only.
-        let stat_file = self.pin_owned_stat(&file, current).ok().flatten();
+        let stat_file = self
+            .pin_owned_stat(path, current)
+            .ok()
+            .flatten()
+            .filter(|stat_file| Self::holds_own_object(&data, stat_file));
         Some(PreparedOwnedUnlink {
             data,
             file,
