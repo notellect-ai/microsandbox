@@ -1,7 +1,5 @@
 //! Directory enumeration helpers for the Windows passthrough backend.
 
-use std::ffi::CString;
-
 use super::*;
 
 //--------------------------------------------------------------------------------------------------
@@ -39,47 +37,13 @@ impl PassthroughFs {
         Ok(snapshot.as_ref().unwrap().clone())
     }
 
-    /// Read the attributes of a listed entry. `Ok(None)` when its name has
-    /// gone, turned into a reparse point or keeps being replaced since the
-    /// listing: the entry is left out, as `dir_entries` leaves out a
-    /// reparse point.
-    pub(super) fn snapshot_entry_attributes(
-        &self,
-        parent: u64,
-        entry: &DirSnapshotEntry,
-    ) -> io::Result<Option<Entry>> {
+    pub(super) fn snapshot_entry_attributes(&self, entry: &DirSnapshotEntry) -> io::Result<Entry> {
         if self.cfg.inject_init && entry.inode == INIT_INODE {
-            return Ok(Some(init_entry(
-                self.cfg.entry_timeout,
-                self.cfg.attr_timeout,
-            )));
+            return Ok(init_entry(self.cfg.entry_timeout, self.cfg.attr_timeout));
         }
-        if entry.name == b"." || entry.name == b".." {
-            let data = self.inode(entry.inode)?;
-            let metadata = self.inode_metadata(&data)?;
-            return self.entry_from_metadata(&metadata, data.as_ref()).map(Some);
-        }
-        let name = CString::new(entry.name.clone()).map_err(|_| linux_error(LINUX_EINVAL))?;
-        let path = self.child_path(parent, &name)?;
-        // The name still holds the listed inode's file: read it as before.
-        if let Ok(data) = self.inode(entry.inode)
-            && data.identity.is_some()
-            && self.path_identity(&path).ok().flatten() == data.identity
-        {
-            match self
-                .inode_metadata(&data)
-                .and_then(|metadata| self.entry_from_metadata(&metadata, data.as_ref()))
-            {
-                Err(error) if is_name_miss(&error) => {}
-                result => return result.map(Some),
-            }
-        }
-        // The host can have put another file at the name since the listing:
-        // report what the name holds now, as a lookup would.
-        match self.entry_for_path(path) {
-            Err(error) if is_name_miss(&error) => Ok(None),
-            result => result.map(Some),
-        }
+        let data = self.inode(entry.inode)?;
+        let metadata = self.inode_metadata(&data)?;
+        self.entry_from_metadata(&metadata, data.as_ref())
     }
 
     pub(super) fn dir_entries(&self, inode: u64) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
@@ -133,15 +97,18 @@ impl PassthroughFs {
                 .map_err(|_| linux_error(LINUX_EINVAL))?;
             validate_component(name)?;
 
+            let path = entry.path();
             // A rejected reparse point must not hide its ordinary siblings.
             // Direct lookup and access still enforce the same reparse guard.
-            let full_entry = match self.entry_for_path(entry.path()) {
-                Ok(full_entry) => full_entry,
+            let metadata = match self.safe_metadata(&path) {
+                Ok(metadata) => metadata,
                 Err(error) if error.raw_os_error() == Some(LINUX_ELOOP) => continue,
                 Err(error) => return Err(error),
             };
+            let child = self.intern_path(path)?;
+            let full_entry = self.entry_from_metadata(&metadata, child.as_ref())?;
             let dir_entry = DirEntry {
-                ino: full_entry.inode,
+                ino: child.inode,
                 offset: entries.len() as u64 + 1,
                 type_: dirent_type_from_mode(full_entry.attr.st_mode),
                 name: leak_name(name.to_bytes()),
@@ -175,12 +142,4 @@ pub(super) fn snapshot_dir_entry(entry: DirSnapshotEntry) -> DirEntry<'static> {
         type_: entry.file_type,
         name: leak_name(&entry.name),
     }
-}
-
-/// Whether `error` says a listed name no longer holds a file to report.
-fn is_name_miss(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(LINUX_ENOENT | LINUX_ESTALE | LINUX_ELOOP)
-    )
 }

@@ -1,16 +1,5 @@
 //! Creation and link operations for the Windows passthrough backend.
 
-use std::os::windows::io::AsRawHandle;
-
-use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_LINK_INFORMATION, FileLinkInformation, NtSetInformationFile,
-};
-use windows_sys::Win32::Foundation::{ERROR_DELETE_PENDING, RtlNtStatusToDosError};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_LIST_DIRECTORY, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
-};
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-
 use super::*;
 
 //--------------------------------------------------------------------------------------------------
@@ -194,11 +183,7 @@ impl PassthroughFs {
         }
 
         let source = self.inode(inode)?;
-        // Through the source's own file, before anything is linked: a source
-        // whose name the host has put another file at, or removed, fails
-        // here unless the guest has it open.
-        let source_metadata = self.inode_metadata(&source)?;
-        let current = self.current_override(&source_metadata, source.as_ref())?;
+        self.safe_metadata(&source.path())?;
         let new_path = self.child_path(newparent, newname)?;
         let parent_path = new_path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
         let parent_metadata = self.safe_metadata(parent_path)?;
@@ -206,14 +191,16 @@ impl PassthroughFs {
             return Err(linux_error(LINUX_ENOTDIR));
         }
 
-        // Linked through the checked handle, so the new name never goes to
-        // another file the source's name holds by now.
-        match self.own_file(&source, true)? {
-            Some(file) => link_at(&file, parent_path, newname)?,
-            None => std::fs::hard_link(source.path(), &new_path).map_err(host_error)?,
+        // Proof only: the window the fix guards, after the source is
+        // resolved and before the link is made.
+        #[cfg(test)]
+        if let Some(act) = super::metadata::AFTER_OWN_CHECK.with(|hook| hook.borrow_mut().take()) {
+            act();
         }
+        std::fs::hard_link(source.path(), &new_path).map_err(host_error)?;
         let metadata = self.safe_metadata(&new_path)?;
         let data = self.intern_path(new_path.clone())?;
+        let current = self.current_override(&metadata, source.as_ref())?;
         if let Err(error) = self.set_virtual_metadata(
             data.as_ref(),
             current.uid,
@@ -226,96 +213,6 @@ impl PassthroughFs {
             return Err(error);
         }
 
-        match self.entry_from_metadata(&metadata, data.as_ref()) {
-            // The inode tracks the source's name, which the host has put
-            // another file at since the link: the new name still holds it.
-            Err(error) if error.raw_os_error() == Some(LINUX_ESTALE) => {
-                self.entry_for_path(new_path)
-            }
-            entry => entry,
-        }
+        self.entry_from_metadata(&metadata, data.as_ref())
     }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-/// Give the file `file` holds the name `name` in the directory at `parent`.
-/// A handle opened through a name the host has since replaced or removed
-/// can no longer link the file (Windows reports delete pending or access
-/// denied); the file is then reached through a reopen by file ID. A file
-/// with no name left is gone (ENOENT).
-fn link_at(file: &File, parent: &Path, name: &CStr) -> io::Result<()> {
-    let name: Vec<u16> = name
-        .to_str()
-        .map_err(|_| linux_error(LINUX_EINVAL))?
-        .encode_utf16()
-        .collect();
-    let directory = StdOpenOptions::new()
-        .access_mode(FILE_LIST_DIRECTORY | FILE_TRAVERSE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(parent)
-        .map_err(host_error)?;
-    let error = match set_link(file, &directory, &name) {
-        Ok(()) => return Ok(()),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(code) if code == ERROR_ACCESS_DENIED || code == ERROR_DELETE_PENDING as i32
-            ) =>
-        {
-            error
-        }
-        Err(error) => return Err(host_error(error)),
-    };
-    // As on Linux, a file with no name left gets none.
-    if owned_metadata::link_count(file)? == 0 {
-        return Err(linux_error(LINUX_ENOENT));
-    }
-    let Ok(file) = owned_metadata::reopen_by_id(file, FILE_WRITE_ATTRIBUTES) else {
-        return Err(host_error(error));
-    };
-    set_link(&file, &directory, &name).map_err(host_error)
-}
-
-/// Link the file `file` holds as `name` in `directory`, by FileLinkInformation.
-/// Errors are the host's, not yet mapped to Linux.
-fn set_link(file: &File, directory: &File, name: &[u16]) -> io::Result<()> {
-    // A validated name component is short, so its length in bytes fits.
-    let name_bytes = (name.len() * 2) as u32;
-    let size = (std::mem::offset_of!(FILE_LINK_INFORMATION, FileName) + name_bytes as usize)
-        .max(std::mem::size_of::<FILE_LINK_INFORMATION>());
-
-    // Pointer-sized words provide the alignment of FILE_LINK_INFORMATION; the
-    // flags stay zero, so an existing name is not replaced.
-    let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
-    let mut status_block = IO_STATUS_BLOCK::default();
-
-    // SAFETY: buffer is aligned and large enough for the header and name, and
-    // both handles stay open until the synchronous call returns.
-    let status = unsafe {
-        (*info).RootDirectory = directory.as_raw_handle();
-        (*info).FileNameLength = name_bytes;
-        let destination = info
-            .cast::<u8>()
-            .add(std::mem::offset_of!(FILE_LINK_INFORMATION, FileName))
-            .cast::<u16>();
-        std::ptr::copy_nonoverlapping(name.as_ptr(), destination, name.len());
-        NtSetInformationFile(
-            file.as_raw_handle(),
-            &mut status_block,
-            info.cast(),
-            size as u32,
-            FileLinkInformation,
-        )
-    };
-    if status < 0 {
-        // SAFETY: RtlNtStatusToDosError only maps the status code.
-        let code = unsafe { RtlNtStatusToDosError(status) };
-        return Err(io::Error::from_raw_os_error(code as i32));
-    }
-
-    Ok(())
 }

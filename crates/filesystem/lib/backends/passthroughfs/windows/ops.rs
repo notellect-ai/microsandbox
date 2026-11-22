@@ -512,19 +512,9 @@ impl DynFileSystem for PassthroughFs {
             .dir_snapshot(inode, handle)?
             .into_iter()
             .filter(|entry| entry.offset > offset)
-            .filter_map(|entry| {
-                let full = match self.snapshot_entry_attributes(inode, &entry) {
-                    Ok(Some(full)) => full,
-                    Ok(None) => return None,
-                    Err(error) => return Some(Err(error)),
-                };
-                // The name can hold a newer file than the listing saw.
-                let dir_entry = DirEntry {
-                    ino: full.inode,
-                    type_: dirent_type_from_mode(full.attr.st_mode),
-                    ..snapshot_dir_entry(entry)
-                };
-                Some(Ok((dir_entry, full)))
+            .map(|entry| {
+                let full = self.snapshot_entry_attributes(&entry)?;
+                Ok((snapshot_dir_entry(entry), full))
             })
             .collect::<io::Result<Vec<_>>>()?;
         for (_, entry) in &entries {
@@ -546,17 +536,9 @@ impl DynFileSystem for PassthroughFs {
             if entry.offset <= offset {
                 continue;
             }
-            let Some(full) = self.snapshot_entry_attributes(inode, &entry)? else {
-                continue;
-            };
+            let full = self.snapshot_entry_attributes(&entry)?;
             let id = full.inode;
-            // The name can hold a newer file than the listing saw.
-            let dir_entry = DirEntry {
-                ino: id,
-                type_: dirent_type_from_mode(full.attr.st_mode),
-                ..snapshot_dir_entry(entry)
-            };
-            if add_entry(dir_entry, full)? == 0 {
+            if add_entry(snapshot_dir_entry(entry), full)? == 0 {
                 break;
             }
             self.record_owned_lookup(id);
