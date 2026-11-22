@@ -60,10 +60,6 @@ fn share_with_non_elevated_as<S>(
     security: impl FnOnce() -> io::Result<S>,
 ) -> RuntimeResult<()> {
     SHARE_ELEVATED.store(false, Ordering::Relaxed);
-    if !opt_in {
-        return Ok(());
-    }
-
     let elevation = elevation().map_err(|error| {
         RuntimeError::Custom(format!(
             "share_elevated_sandboxes was requested, but this runtime's token elevation type \
