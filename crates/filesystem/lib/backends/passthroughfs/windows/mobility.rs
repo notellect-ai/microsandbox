@@ -896,6 +896,7 @@ fn rebuild(
             }),
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
+            unsaved_metadata: AtomicBool::new(false),
             lookups: std::sync::atomic::AtomicU64::new(0),
         });
         if let Some(identity) = data.identity {

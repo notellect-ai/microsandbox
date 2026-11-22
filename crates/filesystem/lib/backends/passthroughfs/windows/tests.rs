@@ -3782,6 +3782,57 @@ fn unreadable_metadata_on_both_sides_does_not_drop_a_renamed_over_file() {
     unreadable_metadata_does_not_block_name_loss(true, true);
 }
 
+/// A chmod on an open file after its name is gone survives a later lookup of
+/// a hard link the guest had not looked up: the lookup names the file again,
+/// and its metadata is then read from the host by that name.
+fn chmod_after_name_loss_survives_a_hard_link_lookup(replace: bool) {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+    let (inode, handle) = create_with(&fs, context(), c"data", 0o644, b"old");
+    std::fs::hard_link(temp.path.join("data"), temp.path.join("link")).unwrap();
+
+    if replace {
+        let (tmp_inode, tmp_handle) = create_with(&fs, context(), c"tmp", 0o644, b"new");
+        fs.release(context(), tmp_inode, 0, tmp_handle, false, false, None)
+            .unwrap();
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap();
+    } else {
+        fs.unlink(context(), ROOT_INODE, c"data").unwrap();
+    }
+    let attr = stat64 {
+        st_mode: S_IFREG | 0o600,
+        ..Default::default()
+    };
+    let (st, _) = fs
+        .setattr(context(), inode, attr, Some(handle), SetattrValid::MODE)
+        .unwrap();
+    assert_eq!(st.st_mode, S_IFREG | 0o600);
+
+    let link = fs.lookup(context(), ROOT_INODE, c"link").unwrap();
+
+    assert_eq!(link.inode, inode);
+    assert_eq!(link.attr.st_mode, S_IFREG | 0o600);
+    let (st, _) = fs.getattr(context(), inode, Some(handle)).unwrap();
+    assert_eq!(st.st_mode, S_IFREG | 0o600);
+    assert_override(&temp.path.join("link"), 0, 0, S_IFREG | 0o600, 0);
+    fs.release(context(), inode, 0, handle, false, false, None)
+        .unwrap();
+    let (st, _) = fs.getattr(context(), inode, None).unwrap();
+    assert_eq!(st.st_mode, S_IFREG | 0o600);
+}
+
+#[test]
+fn chmod_after_unlink_survives_a_hard_link_lookup() {
+    chmod_after_name_loss_survives_a_hard_link_lookup(false);
+}
+
+#[test]
+fn chmod_after_rename_over_survives_a_hard_link_lookup() {
+    chmod_after_name_loss_survives_a_hard_link_lookup(true);
+}
+
 /// A handle whose file is not its inode's object (an open by path that raced
 /// a rename-over reaches the replacing file) is never pinned as that inode's
 /// retained file.
@@ -4158,6 +4209,39 @@ fn a_host_replace_gives_the_name_a_new_inode() {
         fs.release(context(), old, 0, handle, false, false, None)
             .unwrap();
     }
+}
+
+/// A chmod the guest makes through an open handle after the host replaced
+/// the file's name survives a lookup of another hard link to the old file,
+/// which names it again.
+#[test]
+fn chmod_after_a_host_replace_survives_a_hard_link_lookup() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+    let (old, handle) = create_with(&fs, context(), c"config", 0o644, b"old");
+    std::fs::hard_link(temp.path.join("config"), temp.path.join("link")).unwrap();
+    let staged = temp.path.join("config.new");
+    std::fs::write(&staged, b"new").unwrap();
+    std::fs::rename(&staged, temp.path.join("config")).unwrap();
+    let entry = fs.lookup(context(), ROOT_INODE, c"config").unwrap();
+    assert_ne!(entry.inode, old);
+
+    let attr = stat64 {
+        st_mode: S_IFREG | 0o600,
+        ..Default::default()
+    };
+    fs.setattr(context(), old, attr, Some(handle), SetattrValid::MODE)
+        .unwrap();
+    let link = fs.lookup(context(), ROOT_INODE, c"link").unwrap();
+
+    assert_eq!(link.inode, old);
+    assert_eq!(link.attr.st_mode, S_IFREG | 0o600);
+    assert_override(&temp.path.join("link"), 0, 0, S_IFREG | 0o600, 0);
+    fs.release(context(), old, 0, handle, false, false, None)
+        .unwrap();
+    let (st, _) = fs.getattr(context(), old, None).unwrap();
+    assert_eq!(st.st_mode, S_IFREG | 0o600);
 }
 
 /// A lookup of the destination name inside the window between the host
