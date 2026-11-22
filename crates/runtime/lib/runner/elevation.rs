@@ -70,7 +70,7 @@ fn share_with_non_elevated_as<S>(
              could not be read: {error}"
         ))
     })?;
-    if !elevation_share::shares_with_non_elevated(opt_in, elevation) {
+    if !elevation_share::shares_with_non_elevated(false, elevation) {
         return Ok(());
     }
 
