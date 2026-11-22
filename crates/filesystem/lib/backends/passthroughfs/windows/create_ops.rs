@@ -183,7 +183,11 @@ impl PassthroughFs {
         }
 
         let source = self.inode(inode)?;
-        self.safe_metadata(&source.path())?;
+        // Through the source's own file, before anything is linked: a source
+        // whose name the host has put another file at, or removed, fails
+        // here unless the guest has it open.
+        let source_metadata = self.inode_metadata(&source)?;
+        let current = self.current_override(&source_metadata, source.as_ref())?;
         let new_path = self.child_path(newparent, newname)?;
         let parent_path = new_path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
         let parent_metadata = self.safe_metadata(parent_path)?;
@@ -194,7 +198,6 @@ impl PassthroughFs {
         std::fs::hard_link(source.path(), &new_path).map_err(host_error)?;
         let metadata = self.safe_metadata(&new_path)?;
         let data = self.intern_path(new_path.clone())?;
-        let current = self.current_override(&metadata, source.as_ref())?;
         if let Err(error) = self.set_virtual_metadata(
             data.as_ref(),
             current.uid,
