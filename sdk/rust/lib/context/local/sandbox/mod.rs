@@ -31,6 +31,8 @@ use microsandbox_db::{DbReadConnection, DbWriteConnection};
 use microsandbox_image::{Digest, GlobalCache};
 #[cfg(unix)]
 use microsandbox_runtime::ipc::SandboxSocketPaths;
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use sea_orm::{
     ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::Expr,
@@ -1258,7 +1260,9 @@ impl LocalContext {
         })?;
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if handle.is_null() {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(
+                elevation_share::explain_access_denied(std::io::Error::last_os_error()).into(),
+            );
         }
 
         let result = unsafe { TerminateProcess(handle, 1) };

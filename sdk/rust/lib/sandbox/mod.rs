@@ -1379,12 +1379,10 @@ pub(super) async fn remove_local_persisted_sandbox(
     // Transition ownership prevents a new start while this identity-checked compatibility cleanup
     // terminates that recorded generation.
     #[cfg(windows)]
-    if reap_leaked_runtime_process(local_backend, expected_id, name).await?
-        == reap::LeakedReapVerdict::Unverifiable
+    if let reap::LeakedReapVerdict::Unverifiable { open_error } =
+        reap_leaked_runtime_process(local_backend, expected_id, name).await?
     {
-        return Err(crate::MicrosandboxError::Runtime(format!(
-            "cannot remove sandbox {name:?}: its recorded runtime process could not be verified"
-        )));
+        return Err(reap::unverifiable_runtime_error(name, open_error));
     }
 
     let _runtime_guard = crate::runtime::acquire_sandbox_lifecycle_guard(

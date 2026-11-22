@@ -339,6 +339,11 @@ impl LocalContext {
         launch_contract::validate_exec_limits(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_fs_state_limit(&resolved_runtime.msb_path, global).await?;
+        launch_contract::validate_share_elevated_sandboxes(
+            &resolved_runtime.msb_path,
+            global.share_elevated_sandboxes(),
+        )
+        .await?;
 
         #[cfg(feature = "net")]
         launch_contract::validate_multi_tenant_config(&resolved_runtime.msb_path, config, global)
@@ -2326,6 +2331,7 @@ fn machine_cli_args(
         nested_virt: config.spec.resources.nested_virt,
         guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
         fs_state_limit_bytes: local.config().fs_state_limit_override(),
+        share_elevated_sandboxes: local.config().share_elevated_sandboxes(),
         memory_cache_dir: Some(local.cache_dir().join("memory")),
         startup: startup_command(config),
         lifecycle: Lifecycle {
@@ -2837,7 +2843,9 @@ mod tests {
         volume::VolumeKind,
     };
     use crate::{
-        SandboxConfigPatch, config::layers::BackendConfig, context::ContextSelectionSource,
+        SandboxConfigPatch,
+        config::{GlobalConfigPatch, layers::BackendConfig},
+        context::ContextSelectionSource,
     };
 
     #[test]
@@ -3526,8 +3534,13 @@ mod tests {
     /// Use isolated configuration for pure `machine_cli_args` rendering tests.
     /// The database remains unopened.
     fn test_local_backend() -> LocalContext {
+        test_local_backend_with(Default::default())
+    }
+
+    /// [`test_local_backend`] with user settings `defaults`.
+    fn test_local_backend_with(defaults: GlobalConfigPatch) -> LocalContext {
         LocalContext::from_backend_config(
-            BackendConfig::new(Default::default(), Default::default())
+            BackendConfig::new(defaults, Default::default())
                 .prepare_for_local_backend(Default::default())
                 .unwrap(),
             ContextSelectionSource::Programmatic,
@@ -3553,9 +3566,13 @@ mod tests {
 
     /// Return the typed launch payload generated for a sandbox configuration.
     fn render_launch(config: &SandboxConfig) -> LaunchConfig {
-        let local = test_local_backend();
+        render_launch_on(&test_local_backend(), config)
+    }
+
+    /// [`render_launch`] on the backend `local`.
+    fn render_launch_on(local: &LocalContext, config: &SandboxConfig) -> LaunchConfig {
         let (_, launch) = machine_cli_args(
-            &local,
+            local,
             config,
             42,
             #[cfg(feature = "net")]
@@ -3865,6 +3882,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(render_launch(&config).sandbox_slot, 1);
+    }
+
+    #[tokio::test]
+    async fn launch_carries_the_elevated_sandbox_sharing_opt_in() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        let opted_in: GlobalConfigPatch =
+            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
+        let local = test_local_backend_with(opted_in);
+
+        let default = render_launch(&config);
+        let shared = render_launch_on(&local, &config);
+
+        assert!(!default.share_elevated_sandboxes);
+        assert!(local.config().runtime.share_elevated_sandboxes);
+        // Sent only where the launched runtime would act on it: by the elevated half of a
+        // Windows split token, which GitHub's runners are not.
+        assert_eq!(
+            shared.share_elevated_sandboxes,
+            local.config().share_elevated_sandboxes()
+        );
     }
 
     /// Render only the `visible` argv (what shows up in `ps`).

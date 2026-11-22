@@ -7,6 +7,8 @@ use std::io::{IsTerminal, Write};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use console::style;
+#[cfg(windows)]
+use microsandbox_cli::ui::ErrorLine;
 use microsandbox_cli::{
     commands::{
         completion, context, image, install, pull, registry,
@@ -18,6 +20,8 @@ use microsandbox_cli::{
     log_args::{self, LogArgs},
     machine_cmd::{self, MachineArgs},
 };
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -433,6 +437,7 @@ fn main() {
                     ),
                     exec_limits: true,
                     multi_tenant: cfg!(feature = "net"),
+                    share_elevated_sandboxes: true,
                 })
                 .expect("serialize capabilities");
             capabilities["deferred_command_bindings"] = true.into();
@@ -678,6 +683,18 @@ fn render_anyhow_error(err: &anyhow::Error) -> i32 {
         microsandbox_cli::ui::error_with_lines(setup_err.title(), &lines);
         return 1;
     }
+    #[cfg(windows)]
+    if has_elevated_sandbox_denial_in_chain(err) {
+        // The message already carries the SDK's explanation; add the msb way to act on it.
+        microsandbox_cli::ui::error_with_lines(
+            &err.to_string(),
+            &[ErrorLine::Hint(
+                "run msb from an elevated terminal, or stop the sandbox with msb stop from an \
+                 elevated terminal and then start it from this one",
+            )],
+        );
+        return 1;
+    }
     if find_unsupported_feature_in_chain(err) {
         microsandbox_cli::ui::error_with_lines(
             "this sandbox's runtime is too old for the requested feature",
@@ -771,6 +788,15 @@ fn find_exec_failed_in_chain(
         }
     }
     None
+}
+
+/// Walk the chain looking for an access-denied error the SDK explained as a sandbox that an
+/// elevated process started.
+#[cfg(windows)]
+fn has_elevated_sandbox_denial_in_chain(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(elevation_share::is_elevated_sandbox_denial)
 }
 
 /// Walk the chain looking for a too-old-runtime feature rejection.

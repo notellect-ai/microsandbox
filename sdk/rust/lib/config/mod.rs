@@ -34,6 +34,8 @@ use microsandbox_types::{
     ConfigPatch, CpuPlacement, DeploymentProfile, OutboundProxy, PlacementProfile, RootDisk,
     TransparentHugePagePolicy,
 };
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextKind, Profile};
@@ -404,6 +406,11 @@ pub struct RuntimeConfig {
     /// Host-owned placement profiles selectable by sandbox name.
     #[config_patch(merge)]
     pub placement_profiles: BTreeMap<String, PlacementProfile>,
+
+    /// On Windows, let the same account's non-elevated runs reach sandboxes that an elevated
+    /// (administrator) run starts: they can connect to, exec in and stop them. Off keeps the
+    /// UAC boundary, and a non-elevated run gets an access-denied error explaining it.
+    pub share_elevated_sandboxes: bool,
 }
 
 /// Controls buffered host dirty data for writable raw disks.
@@ -498,6 +505,13 @@ impl GlobalConfig {
     pub(crate) fn fs_state_limit_override(&self) -> Option<u64> {
         (self.snapshots.max_filesystem_state_mib != FS_STATE_LIMIT_DEFAULT_MIB)
             .then(|| self.fs_state_limit() as u64)
+    }
+
+    /// Whether launches ask the runtime to share elevated sandboxes with non-elevated runs:
+    /// the setting is on and the runtimes this process launches, which inherit its token,
+    /// would act on it. Other hosts and non-elevated processes never send it.
+    pub(crate) fn share_elevated_sandboxes(&self) -> bool {
+        self.runtime.share_elevated_sandboxes && launched_runtimes_can_share()
     }
 
     /// Resolve and structurally validate a host-owned placement profile.
@@ -805,6 +819,19 @@ fn resolve_default_home() -> PathBuf {
     microsandbox_utils::resolve_home()
 }
 
+/// Whether a runtime this process launches, with this process's token, shares elevated
+/// sandboxes when asked: only the full half of a Windows split token does.
+#[cfg(windows)]
+fn launched_runtimes_can_share() -> bool {
+    elevation_share::elevation_type()
+        .is_ok_and(|elevation| elevation_share::shares_with_non_elevated(true, elevation))
+}
+
+#[cfg(not(windows))]
+fn launched_runtimes_can_share() -> bool {
+    false
+}
+
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
@@ -828,6 +855,8 @@ pub use runtime_paths::set_sdk_packaged_msb_path;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use windows_sys::Win32::Security::TokenElevationTypeFull;
 
     fn saved_patch(config: &GlobalConfig) -> GlobalConfigPatch {
         let dir = tempfile::tempdir().unwrap();
@@ -893,7 +922,8 @@ mod tests {
                 "placement_profiles": {"latency": {
                     "numa": {"mode": "prefer_single"},
                     "memory": {"mode": "follow_cpu"}
-                }}
+                }},
+                "share_elevated_sandboxes": true
             },
             "registries": {
                 "ca_certs": "/configured/ca.pem",
@@ -1230,6 +1260,24 @@ mod tests {
                 "placement profile `missing` is not defined in runtime.placement_profiles"
             )
         );
+    }
+
+    #[test]
+    fn test_share_elevated_sandboxes_defaults_off_and_applies_only_to_elevated_launchers() {
+        let default: GlobalConfig = serde_json::from_str("{}").unwrap();
+        let opted_in: GlobalConfig =
+            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
+        #[cfg(windows)]
+        let elevated = elevation_share::elevation_type().unwrap() == TokenElevationTypeFull;
+        #[cfg(not(windows))]
+        let elevated = false;
+
+        assert!(!default.runtime.share_elevated_sandboxes);
+        assert!(!default.share_elevated_sandboxes());
+        assert!(opted_in.runtime.share_elevated_sandboxes);
+        // GitHub's Windows runners are not split tokens, so there it stays off as well.
+        assert_eq!(opted_in.share_elevated_sandboxes(), elevated);
+        assert_eq!(launched_runtimes_can_share(), elevated);
     }
 
     #[test]

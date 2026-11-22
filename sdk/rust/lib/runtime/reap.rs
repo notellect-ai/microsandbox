@@ -48,8 +48,11 @@ pub(crate) enum ReapOutcome {
     /// The process could not be opened or queried, so identity is unprovable; it was left alone.
     /// Windows recycles PIDs aggressively, so this is usually a recycled PID landing on a
     /// protected or other-user process rather than a leaked runtime (our own runtime children run
-    /// as the same user and stay queryable).
-    Unverifiable,
+    /// as the same user and stay queryable), unless an elevated process started the runtime.
+    Unverifiable {
+        /// The OS error from opening the process, when that is what failed.
+        open_error: Option<i32>,
+    },
 }
 
 /// Process handle that closes on drop so every early return releases it.
@@ -122,20 +125,22 @@ pub(crate) fn terminate_runtime_process_checked(
         if err == ERROR_INVALID_PARAMETER {
             return Ok(ReapOutcome::AlreadyDead);
         }
-        return Ok(ReapOutcome::Unverifiable);
+        return Ok(ReapOutcome::Unverifiable {
+            open_error: Some(err as i32),
+        });
     }
     let handle = OwnedProcessHandle(handle);
 
     let mut exit_code = 0u32;
     if unsafe { GetExitCodeProcess(handle.0, &mut exit_code) } == 0 {
-        return Ok(ReapOutcome::Unverifiable);
+        return Ok(ReapOutcome::Unverifiable { open_error: None });
     }
     if exit_code != STILL_ACTIVE as u32 {
         return Ok(ReapOutcome::AlreadyDead);
     }
 
     let Some(creation_unix_micros) = process_creation_unix_micros(handle.0) else {
-        return Ok(ReapOutcome::Unverifiable);
+        return Ok(ReapOutcome::Unverifiable { open_error: None });
     };
     if !creation_may_belong_to_run(creation_unix_micros, run_started_unix_micros) {
         return Ok(ReapOutcome::IdentityMismatch);

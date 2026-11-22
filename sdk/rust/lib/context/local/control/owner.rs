@@ -1,5 +1,7 @@
 //! Existing database run rows and kernel peer credentials bind every exchange.
 
+#[cfg(windows)]
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,10 +13,14 @@ use microsandbox_db::{
     entity::{run, sandbox},
 };
 use microsandbox_protocol_client::{BoxFuture, BoxTransport};
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use tokio::time::Instant;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 
@@ -96,8 +102,7 @@ impl LocalContext {
         let pid = run.pid.ok_or_else(|| {
             MicrosandboxError::ControlClient(Arc::new(ControlClientError::RuntimeChanged))
         })?;
-        let process = ProcessIdentity::capture(pid)
-            .map_err(|error| MicrosandboxError::ControlClient(Arc::new(error)))?;
+        let process = ProcessIdentity::capture(pid).map_err(capture_error)?;
         let key = RuntimeKey {
             sandbox_id: model.id,
             run_id: run.id,
@@ -230,6 +235,25 @@ impl VerifiedControlConnector for RuntimeOwner {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// A failed [`ProcessIdentity::capture`]. On Windows, access denied there can only come from
+/// opening the runtime process, which an elevated process most likely started; in a
+/// non-elevated process that error is explained. Other errors are unchanged.
+fn capture_error(error: ControlClientError) -> MicrosandboxError {
+    #[cfg(windows)]
+    if let ControlClientError::Client(client) = &error
+        && client.kind == ErrorKind::Io(io::ErrorKind::PermissionDenied)
+    {
+        let explained = elevation_share::explain_access_denied(io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32,
+        ));
+        if elevation_share::is_elevated_sandbox_denial(&explained) {
+            return explained.into();
+        }
+    }
+
+    MicrosandboxError::ControlClient(Arc::new(error))
+}
 
 async fn current_run(
     db: &DbReadConnection,

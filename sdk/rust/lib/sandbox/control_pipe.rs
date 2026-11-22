@@ -3,6 +3,9 @@
 use std::io;
 use std::time::Duration;
 
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
+
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
@@ -23,7 +26,9 @@ pub(super) async fn connect(
 ) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    retry_open(CONNECT_TIMEOUT, || ClientOptions::new().open(path)).await
+    retry_open(CONNECT_TIMEOUT, || ClientOptions::new().open(path))
+        .await
+        .map_err(elevation_share::explain_access_denied)
 }
 
 async fn retry_open<T>(
