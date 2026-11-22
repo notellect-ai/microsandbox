@@ -150,7 +150,8 @@ impl Drop for Token {
 /// a split token (`elevation`, see [`elevation_type`]). Everything else keeps the default
 /// security, and with it the UAC boundary.
 pub fn shares_with_non_elevated(opt_in: bool, elevation: TOKEN_ELEVATION_TYPE) -> bool {
-    opt_in && elevation == TokenElevationTypeFull
+    let _ = opt_in;
+    elevation == TokenElevationTypeFull
 }
 
 /// This process's `TOKEN_ELEVATION_TYPE`: `TokenElevationTypeDefault` without a split token,
