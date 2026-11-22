@@ -1,10 +1,13 @@
 //! Inode, handle, and lookup helpers for the Windows passthrough backend.
 
-use std::os::windows::io::AsRawHandle;
+use std::ffi::CString;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdType, GetFinalPathNameByHandleW,
+    OpenFileById, VOLUME_NAME_DOS,
 };
 
 use super::*;
@@ -270,77 +273,52 @@ impl PassthroughFs {
         Self::follow_host_rename_descendants(inodes, data, &canonical, path, &identity_of)
     }
 
-    /// A name a moved descendant took from a stale cached entry: that inode
-    /// lost it as in an unlink. An inode the guest still has open stays
-    /// tracked: reads and writes through its open handles keep working, and
-    /// a lookup of the name the host moved it to finds it again by its
-    /// identity. A directory handle holds no host handle to find that name
-    /// from, so an open directory keeps its old path until that lookup.
+    /// Names a moved descendant took from stale cached entries. An inode that
+    /// held one follows its file to the name the file has now, found by its
+    /// file id, so reads, writes, listings and metadata through it, by handle
+    /// or by path, reach its own file or directory and not the one that took
+    /// its old name. An inode whose file is gone, or has no name the guest can
+    /// reach, lost its name as in an unlink.
     fn finish_displaced(&self, inodes: &mut InodeTable, displaced: Vec<Arc<InodeData>>) {
         for data in displaced {
-            if self.has_open_handle(data.inode) {
-                self.follow_open_handle(&data);
-                continue;
-            }
-            if self.has_open_dir_handle(data.inode) {
-                continue;
-            }
-            self.finish_removed_alias(inodes, &data);
-        }
-    }
-
-    fn has_open_dir_handle(&self, inode: u64) -> bool {
-        self.dir_handles
-            .read()
-            .unwrap()
-            .values()
-            .any(|handle| handle.inode == inode)
-    }
-
-    /// Point a displaced inode the guest still has open at the name its file
-    /// has now, read from an open handle, so that metadata read and set by
-    /// path reaches that file and not the one that took its old name. A file
-    /// the host moved out of the mount, deleted, or gave a name the guest
-    /// cannot see keeps its old path.
-    fn follow_open_handle(&self, data: &InodeData) {
-        match self.open_file_path(data) {
-            Ok(Some(path)) => *data.path.write().unwrap() = path,
-            Ok(None) => {}
-            Err(error) => {
-                tracing::debug!(
-                    ?error,
-                    inode = data.inode,
-                    "cannot read an open file's host name"
-                );
+            match self.current_name(&data) {
+                Ok(Some(path)) => {
+                    *data.path.write().unwrap() = path.clone();
+                    inodes.by_path.entry(path).or_insert(data);
+                }
+                Ok(None) => self.finish_removed_alias(inodes, &data),
+                Err(error) => {
+                    tracing::debug!(
+                        ?error,
+                        inode = data.inode,
+                        "cannot find the host name of a displaced inode"
+                    );
+                    self.finish_removed_alias(inodes, &data);
+                }
             }
         }
     }
 
-    /// The path under the mount root that names the file an open handle of
-    /// `data` holds. `None` when the handle holds another object or the name
-    /// is not one the guest can reach.
-    fn open_file_path(&self, data: &InodeData) -> io::Result<Option<PathBuf>> {
+    /// The path under the mount root that names the file or directory of
+    /// `data` now. `None` when it is on another volume or its name is not one
+    /// the guest can reach.
+    fn current_name(&self, data: &InodeData) -> io::Result<Option<PathBuf>> {
         let Some(identity) = data.identity else {
             return Ok(None);
         };
-        let host = {
-            let handles = self.handles.read().unwrap();
-            let Some(handle) = handles.values().find(|handle| handle.inode == data.inode) else {
-                return Ok(None);
-            };
-            let file = handle.file.lock().unwrap();
-            if mobility::file_identity(&file)? != identity {
-                return Ok(None);
-            }
-            final_path(&file)?
-        };
-
         let root = StdOpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(&self.root)
             .map_err(host_error)?;
-        let Ok(relative) = host.strip_prefix(final_path(&root)?) else {
+        let file = open_by_file_index(&root, identity.1)?;
+        if mobility::file_identity(&file)? != identity {
+            return Ok(None);
+        }
+
+        let host = final_path(&file)?;
+        let root_path = final_path(&root)?;
+        let Ok(relative) = host.strip_prefix(&root_path) else {
             return Ok(None);
         };
         let mut path = self.root.clone();
@@ -348,24 +326,22 @@ impl PassthroughFs {
             let Component::Normal(name) = component else {
                 return Ok(None);
             };
-            let Some(name) = name.to_str() else {
+            let Some(name) = name.to_str().and_then(|name| CString::new(name).ok()) else {
                 return Ok(None);
             };
-            if is_reserved_name(name) {
-                return Ok(None);
-            }
-            let Ok(name) = std::ffi::CString::new(name) else {
+            let Ok(name) = validate_component(&name) else {
                 return Ok(None);
             };
-            if validate_component(&name).is_err() {
-                return Ok(None);
-            }
-            path.push(name.to_str().expect("validated as UTF-8"));
+            path.push(name);
         }
 
-        // The name is read again by path: the host may have moved the file
-        // once more since the handle was asked.
-        if path == self.root || self.path_identity(&path)? != Some(identity) {
+        // The name is checked by path as a lookup checks it, with no reparse
+        // point on the way, and read again: the host may have moved the file
+        // once more since its name was asked.
+        if path == self.root
+            || self.safe_metadata(&path).is_err()
+            || self.path_identity(&path)? != Some(identity)
+        {
             return Ok(None);
         }
         Ok(Some(path))
@@ -456,14 +432,6 @@ impl PassthroughFs {
         self.entry_for_path(path)
     }
 
-    pub(super) fn has_open_handle(&self, inode: u64) -> bool {
-        self.handles
-            .read()
-            .unwrap()
-            .values()
-            .any(|handle| handle.inode == inode)
-    }
-
     pub(super) fn handle(&self, inode: u64, handle: u64) -> io::Result<Arc<HandleData>> {
         if self.cfg.inject_init && inode == INIT_INODE && handle == INIT_HANDLE {
             return Err(linux_error(LINUX_EBADF));
@@ -482,6 +450,38 @@ impl PassthroughFs {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Open, for reading attributes, the file or directory with the file index
+/// `index` on the volume `volume` is on.
+fn open_by_file_index(volume: &File, index: u64) -> io::Result<File> {
+    let descriptor = FILE_ID_DESCRIPTOR {
+        dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: FileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 {
+            FileId: index as i64,
+        },
+    };
+
+    // SAFETY: the volume handle is open for the duration of the call, the
+    // descriptor is initialized and outlives it, and no security attributes
+    // are passed.
+    let handle = unsafe {
+        OpenFileById(
+            volume.as_raw_handle() as HANDLE,
+            &descriptor,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(host_error(io::Error::last_os_error()));
+    }
+
+    // SAFETY: OpenFileById returned a new handle, owned from here by the File.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
 
 /// The normalized host path of an open file, in the `\\?\` form
 /// `std::fs::canonicalize` returns (`\\?\C:\...` or `\\?\UNC\...`).

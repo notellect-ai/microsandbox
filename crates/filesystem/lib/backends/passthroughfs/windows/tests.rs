@@ -3679,12 +3679,13 @@ fn a_stale_child_closed_before_a_host_move_takes_its_name_is_dropped_on_an_owned
 }
 
 /// A stale directory the guest still has open when a host directory move
-/// takes its cached name stays tracked: reading it through its open handle
-/// keeps working, and a lookup of the name the host moved it to finds it.
+/// takes its cached name follows the directory to its new name: listing it
+/// through its open handle and creating in it reach its own entries, not the
+/// moved directory's, and a lookup of the new name finds it.
 #[test]
 fn a_stale_directory_open_when_a_host_move_takes_its_name_stays_usable() {
     let temp = TempDir::new();
-    for path in ["d/sub", "e/sub"] {
+    for path in ["d/sub/other", "e/sub/own"] {
         std::fs::create_dir_all(temp.path.join(path)).unwrap();
     }
     let fs = fs_for(&temp.path);
@@ -3701,10 +3702,63 @@ fn a_stale_directory_open_when_a_host_move_takes_its_name_stays_usable() {
     lookup_relative(&fs, "e").unwrap();
     assert_eq!(lookup_relative(&fs, "e/sub").unwrap().inode, moved);
 
-    assert!(fs.readdir(context(), stale, handle, 4096, 0).is_ok());
+    let entries = fs.readdir(context(), stale, handle, 4096, 0).unwrap();
+    let names: Vec<_> = entries.iter().map(|entry| entry.name).collect();
+    assert_eq!(names, [b".".as_slice(), b"..", b"own"]);
+    fs.mkdir(
+        context(),
+        stale,
+        c"new",
+        S_IFDIR | 0o755,
+        0,
+        Extensions::default(),
+    )
+    .unwrap();
+
+    assert!(temp.path.join("kept/new").is_dir());
+    assert!(!temp.path.join("e/sub/new").exists());
     assert!(fs.getattr(context(), stale, None).is_ok());
     assert_eq!(lookup_relative(&fs, "kept").unwrap().inode, stale);
+    assert_every_inode_named(&fs, "open directory followed");
     fs.releasedir(context(), stale, 0, handle).unwrap();
+}
+
+/// A stale child the guest still has open when the host deleted it and then
+/// moved a directory onto its cached name has no name to follow: it is
+/// dropped, and an operation through it by path must not reach the moved
+/// file that holds the name now.
+#[test]
+fn a_deleted_stale_child_open_when_a_host_move_takes_its_name_is_dropped() {
+    let temp = TempDir::new();
+    for (path, contents) in [("d/c", "moved"), ("e/c", "stale")] {
+        std::fs::create_dir_all(temp.path.join(path).parent().unwrap()).unwrap();
+        std::fs::write(temp.path.join(path), contents).unwrap();
+    }
+    let fs = fs_for(&temp.path);
+    let moved = lookup_relative(&fs, "d/c").unwrap().inode;
+    let stale = lookup_relative(&fs, "e/c").unwrap().inode;
+    let (handle, _) = fs
+        .open(context(), stale, false, LINUX_O_RDWR as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+
+    std::fs::remove_file(temp.path.join("e/c")).unwrap();
+    fs.rmdir(context(), ROOT_INODE, c"e").unwrap();
+    std::fs::rename(temp.path.join("d"), temp.path.join("e")).unwrap();
+    lookup_relative(&fs, "e").unwrap();
+    assert_eq!(lookup_relative(&fs, "e/c").unwrap().inode, moved);
+
+    let truncate = stat64 {
+        st_size: 0,
+        ..Default::default()
+    };
+    let result = fs.setattr(context(), stale, truncate, None, SetattrValid::SIZE);
+
+    expect_errno(result, LINUX_EBADF);
+    assert_eq!(std::fs::read(temp.path.join("e/c")).unwrap(), b"moved");
+    assert!(!fs.inodes.read().unwrap().by_inode.contains_key(&stale));
+    assert_every_inode_named(&fs, "deleted open child dropped");
+    let _ = fs.release(context(), stale, 0, handle, false, false, None);
 }
 
 /// A stale child the guest still has open when a host directory move takes
