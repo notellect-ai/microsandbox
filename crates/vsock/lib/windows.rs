@@ -1,9 +1,13 @@
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io;
+use std::iter;
+use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use msb_krun::backends::vsock::{
     VsockConnectRequest, VsockConnectState, VsockNotifier, VsockPortBackend, VsockShutdown,
@@ -191,11 +195,11 @@ impl PipeHandle {
 
 impl Event {
     fn new(manual_reset: bool) -> io::Result<Self> {
-        let handle =
-            unsafe { CreateEventW(std::ptr::null(), manual_reset as i32, 0, std::ptr::null()) };
+        let handle = unsafe { CreateEventW(null(), manual_reset as i32, 0, null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
+
         Ok(Self(handle))
     }
 
@@ -210,7 +214,7 @@ impl PendingIo {
     fn new(pipe: &PipeHandle, capacity: usize) -> io::Result<Self> {
         Ok(Self {
             pipe: pipe.raw(),
-            overlapped: Box::new(unsafe { std::mem::zeroed() }),
+            overlapped: Box::new(unsafe { mem::zeroed() }),
             event: Event::new(true)?,
             buffer: vec![0; capacity],
             pending: false,
@@ -220,15 +224,17 @@ impl PendingIo {
     /// Start a read of up to `count` bytes into the buffer.
     fn start_read(&mut self, count: usize) -> io::Result<()> {
         self.prepare();
+
         let started = unsafe {
             ReadFile(
                 self.pipe,
                 self.buffer.as_mut_ptr(),
                 count.min(self.buffer.len()) as u32,
-                std::ptr::null_mut(),
+                null_mut(),
                 &mut *self.overlapped,
             )
         };
+
         self.started(started)
     }
 
@@ -236,21 +242,23 @@ impl PendingIo {
     fn start_write(&mut self, bytes: Vec<u8>) -> io::Result<()> {
         self.prepare();
         self.buffer = bytes;
+
         let started = unsafe {
             WriteFile(
                 self.pipe,
                 self.buffer.as_ptr(),
                 self.buffer.len() as u32,
-                std::ptr::null_mut(),
+                null_mut(),
                 &mut *self.overlapped,
             )
         };
+
         self.started(started)
     }
 
     fn prepare(&mut self) {
         debug_assert!(!self.pending);
-        *self.overlapped = unsafe { std::mem::zeroed() };
+        *self.overlapped = unsafe { mem::zeroed() };
         self.overlapped.hEvent = self.event.0;
     }
 
@@ -262,6 +270,7 @@ impl PendingIo {
                 return Err(error);
             }
         }
+
         self.pending = true;
         Ok(())
     }
@@ -271,13 +280,16 @@ impl PendingIo {
         let mut transferred = 0;
         let ok = unsafe { GetOverlappedResult(self.pipe, &*self.overlapped, &mut transferred, 0) };
         self.pending = false;
+
         if ok == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_MORE_DATA as i32) {
                 return Ok(transferred as usize);
             }
+
             return Err(error);
         }
+
         Ok(transferred as usize)
     }
 
@@ -288,12 +300,14 @@ impl PendingIo {
         if !self.pending {
             return 0;
         }
+
         let mut transferred = 0;
         let ok = unsafe {
             CancelIoEx(self.pipe, &*self.overlapped);
             GetOverlappedResult(self.pipe, &*self.overlapped, &mut transferred, 1)
         };
         self.pending = false;
+
         if ok == 0 { 0 } else { transferred as usize }
     }
 }
@@ -325,7 +339,7 @@ impl VsockPortBackend for WindowsNamedPipePortBackend {
         });
         let worker_shared = Arc::clone(&shared);
         let path = self.path.clone();
-        std::thread::Builder::new()
+        thread::Builder::new()
             .name("vsock named pipe".to_string())
             .spawn(move || named_pipe_worker(path, worker_shared))?;
 
@@ -472,7 +486,7 @@ fn invalid_pipe_path() -> io::Error {
 }
 
 fn wide_null(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(std::iter::once(0)).collect()
+    value.encode_wide().chain(iter::once(0)).collect()
 }
 
 fn connect_named_pipe(path: &Path, shared: &SharedState) -> io::Result<PipeHandle> {
@@ -500,10 +514,10 @@ fn connect_named_pipe(path: &Path, shared: &SharedState) -> io::Result<PipeHandl
                 path.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
                 0,
-                std::ptr::null(),
+                null(),
                 OPEN_EXISTING,
                 FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                std::ptr::null_mut(),
+                null_mut(),
             )
         };
         if handle != INVALID_HANDLE_VALUE {
@@ -540,6 +554,7 @@ fn wait_for(io: &PendingIo, wake: &Event) -> io::Result<bool> {
     if result == WAIT_FAILED {
         return Err(io::Error::last_os_error());
     }
+
     Ok(result == WAIT_OBJECT_0)
 }
 
@@ -548,6 +563,7 @@ fn wait_for_wake(wake: &Event) -> io::Result<()> {
     if unsafe { WaitForMultipleObjects(1, &wake.0, 0, INFINITE) } == WAIT_FAILED {
         return Err(io::Error::last_os_error());
     }
+
     Ok(())
 }
 
@@ -558,8 +574,10 @@ fn write_all(write: &mut PendingIo, bytes: Vec<u8>, shared: &SharedState) -> IoW
     if let Err(error) = write.start_write(bytes) {
         return IoWait::Completed(Err(error));
     }
+
     #[cfg(test)]
     shared.probe.record(|waits| waits.writes += 1);
+
     loop {
         match wait_for(write, &shared.wake_worker) {
             Ok(true) => {
@@ -597,6 +615,7 @@ fn named_pipe_worker(path: PathBuf, shared: Arc<SharedState>) {
             return;
         }
     };
+
     // Declared after the handle, so both are dropped (cancelled and reaped)
     // before it is closed.
     let (mut read, mut write) = match (
@@ -609,20 +628,24 @@ fn named_pipe_worker(path: PathBuf, shared: Arc<SharedState>) {
             return;
         }
     };
+
     {
         let mut state = shared.state.lock().unwrap();
         if state.terminate {
             return;
         }
+
         state.connection = ConnectionState::Connected;
     }
     let _ = shared.notifier.notify();
 
     pump(&mut read, &mut write, &shared);
+
     // A read that completed while the connection was ending still carries
     // Host bytes: hand them over unless the guest end is gone.
     write.cancel();
     let count = read.cancel();
+
     if count > 0 && !shared.terminating() {
         shared
             .state
@@ -646,6 +669,7 @@ fn pump(read: &mut PendingIo, write: &mut PendingIo, shared: &SharedState) {
             if state.terminate {
                 return;
             }
+
             let count = state.outgoing.len().min(IO_CHUNK_SIZE);
             state.outgoing.drain(..count).collect::<Vec<_>>()
         };
@@ -691,6 +715,7 @@ fn pump(read: &mut PendingIo, write: &mut PendingIo, shared: &SharedState) {
             } else {
                 shared.fail(error);
             }
+
             return;
         }
 
@@ -752,6 +777,7 @@ fn deliver(read: &mut PendingIo, shared: &SharedState) -> bool {
                     .extend(&read.buffer[..count]);
                 let _ = shared.notifier.notify();
             }
+
             true
         }
         Err(error) if is_pipe_closed(&error) => {
@@ -771,6 +797,8 @@ fn deliver(read: &mut PendingIo, shared: &SharedState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::process;
+    use std::sync::{Barrier, mpsc};
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
@@ -782,6 +810,8 @@ mod tests {
 
     use super::*;
 
+    const DEADLINE: Duration = Duration::from_secs(10);
+
     #[test]
     fn rejects_remote_and_ambiguous_pipe_paths() {
         assert!(validate_named_pipe_path(Path::new(r"\\.\pipe\api")).is_ok());
@@ -792,7 +822,7 @@ mod tests {
 
     #[test]
     fn named_pipe_backend_moves_stream_bytes_in_both_directions() {
-        let name = format!(r"\\.\pipe\msb-vsock-test-{}", std::process::id());
+        let name = format!(r"\\.\pipe\msb-vsock-test-{}", process::id());
         let wide = wide_null(OsStr::new(&name));
         let server = unsafe {
             CreateNamedPipeW(
@@ -803,13 +833,13 @@ mod tests {
                 4096,
                 4096,
                 0,
-                std::ptr::null(),
+                null(),
             )
         };
         assert_ne!(server, INVALID_HANDLE_VALUE);
         let server = PipeHandle(server);
-        let host = std::thread::spawn(move || {
-            let connected = unsafe { ConnectNamedPipe(server.raw(), std::ptr::null_mut()) };
+        let host = thread::spawn(move || {
+            let connected = unsafe { ConnectNamedPipe(server.raw(), null_mut()) };
             if connected == 0 {
                 assert_eq!(
                     io::Error::last_os_error().raw_os_error(),
@@ -826,7 +856,7 @@ mod tests {
                         request.as_mut_ptr(),
                         request.len() as u32,
                         &mut read,
-                        std::ptr::null_mut(),
+                        null_mut(),
                     )
                 },
                 0
@@ -835,15 +865,7 @@ mod tests {
 
             let mut written = 0;
             assert_ne!(
-                unsafe {
-                    WriteFile(
-                        server.raw(),
-                        b"host".as_ptr(),
-                        4,
-                        &mut written,
-                        std::ptr::null_mut(),
-                    )
-                },
+                unsafe { WriteFile(server.raw(), b"host".as_ptr(), 4, &mut written, null_mut(),) },
                 0
             );
             assert_eq!(written, 4);
@@ -863,7 +885,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         while endpoint.connect_state().unwrap() != VsockConnectState::Connected {
             assert!(Instant::now() < deadline, "named-pipe connect timed out");
-            std::thread::yield_now();
+            thread::yield_now();
         }
         assert_eq!(endpoint.write(b"guest").unwrap(), 5);
 
@@ -873,7 +895,7 @@ mod tests {
                 Ok(4) => break,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "named-pipe read timed out");
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 result => panic!("unexpected named-pipe read result: {result:?}"),
             }
@@ -881,12 +903,6 @@ mod tests {
         assert_eq!(&response, b"host");
         host.join().unwrap();
     }
-
-    //----------------------------------------------------------------------------------------------
-    // Hostile cases for the overlapped relay
-    //----------------------------------------------------------------------------------------------
-
-    const DEADLINE: Duration = Duration::from_secs(10);
 
     /// What a relay worker reports about its waits, so a test can act once the
     /// worker is in a known state instead of sleeping until it probably is.
@@ -957,7 +973,7 @@ mod tests {
     }
 
     fn pipe_name(tag: &str) -> String {
-        format!(r"\\.\pipe\msb-vsock-test-{}-{tag}", std::process::id())
+        format!(r"\\.\pipe\msb-vsock-test-{}-{tag}", process::id())
     }
 
     /// A Host end with small buffers, so streams split across reads.
@@ -972,15 +988,16 @@ mod tests {
                 4096,
                 4096,
                 0,
-                std::ptr::null(),
+                null(),
             )
         };
         assert_ne!(server, INVALID_HANDLE_VALUE);
+
         PipeHandle(server)
     }
 
     fn host_accept(server: &PipeHandle) {
-        if unsafe { ConnectNamedPipe(server.raw(), std::ptr::null_mut()) } == 0 {
+        if unsafe { ConnectNamedPipe(server.raw(), null_mut()) } == 0 {
             assert_eq!(
                 io::Error::last_os_error().raw_os_error(),
                 Some(ERROR_PIPE_CONNECTED as i32)
@@ -996,23 +1013,26 @@ mod tests {
                 buf.as_mut_ptr(),
                 buf.len() as u32,
                 &mut read,
-                std::ptr::null_mut(),
+                null_mut(),
             )
         };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+
         Ok(read as usize)
     }
 
     fn host_read_exact(server: &PipeHandle, count: usize) -> Vec<u8> {
         let mut out = vec![0; count];
         let mut filled = 0;
+
         while filled < count {
             let read = host_read(server, &mut out[filled..]).unwrap();
             assert!(read > 0);
             filled += read;
         }
+
         out
     }
 
@@ -1025,7 +1045,7 @@ mod tests {
                     bytes.as_ptr(),
                     bytes.len() as u32,
                     &mut written,
-                    std::ptr::null_mut(),
+                    null_mut(),
                 )
             },
             0
@@ -1045,11 +1065,13 @@ mod tests {
                 VsockNotifier::new().unwrap(),
             )
             .unwrap();
+
         let deadline = Instant::now() + DEADLINE;
         while endpoint.connect_state().unwrap() != VsockConnectState::Connected {
             assert!(Instant::now() < deadline, "named-pipe connect timed out");
-            std::thread::yield_now();
+            thread::yield_now();
         }
+
         endpoint
     }
 
@@ -1064,7 +1086,7 @@ mod tests {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "guest write stalled");
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 Err(error) => panic!("guest write failed: {error}"),
             }
@@ -1077,6 +1099,7 @@ mod tests {
         let mut deadline = Instant::now() + DEADLINE;
         let mut out = Vec::with_capacity(count);
         let mut chunk = vec![0; 70_000];
+
         while out.len() < count {
             let want = (count - out.len()).min(chunk.len());
             match endpoint.read(&mut chunk[..want]) {
@@ -1087,11 +1110,12 @@ mod tests {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "guest read stalled");
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 Err(error) => panic!("guest read failed: {error}"),
             }
         }
+
         out
     }
 
@@ -1104,10 +1128,11 @@ mod tests {
     /// Run `host` on its own thread and wait at most DEADLINE for it, so a
     /// relay that never lets go of the pipe fails instead of hanging.
     fn within_deadline<T: Send + 'static>(host: impl FnOnce() -> T + Send + 'static) -> T {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
             let _ = sender.send(host());
         });
+
         receiver
             .recv_timeout(DEADLINE)
             .expect("Host end did not finish in time")
@@ -1115,11 +1140,14 @@ mod tests {
 
     #[test]
     fn host_replies_reach_the_guest_without_a_polling_interval() {
+        const ROUNDS: usize = 200;
+
         let name = pipe_name("latency");
         let server = host_pipe(&name);
-        const ROUNDS: usize = 200;
-        let host = std::thread::spawn(move || {
+
+        let host = thread::spawn(move || {
             host_accept(&server);
+
             let mut request = [0_u8; 8];
             for _ in 0..ROUNDS {
                 let mut filled = 0;
@@ -1129,6 +1157,7 @@ mod tests {
                 host_write_all(&server, &request);
             }
         });
+
         let endpoint = guest_connect(&name);
         let mut round_trips = Vec::with_capacity(ROUNDS);
         for round in 0..ROUNDS {
@@ -1138,9 +1167,12 @@ mod tests {
             assert_eq!(guest_read_up_to(&*endpoint, 8), request);
             round_trips.push(started.elapsed());
         }
+
         host.join().unwrap();
+
         round_trips.sort();
         let median = round_trips[ROUNDS / 2];
+
         // A polling relay waits one Windows timer tick (about 15.6 ms) per
         // reply, so every round trip costs at least that; a blocking read
         // takes well under a millisecond. Half a tick separates the two with
@@ -1154,16 +1186,20 @@ mod tests {
 
     #[test]
     fn streams_larger_than_a_read_arrive_whole_and_in_order() {
+        const LENGTH: usize = 300_000;
+
         let name = pipe_name("large");
         let server = host_pipe(&name);
-        const LENGTH: usize = 300_000;
-        let host = std::thread::spawn(move || {
+
+        let host = thread::spawn(move || {
             host_accept(&server);
             assert_eq!(host_read_exact(&server, LENGTH), pattern(LENGTH, 1));
             host_write_all(&server, &pattern(LENGTH, 2));
         });
+
         let endpoint = guest_connect(&name);
         guest_write_all(&*endpoint, &pattern(LENGTH, 1));
+
         assert_eq!(guest_read_up_to(&*endpoint, LENGTH), pattern(LENGTH, 2));
         host.join().unwrap();
     }
@@ -1172,21 +1208,25 @@ mod tests {
     fn host_closing_mid_stream_ends_the_stream_after_its_bytes() {
         let name = pipe_name("hostclose");
         let server = host_pipe(&name);
-        let host = std::thread::spawn(move || {
+
+        let host = thread::spawn(move || {
             host_accept(&server);
             host_write_all(&server, b"partial reply");
             // The Host goes away in the middle of a reply.
             drop(server);
         });
+
         let endpoint = guest_connect(&name);
         host.join().unwrap();
+
         assert_eq!(guest_read_up_to(&*endpoint, 1 << 20), b"partial reply");
+
         let deadline = Instant::now() + DEADLINE;
         loop {
             match endpoint.write(b"more") {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline);
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 Err(_) => break,
                 Ok(_) => {
@@ -1194,7 +1234,7 @@ mod tests {
                         Instant::now() < deadline,
                         "writes to a closed Host kept succeeding"
                     );
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
             }
         }
@@ -1204,7 +1244,8 @@ mod tests {
     fn host_replying_then_closing_while_the_guest_still_sends_delivers_the_reply_then_eof() {
         let name = pipe_name("replyclose");
         let server = host_pipe(&name);
-        let host = std::thread::spawn(move || {
+
+        let host = thread::spawn(move || {
             host_accept(&server);
             // Read only the start of the guest's stream, answer, and close
             // while the rest of it is still queued in the relay.
@@ -1212,6 +1253,7 @@ mod tests {
             host_write_all(&server, b"final reply");
             drop(server);
         });
+
         let endpoint = guest_connect(&name);
         // Far more than the pipe buffers: the relay is still writing it when
         // the Host closes.
@@ -1224,13 +1266,15 @@ mod tests {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "guest write timed out");
-                    std::thread::yield_now();
+                    thread::yield_now();
                 }
                 // Refusing further guest bytes once the Host closed is fine.
                 Err(_) => break,
             }
         }
+
         host.join().unwrap();
+
         // guest_read_up_to fails on any read error; the stream must end
         // cleanly after the reply.
         assert_eq!(guest_read_up_to(&*endpoint, 1 << 20), b"final reply");
@@ -1239,15 +1283,18 @@ mod tests {
 
     #[test]
     fn room_the_guest_frees_during_a_write_is_read_into_after_it() {
-        let name = pipe_name("roomafterwrite");
-        let server = host_pipe(&name);
         // One write chunk, larger than the pipe buffers, so the relay's
         // write stays pending until the Host reads it.
         const WRITE: usize = 32 * 1024;
         const TAIL: &[u8] = b"sent once the guest made room";
-        let (filled_tx, filled_rx) = std::sync::mpsc::channel();
-        let (drained_tx, drained_rx) = std::sync::mpsc::channel::<()>();
-        let host = std::thread::spawn(move || {
+
+        let name = pipe_name("roomafterwrite");
+        let server = host_pipe(&name);
+
+        let (filled_tx, filled_rx) = mpsc::channel();
+        let (drained_tx, drained_rx) = mpsc::channel::<()>();
+
+        let host = thread::spawn(move || {
             host_accept(&server);
             host_write_all(&server, &pattern(MAX_BUFFERED_BYTES, 5));
             filled_tx.send(()).unwrap();
@@ -1255,20 +1302,26 @@ mod tests {
             assert_eq!(host_read_exact(&server, WRITE), pattern(WRITE, 6));
             host_write_all(&server, TAIL);
         });
+
         let endpoint = guest_connect(&name);
         filled_rx.recv_timeout(DEADLINE).unwrap();
+
         // Let the last Host bytes reach the guest buffer, so it is full and
         // the relay has no read pending.
-        std::thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
         guest_write_all(&*endpoint, &pattern(WRITE, 6));
+
         // The relay is now blocked in that write; empty the guest buffer
         // under it.
-        std::thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
+
         assert_eq!(
             guest_read_up_to(&*endpoint, MAX_BUFFERED_BYTES),
             pattern(MAX_BUFFERED_BYTES, 5)
         );
+
         drained_tx.send(()).unwrap();
+
         // Once the write completes the relay must read again; nothing else
         // will wake it.
         assert_eq!(guest_read_up_to(&*endpoint, TAIL.len()), TAIL);
@@ -1279,20 +1332,25 @@ mod tests {
     fn dropping_the_guest_end_during_a_pending_read_releases_the_pipe() {
         let name = pipe_name("dropread");
         let server = host_pipe(&name);
-        let accepted = Arc::new(std::sync::Barrier::new(2));
+        let accepted = Arc::new(Barrier::new(2));
         let host_accepted = Arc::clone(&accepted);
-        let host = std::thread::spawn(move || {
+
+        let host = thread::spawn(move || {
             host_accept(&server);
             host_accepted.wait();
             server
         });
+
         let endpoint = guest_connect(&name);
         accepted.wait();
         let server = host.join().unwrap();
+
         // The relay's read is pending: the Host has written nothing.
-        std::thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
         drop(endpoint);
+
         let result = within_deadline(move || host_read(&server, &mut [0_u8; 16]));
+
         assert!(
             result.is_err(),
             "the relay kept its pipe end open: {result:?}"
@@ -1303,21 +1361,25 @@ mod tests {
     fn dropping_the_guest_end_during_a_blocked_write_releases_the_pipe() {
         let name = pipe_name("dropwrite");
         let server = host_pipe(&name);
-        let accepted = Arc::new(std::sync::Barrier::new(2));
+        let accepted = Arc::new(Barrier::new(2));
         let host_accepted = Arc::clone(&accepted);
-        let host = std::thread::spawn(move || {
+
+        let host = thread::spawn(move || {
             host_accept(&server);
             host_accepted.wait();
             server
         });
+
         let endpoint = guest_connect(&name);
         accepted.wait();
         let server = host.join().unwrap();
+
         // Far more than the pipe buffers while the Host reads nothing, so the
         // relay's write cannot complete.
         guest_write_all(&*endpoint, &pattern(1 << 20, 3));
-        std::thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
         drop(endpoint);
+
         let drained = within_deadline(move || {
             let mut buf = vec![0_u8; 65_536];
             let mut total = 0;
@@ -1328,6 +1390,7 @@ mod tests {
                 }
             }
         });
+
         assert!(
             drained.0 < 1 << 20,
             "the whole write went through: {drained:?}"
@@ -1336,12 +1399,14 @@ mod tests {
 
     #[test]
     fn many_concurrent_connections_each_keep_their_own_stream() {
-        let name = pipe_name("many");
         const CONNECTIONS: usize = 32;
+
+        let name = pipe_name("many");
+
         let hosts = (0..CONNECTIONS)
             .map(|_| {
                 let server = host_pipe(&name);
-                std::thread::spawn(move || {
+                thread::spawn(move || {
                     host_accept(&server);
                     let mut header = host_read_exact(&server, 1);
                     let body = host_read_exact(&server, 20_000);
@@ -1351,10 +1416,11 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+
         let guests = (0..CONNECTIONS)
             .map(|index| {
                 let name = name.clone();
-                std::thread::spawn(move || {
+                thread::spawn(move || {
                     let endpoint = guest_connect(&name);
                     let seed = index as u8;
                     guest_write_all(&*endpoint, &[seed]);
@@ -1365,6 +1431,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+
         for guest in guests {
             guest.join().unwrap();
         }
