@@ -513,14 +513,8 @@ impl DynFileSystem for PassthroughFs {
             .into_iter()
             .filter(|entry| entry.offset > offset)
             .map(|entry| {
-                let full = self.snapshot_entry_attributes(inode, &entry)?;
-                // The name can hold a newer file than the listing saw.
-                let dir_entry = DirEntry {
-                    ino: full.inode,
-                    type_: dirent_type_from_mode(full.attr.st_mode),
-                    ..snapshot_dir_entry(entry)
-                };
-                Ok((dir_entry, full))
+                let full = self.snapshot_entry_attributes(&entry)?;
+                Ok((snapshot_dir_entry(entry), full))
             })
             .collect::<io::Result<Vec<_>>>()?;
         for (_, entry) in &entries {
@@ -542,15 +536,9 @@ impl DynFileSystem for PassthroughFs {
             if entry.offset <= offset {
                 continue;
             }
-            let full = self.snapshot_entry_attributes(inode, &entry)?;
+            let full = self.snapshot_entry_attributes(&entry)?;
             let id = full.inode;
-            // The name can hold a newer file than the listing saw.
-            let dir_entry = DirEntry {
-                ino: id,
-                type_: dirent_type_from_mode(full.attr.st_mode),
-                ..snapshot_dir_entry(entry)
-            };
-            if add_entry(dir_entry, full)? == 0 {
+            if add_entry(snapshot_dir_entry(entry), full)? == 0 {
                 break;
             }
             self.record_owned_lookup(id);
