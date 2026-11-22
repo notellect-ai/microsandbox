@@ -330,13 +330,6 @@ impl PassthroughFs {
             {
                 pending.push(stale);
             }
-            // Only a directory with cached descendants has any to take along;
-            // the walk over every tracked inode is skipped otherwise.
-            let has_descendants = inodes
-                .by_path
-                .range(old.clone()..)
-                .find(|(key, _)| **key != old)
-                .is_some_and(|(key, _)| key.starts_with(&old));
         }
     }
 
