@@ -1,0 +1,41 @@
+# Proof-only workflow for an upstream PR draft. It lives ONLY on the fork's
+# notellect/pr-proof/<name>[-unfixed] branches (one extra commit on top of the
+# PR branch); the PR branch itself never carries it.
+name: PR proof
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Mirrors upstream's agentd checks: rust-quality "Check agentd" (fmt + clippy on
+  # x86_64-unknown-linux-musl) and test-platform.yml "Test agentd (Linux)".
+  agentd-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --target x86_64-unknown-linux-musl
+          rustup default stable
+      - name: Format
+        run: cargo fmt --manifest-path crates/agentd/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+      - name: Tests (new)
+        run: cargo test --locked --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl --lib -- filesystem_read_credit live_filesystem_read
+      - name: Tests (crate)
+        run: cargo test --locked --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl --lib
