@@ -3707,7 +3707,7 @@ fn stale_directory_open_when_a_host_move_takes_its_name_stays_usable(cache_moved
     assert_eq!(lookup_relative(&fs, "e/sub").unwrap().inode, moved);
     assert_eq!(
         fs.inode(stale_child).unwrap().path(),
-        temp.path.join("kept").join("own")
+        fs.root.join("kept").join("own")
     );
     assert_every_inode_named(&fs, "open directory followed");
 
