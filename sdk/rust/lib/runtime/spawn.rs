@@ -2335,7 +2335,7 @@ fn machine_cli_args(
         nested_virt: config.spec.resources.nested_virt,
         guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
         fs_state_limit_bytes: local.config().fs_state_limit_override(),
-        share_elevated_sandboxes,
+        share_elevated_sandboxes: false,
         memory_cache_dir: Some(local.cache_dir().join("memory")),
         startup: startup_command(config),
         lifecycle: Lifecycle {
