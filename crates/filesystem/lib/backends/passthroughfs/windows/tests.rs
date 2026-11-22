@@ -4561,6 +4561,7 @@ fn the_old_root_moved_under_its_replacement_is_not_the_root() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("before"), b"old").unwrap();
     let fs = fs_for(&temp.path);
+    let root_path = fs.inode(ROOT_INODE).unwrap().path();
     let moved = TempDir {
         path: temp.path.with_extension("moved"),
     };
@@ -4602,10 +4603,7 @@ fn the_old_root_moved_under_its_replacement_is_not_the_root() {
             .st_size,
         3
     );
-    assert_eq!(
-        *fs.inode(ROOT_INODE).unwrap().path.read().unwrap(),
-        temp.path
-    );
+    assert_eq!(fs.inode(ROOT_INODE).unwrap().path(), root_path);
 }
 
 /// The Host replaces a directory whose child the guest has looked up, by
