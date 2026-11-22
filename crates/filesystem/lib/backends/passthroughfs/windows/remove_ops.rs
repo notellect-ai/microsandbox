@@ -257,11 +257,6 @@ impl PassthroughFs {
         // Read the guest metadata now: an ADS override moves with whichever
         // file holds the name, so after a rename-over it is the new file's.
         let current = self.current_override(&metadata, &data).ok()?;
-        // Keep it in memory as well: if a step below fails, the fallback pin
-        // after the host operation can no longer read the stream by path.
-        if self.stat_follows_file() {
-            keep_in_memory(&data, current);
-        }
         let file = StdOpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -307,7 +302,12 @@ impl PassthroughFs {
             stat,
             stat_file,
         } = prepared?;
-        keep_in_memory(&data, stat);
+        *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
+            uid: stat.uid,
+            gid: stat.gid,
+            mode: Some(stat.mode),
+            rdev: u64::from(stat.rdev),
+        };
         *data.retained.lock().unwrap() = Some(file);
         *data.retained_stat.lock().unwrap() = stat_file;
         after_retain();
@@ -412,33 +412,24 @@ impl PassthroughFs {
         if metadata.is_dir() {
             return false;
         }
-        // The override is read by path after the host operation. A sidecar
-        // entry there is still this file's: the store moves or removes it
-        // only afterwards, and the host never touches it. A metadata stream
-        // belongs to whatever holds the name now: the replacing file after a
-        // rename-over or a host replace, nothing after an unlink. So a stream
-        // is read only while the name still holds this file; otherwise the
-        // inode keeps its in-memory metadata, which pin_open_file filled in
-        // before a guest unlink or rename. If the override cannot be read,
-        // the inode keeps its in-memory metadata too, and the file stays
-        // pinned.
-        let by_path = !self.stat_follows_file()
-            || data.identity.is_some_and(|identity| {
-                self.path_identity(&data.path()).ok().flatten() == Some(identity)
-            });
-        if by_path && let Ok(stat) = self.current_override(&metadata, data) {
-            keep_in_memory(data, stat);
+        // The override is read by path after the host operation, so it is
+        // taken only while the name still holds this file. After a
+        // rename-over or a host replace the name holds the replacing file's
+        // metadata, and after an unlink nothing. Otherwise, or if it cannot
+        // be read, the inode keeps its in-memory metadata, and the open file
+        // is still pinned.
+        let holds_name = data.identity.is_some()
+            && self.path_identity(&data.path()).ok().flatten() == data.identity;
+        if holds_name && let Ok(stat) = self.current_override(&metadata, data) {
+            *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
+                uid: stat.uid,
+                gid: stat.gid,
+                mode: Some(stat.mode),
+                rdev: u64::from(stat.rdev),
+            };
         }
         *data.retained.lock().unwrap() = Some(file);
         true
-    }
-
-    /// Whether guest metadata is kept in a stream of each file, which follows
-    /// the file object, rather than under its path.
-    fn stat_follows_file(&self) -> bool {
-        self.stat_store
-            .as_ref()
-            .is_some_and(StatStore::follows_file)
     }
 
     pub(super) fn rename_inode_path(
@@ -534,17 +525,6 @@ impl PassthroughFs {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
-
-/// Hold `stat` as the inode's metadata, which it reports once no name of its
-/// file can be read.
-fn keep_in_memory(data: &InodeData, stat: OverrideStat) {
-    *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
-        uid: stat.uid,
-        gid: stat.gid,
-        mode: Some(stat.mode),
-        rdev: u64::from(stat.rdev),
-    };
-}
 
 #[cfg(test)]
 fn after_host_rename() {
