@@ -29,6 +29,12 @@ thread_local! {
     /// inode table follows it, so a test can act inside that window.
     pub(super) static AFTER_HOST_UNLINK: RefCell<Option<Box<dyn FnOnce()>>> =
         const { RefCell::new(None) };
+
+    /// Runs on the unlinking thread after a pin found that the name still
+    /// holds the inode's file and before it pins the file's metadata stream,
+    /// so a test can replace the name inside that window.
+    pub(super) static AFTER_PIN_CHECK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -218,7 +224,8 @@ impl PassthroughFs {
         if !Self::holds_own_object(&data, &file) {
             return Ok(None);
         }
-        let stat_file = self.pin_owned_stat(path, current)?;
+        after_pin_check();
+        let stat_file = self.pin_owned_stat(&file, current)?;
         Ok(Some(PreparedOwnedUnlink {
             data,
             file,
@@ -261,16 +268,13 @@ impl PassthroughFs {
         if !Self::holds_own_object(&data, &file) {
             return None;
         }
+        after_pin_check();
 
         // Pin the file's own metadata stream too, so that a chmod or chown
         // made while the file has no name is stored with the file, where a
         // lookup of another hard link reads it. Without it the change stays
         // in memory only.
-        let stat_file = self
-            .pin_owned_stat(path, current)
-            .ok()
-            .flatten()
-            .filter(|stat_file| Self::holds_own_object(&data, stat_file));
+        let stat_file = self.pin_owned_stat(&file, current).ok().flatten();
         Some(PreparedOwnedUnlink {
             data,
             file,
@@ -506,3 +510,13 @@ fn after_host_unlink() {
 
 #[cfg(not(test))]
 fn after_host_unlink() {}
+
+#[cfg(test)]
+fn after_pin_check() {
+    if let Some(hook) = AFTER_PIN_CHECK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_pin_check() {}
