@@ -13,6 +13,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 #[cfg(unix)]
 use nix::{
     sys::signal::{self, Signal},
@@ -801,7 +803,9 @@ fn reap_in_background(child: Child, runtime: Option<Handle>) {
 fn terminate_process(pid: u32) -> std::io::Result<()> {
     let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
     if handle.is_null() {
-        return Err(std::io::Error::last_os_error());
+        return Err(elevation_share::explain_access_denied(
+            std::io::Error::last_os_error(),
+        ));
     }
 
     let result = unsafe { windows_sys::Win32::System::Threading::TerminateProcess(handle, 1) };

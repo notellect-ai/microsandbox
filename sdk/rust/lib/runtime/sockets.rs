@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use microsandbox_runtime::ipc::SandboxSocketPaths;
 #[cfg(windows)]
+use microsandbox_utils::elevation_share;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
@@ -263,7 +265,7 @@ fn probe_agent_pipe_server(pipe_path: &Path) -> std::io::Result<AgentPipeProbe> 
         Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
             Ok(AgentPipeProbe::Served { server_pid: None })
         }
-        Err(err) => Err(err),
+        Err(err) => Err(elevation_share::explain_access_denied(err)),
     }
 }
 

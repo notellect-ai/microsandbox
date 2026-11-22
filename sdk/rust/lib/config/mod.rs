@@ -404,6 +404,11 @@ pub struct RuntimeConfig {
     /// Host-owned placement profiles selectable by sandbox name.
     #[config_patch(merge)]
     pub placement_profiles: BTreeMap<String, PlacementProfile>,
+
+    /// On Windows, let the same account's non-elevated runs reach sandboxes that an elevated
+    /// (administrator) run starts: they can connect to, exec in and stop them. Off keeps the
+    /// UAC boundary, and a non-elevated run gets an access-denied error explaining it.
+    pub share_elevated_sandboxes: bool,
 }
 
 /// Controls buffered host dirty data for writable raw disks.
@@ -498,6 +503,12 @@ impl GlobalConfig {
     pub(crate) fn fs_state_limit_override(&self) -> Option<u64> {
         (self.snapshots.max_filesystem_state_mib != FS_STATE_LIMIT_DEFAULT_MIB)
             .then(|| self.fs_state_limit() as u64)
+    }
+
+    /// Whether launches ask the runtime to share elevated sandboxes with non-elevated runs.
+    /// The setting only exists on Windows; other hosts never send it.
+    pub(crate) fn share_elevated_sandboxes(&self) -> bool {
+        cfg!(windows) && self.runtime.share_elevated_sandboxes
     }
 
     /// Resolve and structurally validate a host-owned placement profile.
@@ -893,7 +904,8 @@ mod tests {
                 "placement_profiles": {"latency": {
                     "numa": {"mode": "prefer_single"},
                     "memory": {"mode": "follow_cpu"}
-                }}
+                }},
+                "share_elevated_sandboxes": true
             },
             "registries": {
                 "ca_certs": "/configured/ca.pem",
@@ -1230,6 +1242,18 @@ mod tests {
                 "placement profile `missing` is not defined in runtime.placement_profiles"
             )
         );
+    }
+
+    #[test]
+    fn test_share_elevated_sandboxes_defaults_off_and_applies_only_on_windows() {
+        let default: GlobalConfig = serde_json::from_str("{}").unwrap();
+        let opted_in: GlobalConfig =
+            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
+
+        assert!(!default.runtime.share_elevated_sandboxes);
+        assert!(!default.share_elevated_sandboxes());
+        assert!(opted_in.runtime.share_elevated_sandboxes);
+        assert_eq!(opted_in.share_elevated_sandboxes(), cfg!(windows));
     }
 
     #[test]
