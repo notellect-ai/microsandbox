@@ -1,6 +1,7 @@
 //! Tests for the Windows passthrough backend.
 
 use super::*;
+use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::fs::FileExt;
 use std::process::Command;
@@ -4220,6 +4221,256 @@ fn a_host_rename_over_inside_the_pin_leaves_the_replacing_metadata_alone() {
     }
 }
 
+/// The host first renames a file over the inode's own name, then renames
+/// another over a second name the guest renames over, inside the window after
+/// the pin checked that second name. The old file then has no name left, so
+/// its metadata stays in memory: it must be its own, read at the checked
+/// name, not the first replacing file's, read at the inode's own name.
+#[test]
+fn a_host_rename_over_the_inodes_own_name_leaves_the_fallback_its_metadata() {
+    for owned in [false, true] {
+        let case = format!("owned {owned}");
+        let temp = TempDir::new();
+        let path = temp.path.join("data");
+        let alias = temp.path.join("alias");
+        let first = temp.path.join("first.tmp");
+        let first_witness = temp.path.join("first.witness");
+        let second = temp.path.join("second.tmp");
+        let second_witness = temp.path.join("second.witness");
+        let fs = if owned {
+            owned_fs_for(&temp.path, crate::OwnedDirectoryCheckpoint::default())
+        } else {
+            fs_for(&temp.path)
+        };
+        assert_ads_store(&fs);
+        let owner = Context {
+            uid: 111,
+            gid: 222,
+            pid: 0,
+        };
+        let (data, handle) = create_with(&fs, owner, c"data", 0o640, b"old");
+        std::fs::hard_link(&path, &alias).unwrap();
+        let looked_up = fs.lookup(context(), ROOT_INODE, c"alias").unwrap().inode;
+        assert_eq!(looked_up, data, "{case}: the second name is another inode");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::hard_link(&first, &first_witness).unwrap();
+        write_override_stream(
+            &ads_override_path(&first),
+            OverrideStat::new(333, 444, S_IFREG | 0o444, 0),
+        )
+        .unwrap();
+        std::fs::rename(&first, &path).unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        std::fs::hard_link(&second, &second_witness).unwrap();
+        let (src, src_handle) = create_with(&fs, context(), c"src", 0o600, b"src");
+        fs.release(context(), src, 0, src_handle, false, false, None)
+            .unwrap();
+
+        let (from, to) = (second.clone(), alias.clone());
+        remove_ops::AFTER_PIN_CHECK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::rename(from, to).unwrap()));
+        });
+        fs.rename(context(), ROOT_INODE, c"src", ROOT_INODE, c"alias", 0)
+            .unwrap();
+        let pending = remove_ops::AFTER_PIN_CHECK.with(|hook| hook.borrow_mut().take());
+        assert!(pending.is_none(), "{case}: the pin hook did not run");
+        let attr = stat64 {
+            st_mode: S_IFREG | 0o604,
+            ..Default::default()
+        };
+        fs.setattr(owner, data, attr, Some(handle), SetattrValid::MODE)
+            .unwrap();
+
+        let (st, _) = fs.getattr(context(), data, Some(handle)).unwrap();
+        assert_eq!(
+            (st.st_uid, st.st_gid, st.st_mode),
+            (111, 222, S_IFREG | 0o604),
+            "{case}: the old file took another file's metadata"
+        );
+        let stat = read_override_stream(&ads_override_path(&first_witness)).unwrap();
+        let (stat_uid, stat_gid, stat_mode) = (stat.uid, stat.gid, stat.mode);
+        assert_eq!(
+            (stat_uid, stat_gid, stat_mode),
+            (333, 444, S_IFREG | 0o444),
+            "{case}"
+        );
+        assert_eq!(
+            read_override_stream(&ads_override_path(&second_witness))
+                .map(|_| ())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(LINUX_ENOENT),
+            "{case}: the second replacing file got a metadata stream"
+        );
+        assert_eq!(read_all(&fs, data, handle).unwrap(), b"old", "{case}");
+        fs.release(context(), data, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
+/// Metadata the host wrote to a file's stream before the guest saw it is read
+/// on lookup, so it stays the file's once the host renames another file over
+/// its only name and the file is reachable only through the guest's handle.
+#[test]
+fn a_host_written_metadata_stream_stays_with_the_file_once_it_has_no_name() {
+    let temp = TempDir::new();
+    let path = temp.path.join("data");
+    let staged = temp.path.join("new.tmp");
+    let witness = temp.path.join("new.witness");
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+    std::fs::write(&path, b"old").unwrap();
+    write_override_stream(
+        &ads_override_path(&path),
+        OverrideStat::new(555, 666, S_IFREG | 0o640, 0),
+    )
+    .unwrap();
+    let data = fs.lookup(context(), ROOT_INODE, c"data").unwrap().inode;
+    let (handle, _) = fs.open(context(), data, false, 0).unwrap();
+    let handle = handle.unwrap();
+    std::fs::write(&staged, b"new!").unwrap();
+    std::fs::hard_link(&staged, &witness).unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+
+    let (st, _) = fs.getattr(context(), data, Some(handle)).unwrap();
+    assert_eq!(
+        (st.st_uid, st.st_gid, st.st_mode),
+        (555, 666, S_IFREG | 0o640)
+    );
+    let (st, _) = fs.getattr(context(), data, None).unwrap();
+    assert_eq!(
+        (st.st_uid, st.st_gid, st.st_mode),
+        (555, 666, S_IFREG | 0o640)
+    );
+    assert_eq!(read_all(&fs, data, handle).unwrap(), b"old");
+    expect_errno(
+        read_override_stream(&ads_override_path(&witness)),
+        LINUX_ENOENT,
+    );
+}
+
+/// A link through an inode whose name now holds another file links nothing:
+/// the other file gets no new name and none of the inode's metadata.
+#[test]
+fn a_link_through_a_host_replaced_name_links_nothing() {
+    let temp = TempDir::new();
+    let path = temp.path.join("data");
+    let staged = temp.path.join("new.tmp");
+    let fs = fs_for(&temp.path);
+    let owner = Context {
+        uid: 111,
+        gid: 222,
+        pid: 0,
+    };
+    let (data, handle) = create_with(&fs, owner, c"data", 0o640, b"old");
+    fs.release(context(), data, 0, handle, false, false, None)
+        .unwrap();
+    std::fs::write(&staged, b"new!").unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+
+    expect_errno(fs.link(context(), data, ROOT_INODE, c"link"), LINUX_ESTALE);
+    assert!(!temp.path.join("link").exists(), "a link was left behind");
+    assert_eq!(std::fs::read(&path).unwrap(), b"new!");
+}
+
+/// A link whose source name the host renames another file over inside each
+/// window between a check of the source's own file and its use links the
+/// source's own file, with its metadata, or nothing: never the other file.
+#[test]
+fn a_link_inside_each_check_window_links_only_the_inodes_own_file() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+    let owner = Context {
+        uid: 111,
+        gid: 222,
+        pid: 0,
+    };
+    for other_link in [false, true] {
+        for k in 0.. {
+            let case = format!("other link {other_link}, window {k}");
+            let names = HostChangeNames::new(&temp.path, k * 2 + usize::from(other_link));
+            let (data, handle) = create_with(&fs, owner, &names.name, 0o640, b"old");
+            fs.release(owner, data, 0, handle, false, false, None)
+                .unwrap();
+            if other_link {
+                std::fs::hard_link(&names.path, &names.keep).unwrap();
+            }
+            std::fs::write(&names.staged, b"new!").unwrap();
+            std::fs::hard_link(&names.staged, &names.witness).unwrap();
+            let (staged, path) = (names.staged.clone(), names.path.clone());
+            arm_own_check(k, Box::new(move || std::fs::rename(staged, path).unwrap()));
+
+            let link_name = CString::new(format!("link{k}-{other_link}")).unwrap();
+            let result = fs.link(owner, data, ROOT_INODE, &link_name);
+            let unused = metadata::AFTER_OWN_CHECK.with(|hook| hook.borrow_mut().take());
+            let link = temp.path.join(link_name.to_str().unwrap());
+            match result {
+                Ok(entry) => {
+                    assert_eq!(std::fs::read(&link).unwrap(), b"old", "{case}");
+                    let (st, _) = fs.getattr(owner, entry.inode, None).unwrap();
+                    assert_eq!(
+                        (st.st_uid, st.st_gid, st.st_mode),
+                        (111, 222, S_IFREG | 0o640),
+                        "{case}"
+                    );
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(error.raw_os_error(), Some(LINUX_ESTALE | LINUX_ENOENT)),
+                        "{case}: link failed with {error:?}"
+                    );
+                    assert!(!link.exists(), "{case}: a link was left behind");
+                }
+            }
+            assert_eq!(std::fs::read(&names.witness).unwrap(), b"new!", "{case}");
+            expect_errno(
+                read_override_stream(&ads_override_path(&names.witness)),
+                LINUX_ENOENT,
+            );
+            if unused.is_some() {
+                break;
+            }
+        }
+    }
+}
+
+/// A readdirplus page read after the host replaced a listed name reports
+/// what the name holds now, as a lookup would, instead of failing the page.
+#[test]
+fn readdirplus_after_a_host_replace_reports_what_the_name_holds() {
+    let temp = TempDir::new();
+    let path = temp.path.join("data");
+    let staged = temp.path.join("new.tmp");
+    std::fs::write(temp.path.join("other"), b"other").unwrap();
+    std::fs::write(&path, b"old").unwrap();
+    let fs = fs_for(&temp.path);
+    let (handle, _) = fs
+        .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+    let entries = fs
+        .readdirplus(context(), ROOT_INODE, handle, 4096, 0)
+        .unwrap();
+    let index = entries
+        .iter()
+        .position(|(entry, _)| entry.name == b"data")
+        .unwrap();
+    let (offset, old) = (entries[index - 1].0.offset, entries[index].1.inode);
+    std::fs::write(&staged, b"new!").unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+
+    let entries = fs
+        .readdirplus(context(), ROOT_INODE, handle, 4096, offset)
+        .unwrap();
+    let (entry, full) = &entries[0];
+    assert_eq!(entry.name, b"data");
+    assert_ne!(full.inode, old, "the replacing file kept the old inode");
+    assert_eq!(full.attr.st_size, 4);
+    let looked_up = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+    assert_eq!(looked_up.inode, full.inode);
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests: guest renames and names cached under the destination
 //--------------------------------------------------------------------------------------------------
@@ -5037,4 +5288,294 @@ fn a_host_replace_of_the_root_keeps_the_root_inode() {
             .st_size,
         3
     );
+}
+
+/// Metadata calls through an inode whose name the host renamed another file
+/// over, replaced (deleted, then renamed another file to) or removed, before
+/// the calls or inside each window between a call's check of the inode's own
+/// file and its use. Every combination of mount, a metadata stream on the
+/// replacing file, another host link to the inode's file, and a guest handle
+/// on it (none, a writable one the calls go through, a writable one or a
+/// read-only one while the calls go by path); with no stream on the
+/// replacing file only before the calls, since a misdirected write shows as
+/// well on a stream that is there. Each case has names of its own on one
+/// mount per kind. The replacing file must never get the inode's chmod,
+/// times, truncation or metadata; the inode keeps its own (in memory when
+/// its file has no name left), with what each call that succeeded set;
+/// calls through the handle succeed, chmod and touch with a writable handle
+/// open too, and any other call fails only with ESTALE or ENOENT, so the
+/// guest looks the name up again.
+#[test]
+fn metadata_calls_after_a_host_change_reach_only_the_inodes_own_file() {
+    const MTIME: i64 = 1_000_000_000;
+    let mut index = 0;
+    for mount in ["plain", "owned", "mirror"] {
+        let temp = TempDir::new();
+        let fs = match mount {
+            "owned" => owned_fs_for(&temp.path, crate::OwnedDirectoryCheckpoint::default()),
+            "mirror" => {
+                let fs = PassthroughFs::new(PassthroughConfig {
+                    root_dir: temp.path.clone(),
+                    inject_init: false,
+                    host_permissions: HostPermissions::Mirror,
+                    ..Default::default()
+                })
+                .unwrap();
+                fs.init(FsOptions::empty()).unwrap();
+                fs
+            }
+            _ => fs_for(&temp.path),
+        };
+        assert_ads_store(&fs);
+        for stream in [false, true] {
+            for other_link in [false, true] {
+                for open in ["closed", "handle", "path", "read-only"] {
+                    for action in ["rename-over", "replace", "unlink"] {
+                        // `None` acts before the calls; `Some(k)` inside the
+                        // k-th window, until the calls have fewer windows.
+                        let mut window = None;
+                        loop {
+                            let case = format!(
+                                "{mount}, stream {stream}, other link {other_link}, \
+                                 open {open}, {action}, window {window:?}"
+                            );
+                            index += 1;
+                            let names = HostChangeNames::new(&temp.path, index);
+                            let finished = host_change_case(
+                                &case, &fs, &names, stream, other_link, open, action, window, MTIME,
+                            );
+                            if finished || !stream || open == "read-only" {
+                                break;
+                            }
+                            window = Some(window.map_or(0, |k| k + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One case of the test above. Returns whether the calls ran out of windows
+/// before the k-th, so the case did not run the host change inside one.
+#[allow(clippy::too_many_arguments)]
+fn host_change_case(
+    case: &str,
+    fs: &PassthroughFs,
+    names: &HostChangeNames,
+    stream: bool,
+    other_link: bool,
+    open: &str,
+    action: &'static str,
+    window: Option<usize>,
+    mtime: i64,
+) -> bool {
+    let HostChangeNames {
+        name,
+        path,
+        keep,
+        staged,
+        witness,
+    } = names;
+    let owner = Context {
+        uid: 111,
+        gid: 222,
+        pid: 0,
+    };
+    let (data, handle) = create_with(fs, owner, name, 0o640, b"old");
+    if other_link {
+        std::fs::hard_link(path, keep).unwrap();
+    }
+    std::fs::write(staged, b"new!").unwrap();
+    std::fs::hard_link(staged, witness).unwrap();
+    if stream {
+        write_override_stream(
+            &ads_override_path(staged),
+            OverrideStat::new(333, 444, S_IFREG | 0o400, 0),
+        )
+        .unwrap();
+    }
+    // A misdirected chmod (which makes the file writable) shows on it.
+    set_readonly(witness, true);
+    let witness_mtime = std::fs::metadata(witness).unwrap().modified().unwrap();
+    let held = match open {
+        "closed" => None,
+        "read-only" => {
+            let (read_only, _) = fs.open(owner, data, false, 0).unwrap();
+            fs.release(owner, data, 0, handle, false, false, None)
+                .unwrap();
+            read_only
+        }
+        _ => Some(handle),
+    };
+    let handle = held.filter(|_| open == "handle");
+
+    let change = {
+        let (path, staged) = (path.clone(), staged.clone());
+        move || {
+            if action != "rename-over" {
+                std::fs::remove_file(&path).unwrap();
+            }
+            if action != "unlink" {
+                std::fs::rename(&staged, &path).unwrap();
+            }
+        }
+    };
+    match window {
+        None => change(),
+        Some(k) => arm_own_check(k, Box::new(change)),
+    }
+
+    let chmod = stat64 {
+        st_mode: S_IFREG | 0o604,
+        ..Default::default()
+    };
+    let touch = stat64 {
+        st_mtime: mtime,
+        ..Default::default()
+    };
+    let truncate = stat64 {
+        st_size: 1,
+        ..Default::default()
+    };
+    let results = [
+        fs.setattr(owner, data, chmod, handle, SetattrValid::MODE)
+            .map(|_| ()),
+        fs.setattr(owner, data, touch, handle, SetattrValid::MTIME)
+            .map(|_| ()),
+        fs.setattr(owner, data, truncate, handle, SetattrValid::SIZE)
+            .map(|_| ()),
+    ];
+    let unused = metadata::AFTER_OWN_CHECK.with(|hook| hook.borrow_mut().take());
+    let release = || {
+        if let Some(held) = held {
+            fs.release(owner, data, 0, held, false, false, None)
+                .unwrap();
+        }
+    };
+    if unused.is_some() {
+        release();
+        return true;
+    }
+
+    // The replacing file (or, after an unlink, the file never placed) keeps
+    // its own contents, times, attributes and metadata.
+    assert_eq!(
+        std::fs::read(witness).unwrap(),
+        b"new!",
+        "{case}: truncated the replacing file"
+    );
+    let witness_metadata = std::fs::metadata(witness).unwrap();
+    assert_eq!(
+        witness_metadata.modified().unwrap(),
+        witness_mtime,
+        "{case}: touched the replacing file"
+    );
+    assert!(
+        witness_metadata.permissions().readonly(),
+        "{case}: chmodded the replacing file"
+    );
+    let witness_stat = read_override_stream(&ads_override_path(witness))
+        .map(|stat| (stat.uid, stat.gid, stat.mode))
+        .map_err(|error| error.raw_os_error());
+    let expected = if stream {
+        Ok((333, 444, S_IFREG | 0o400))
+    } else {
+        Err(Some(LINUX_ENOENT))
+    };
+    assert_eq!(
+        witness_stat, expected,
+        "{case}: the replacing file's metadata changed"
+    );
+
+    // The inode's own file (and its other name) holds what each call that
+    // succeeded set, and nothing a failed one tried.
+    let [chmodded, touched, truncated] = results.each_ref().map(|result| result.is_ok());
+    if let Some(held) = held {
+        let mode = if chmodded { 0o604 } else { 0o640 };
+        let size = if truncated { 1 } else { 3 };
+        for by_handle in [Some(held), None] {
+            let (st, _) = fs
+                .getattr(owner, data, by_handle)
+                .unwrap_or_else(|error| panic!("{case}: getattr {by_handle:?}: {error}"));
+            assert_eq!(
+                (st.st_uid, st.st_gid, st.st_mode, st.st_size),
+                (111, 222, S_IFREG | mode, size),
+                "{case}: getattr {by_handle:?} lost the inode's own metadata"
+            );
+            // A truncation after the touch sets the time again.
+            if touched && !truncated {
+                assert_eq!(st.st_mtime, mtime, "{case}: getattr {by_handle:?}");
+            }
+        }
+        let contents: &[u8] = if truncated { b"o" } else { b"old" };
+        assert_eq!(read_all(fs, data, held).unwrap(), contents, "{case}");
+    }
+    if other_link {
+        let stat = read_override_stream(&ads_override_path(keep)).unwrap();
+        let mode = if chmodded { 0o604 } else { 0o640 };
+        assert_eq!(
+            (stat.uid, stat.gid, stat.mode),
+            (111, 222, S_IFREG | mode),
+            "{case}: the file's own stream"
+        );
+        let contents: &[u8] = if truncated { b"o" } else { b"old" };
+        assert_eq!(std::fs::read(keep).unwrap(), contents, "{case}: the file");
+    }
+    for (call, result) in ["chmod", "touch", "truncate"].iter().zip(&results) {
+        // Through the handle every call succeeds; by path with a writable
+        // handle open, so do chmod and touch.
+        let must_succeed = open == "handle" || (open == "path" && *call != "truncate");
+        match result {
+            Ok(()) => {}
+            Err(error) if must_succeed => panic!("{case}: {call} failed: {error:?}"),
+            Err(error) => assert!(
+                matches!(error.raw_os_error(), Some(LINUX_ESTALE | LINUX_ENOENT)),
+                "{case}: {call} failed with {error:?}"
+            ),
+        }
+    }
+    release();
+    set_readonly(witness, false);
+    false
+}
+
+/// The host names of one case of the test above: the inode's name, another
+/// host link to its file, and the replacing file with a link of its own.
+struct HostChangeNames {
+    name: CString,
+    path: PathBuf,
+    keep: PathBuf,
+    staged: PathBuf,
+    witness: PathBuf,
+}
+
+impl HostChangeNames {
+    fn new(root: &Path, index: usize) -> Self {
+        Self {
+            name: CString::new(format!("data{index}")).unwrap(),
+            path: root.join(format!("data{index}")),
+            keep: root.join(format!("keep{index}")),
+            staged: root.join(format!("new{index}.tmp")),
+            witness: root.join(format!("new{index}.witness")),
+        }
+    }
+}
+
+fn set_readonly(path: &Path, readonly: bool) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(readonly);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+/// Run `act` inside the `k`-th window between a metadata call's check of the
+/// inode's own file and its use of that file.
+fn arm_own_check(k: usize, act: Box<dyn FnOnce()>) {
+    let hook: Box<dyn FnOnce()> = if k == 0 {
+        act
+    } else {
+        Box::new(move || arm_own_check(k - 1, act))
+    };
+    metadata::AFTER_OWN_CHECK.with(|slot| *slot.borrow_mut() = Some(hook));
 }
