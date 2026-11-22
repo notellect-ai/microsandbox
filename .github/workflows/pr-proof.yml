@@ -1,0 +1,127 @@
+# Proof-only workflow for an upstream PR draft. It lives ONLY on the fork's
+# notellect/pr-proof/<name>[-unfixed] branches (one extra commit on top of the
+# PR branch); the PR branch itself never carries it.
+name: PR proof
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Needed only if a crate under test embeds agentd (microsandbox-filesystem,
+  # microsandbox, microsandbox-cli). Delete this job and the download step otherwise.
+  agentd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+          rustup default stable
+      - run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with: { name: agentd, path: target/x86_64-unknown-linux-musl/release/agentd, if-no-files-found: error, compression-level: 0 }
+
+  windows:
+    needs: agentd
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}\embed
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: actions/download-artifact@v4
+        with: { name: agentd, path: embed }
+      - shell: pwsh
+        run: New-Item -ItemType File -Force -Path embed\msb.exe, embed\libkrunfw.dll | Out-Null
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --locked --no-default-features --features net,runner -p microsandbox-runtime -- -D warnings
+      - name: Check out libkrunfw (for msvc-env.ps1)
+        if: always()
+        shell: bash
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+      - name: Extract the check.yml step verbatim
+        if: always()
+        shell: bash
+        run: |
+          python - "Test passthrough backends (rootfs, directory mount)" > check-step.ps1 <<'PY'
+          # Print one windows-quality step's `run` script from check.yml, verbatim,
+          # with only the matrix expressions filled in for the x86_64 runner.
+          import sys
+          name = sys.argv[1]
+          lines = open('.github/workflows/check.yml', encoding='utf-8').read().splitlines()
+          start = next(i for i, l in enumerate(lines) if l.strip() == f'- name: {name}')
+          run = next(i for i in range(start, len(lines)) if lines[i].strip() == 'run: |')
+          indent = len(lines[run]) - len(lines[run].lstrip())
+          body = []
+          for l in lines[run + 1:]:
+              if l.strip() and len(l) - len(l.lstrip()) <= indent:
+                  break
+              body.append(l)
+          pad = min(len(l) - len(l.lstrip()) for l in body if l.strip())
+          script = '\n'.join(l[pad:] for l in body).rstrip() + '\n'
+          for key, value in {
+              '$' '{{ matrix.rust_target }}': 'x86_64-pc-windows-msvc',
+              '$' '{{ matrix.vs_arch }}': 'amd64',
+              '$' '{{ matrix.vs_host_arch }}': 'amd64',
+          }.items():
+              script = script.replace(key, value)
+          assert '$' '{{' not in script, script
+          # What the Actions pwsh shell appends to every run script.
+          script += 'if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n'
+          sys.stdout.write(script)
+          PY
+          cat check-step.ps1
+      - name: "Run check.yml step verbatim: Test passthrough backends (rootfs, directory mount)"
+        if: always()
+        shell: pwsh
+        env:
+          MSB_AGENTD_PATH: ${{ github.workspace }}\embed\agentd
+        run: |
+          pwsh -NoProfile -NonInteractive -File check-step.ps1
+          exit $LASTEXITCODE
+      - name: Tests
+        if: always()
+        shell: bash
+        run: cargo test --locked --no-default-features --features net,runner -p microsandbox-runtime --lib -- test_host_directory_mount_replies_expire_at_once
+
+  unix:
+    needs: agentd
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}/embed
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+      - uses: actions/download-artifact@v4
+        with: { name: agentd, path: embed }
+      - name: Tests
+        run: cargo test --locked -p microsandbox-runtime --lib -- test_host_directory_mount_replies_expire_at_once test_bind_rootfs_backend_exposes_host_file_and_init
