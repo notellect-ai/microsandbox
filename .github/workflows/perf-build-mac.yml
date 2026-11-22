@@ -1,0 +1,53 @@
+name: perf measurement build msb (macOS aarch64)
+on:
+  push:
+    branches: ["perf/mac-**"]
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUST_TOOLCHAIN: "1.100.0"
+jobs:
+  agentd:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and musl
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target aarch64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Build agentd
+        run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target aarch64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentd-aarch64
+          path: target/aarch64-unknown-linux-musl/release/agentd
+          if-no-files-found: error
+          compression-level: 0
+  msb:
+    needs: agentd
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}/agentd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentd-aarch64
+          path: agentd
+      - name: Build msb
+        run: |
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli --bin msb
+          mkdir -p dist && cp target/release/msb dist/msb
+          codesign --entitlements msb-entitlements.plist --force -s - dist/msb
+          echo "$(git rev-parse HEAD) (${GITHUB_REF_NAME} measurement build)" > dist/source-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msb-darwin-aarch64-perf
+          path: dist/
+          if-no-files-found: error
