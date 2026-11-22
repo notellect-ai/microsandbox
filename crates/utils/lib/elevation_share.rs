@@ -101,7 +101,7 @@ impl SharedSecurity {
     pub fn attributes(&self) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: self.descriptor,
+            lpSecurityDescriptor: null_mut(),
             bInheritHandle: 0,
         }
     }
