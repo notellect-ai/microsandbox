@@ -306,6 +306,8 @@ impl LocalContext {
 
         // Resolve the already-layered runtime paths as one compatible pair before launch.
         let global = self.config();
+        // Decided once, so the capability check and the launch agree.
+        let share_elevated_sandboxes = global.share_elevated_sandboxes();
         #[cfg(feature = "embed-binaries")]
         let resolved_runtime = crate::setup::ensure_runtime(
             global,
@@ -339,6 +341,11 @@ impl LocalContext {
         launch_contract::validate_exec_limits(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_fs_state_limit(&resolved_runtime.msb_path, global).await?;
+        launch_contract::validate_share_elevated_sandboxes(
+            &resolved_runtime.msb_path,
+            share_elevated_sandboxes,
+        )
+        .await?;
 
         #[cfg(feature = "net")]
         launch_contract::validate_multi_tenant_config(&resolved_runtime.msb_path, config, global)
@@ -573,6 +580,7 @@ impl LocalContext {
             None,
             #[cfg(windows)]
             startup_pipe_name,
+            share_elevated_sandboxes,
         );
         tracing::debug!(
             per_disk_limit_bytes = ?writeback_limit_bytes,
@@ -2246,6 +2254,7 @@ fn machine_cli_args(
     parent_watch_fd: Option<i32>,
     startup_fd: Option<i32>,
     startup_pipe: Option<&OsStr>,
+    share_elevated_sandboxes: bool,
 ) -> (Vec<OsString>, LaunchConfig) {
     // `visible` stays on the process argv: a small set of operator-readable
     // labels (name, id, sizing, fds) so the sandbox is identifiable in `ps`
@@ -2326,6 +2335,7 @@ fn machine_cli_args(
         nested_virt: config.spec.resources.nested_virt,
         guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
         fs_state_limit_bytes: local.config().fs_state_limit_override(),
+        share_elevated_sandboxes,
         memory_cache_dir: Some(local.cache_dir().join("memory")),
         startup: startup_command(config),
         lifecycle: Lifecycle {
@@ -2837,7 +2847,9 @@ mod tests {
         volume::VolumeKind,
     };
     use crate::{
-        SandboxConfigPatch, config::layers::BackendConfig, context::ContextSelectionSource,
+        SandboxConfigPatch,
+        config::{GlobalConfigPatch, layers::BackendConfig},
+        context::ContextSelectionSource,
     };
 
     #[test]
@@ -3526,8 +3538,13 @@ mod tests {
     /// Use isolated configuration for pure `machine_cli_args` rendering tests.
     /// The database remains unopened.
     fn test_local_backend() -> LocalContext {
+        test_local_backend_with(Default::default())
+    }
+
+    /// [`test_local_backend`] with user settings `defaults`.
+    fn test_local_backend_with(defaults: GlobalConfigPatch) -> LocalContext {
         LocalContext::from_backend_config(
-            BackendConfig::new(Default::default(), Default::default())
+            BackendConfig::new(defaults, Default::default())
                 .prepare_for_local_backend(Default::default())
                 .unwrap(),
             ContextSelectionSource::Programmatic,
@@ -3553,9 +3570,17 @@ mod tests {
 
     /// Return the typed launch payload generated for a sandbox configuration.
     fn render_launch(config: &SandboxConfig) -> LaunchConfig {
-        let local = test_local_backend();
+        render_launch_on(&test_local_backend(), config, false)
+    }
+
+    /// [`render_launch`] on the backend `local`.
+    fn render_launch_on(
+        local: &LocalContext,
+        config: &SandboxConfig,
+        share_elevated_sandboxes: bool,
+    ) -> LaunchConfig {
         let (_, launch) = machine_cli_args(
-            &local,
+            local,
             config,
             42,
             #[cfg(feature = "net")]
@@ -3574,6 +3599,7 @@ mod tests {
             None,
             None,
             None,
+            share_elevated_sandboxes,
         );
         launch
     }
@@ -3824,6 +3850,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         visible
             .into_iter()
@@ -3867,6 +3894,34 @@ mod tests {
         assert_eq!(render_launch(&config).sandbox_slot, 1);
     }
 
+    /// The launch carries the opt-in exactly when the setting is on and the launcher is the
+    /// elevated half of a split token. The launcher's elevation is injected, since GitHub's
+    /// runners are not split tokens.
+    #[tokio::test]
+    async fn launch_carries_the_elevated_sandbox_sharing_opt_in() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+        let opted_in: GlobalConfigPatch =
+            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
+        let opted_in = test_local_backend_with(opted_in);
+        let default = test_local_backend();
+
+        for (local, opt_in) in [(&default, false), (&opted_in, true)] {
+            for elevated in [false, true] {
+                let share = local.config().share_elevated_sandboxes_as(elevated);
+                let launch = render_launch_on(local, &config, share);
+                assert_eq!(
+                    launch.share_elevated_sandboxes,
+                    opt_in && elevated,
+                    "opt_in={opt_in} elevated launcher={elevated}"
+                );
+            }
+        }
+    }
+
     /// Render only the `visible` argv (what shows up in `ps`).
     fn render_visible_args(config: &SandboxConfig) -> Vec<String> {
         let local = test_local_backend();
@@ -3890,6 +3945,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         visible
             .into_iter()
@@ -3922,6 +3978,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         visible
             .into_iter()
@@ -4008,6 +4065,7 @@ mod tests {
             None,
             Some(microsandbox_runtime::vm::STARTUP_FD),
             None,
+            false,
         );
 
         // The startup fd is an operator-visible label, so it stays on argv.
@@ -4089,6 +4147,7 @@ mod tests {
             None,
             None,
             Some(OsStr::new(r"\\.\pipe\msb-startup-test")),
+            false,
         );
 
         assert!(visible.windows(2).any(|pair| pair
