@@ -434,6 +434,7 @@ fn main() {
                     exec_limits: true,
                     multi_tenant: cfg!(feature = "net"),
                     share_elevated_sandboxes: cfg!(windows),
+                    directory_mount_cache: true,
                 })
                 .expect("serialize capabilities");
             capabilities["deferred_command_bindings"] = true.into();

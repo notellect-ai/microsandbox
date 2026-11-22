@@ -60,6 +60,9 @@ pub struct SavedMountOptions {
         deserialize_with = "deserialize_present"
     )]
     pub override_gid: Option<u32>,
+    /// Guest entry/attribute caching for a host directory bind; omitted when off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache: bool,
 }
 
 /// Backing kind observed for a bind root; do not infer it from a source filename suffix.
@@ -237,6 +240,7 @@ impl From<&MountOptions> for SavedMountOptions {
             nodev,
             override_uid,
             override_gid,
+            cache,
         } = value;
         Self {
             readonly: *readonly,
@@ -245,6 +249,7 @@ impl From<&MountOptions> for SavedMountOptions {
             nodev: *nodev,
             override_uid: *override_uid,
             override_gid: *override_gid,
+            cache: *cache,
         }
     }
 }
@@ -258,6 +263,7 @@ impl From<SavedMountOptions> for MountOptions {
             nodev: value.nodev,
             override_uid: value.override_uid,
             override_gid: value.override_gid,
+            cache: value.cache,
         }
     }
 }

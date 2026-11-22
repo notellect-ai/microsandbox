@@ -197,6 +197,7 @@ impl SavedStorageConfig {
         for volume in &owned {
             validate_guest(&volume.mount.guest)?;
             let options = SavedMountOptions::from(&volume.mount.options);
+            validate_no_cache(&options)?;
             match volume.mount.storage {
                 OwnedVolumeStorage::Directory { .. } => validate_directory(
                     &options,
@@ -282,6 +283,7 @@ fn validate_mount(mount: &SavedMount) -> SnapshotManifestResult<()> {
             ..
         } => match storage {
             OwnedVolumeStorage::Directory { .. } => {
+                validate_no_cache(options)?;
                 validate_directory(options, *stat_virtualization, *host_permissions)?
             }
             OwnedVolumeStorage::Disk { capacity_mib } => {
@@ -323,6 +325,7 @@ fn validate_mount(mount: &SavedMount) -> SnapshotManifestResult<()> {
             ..
         } => {
             binding(&reference.id, "active.storage.mounts.binding")?;
+            validate_no_cache(options)?;
             match storage {
                 SavedNamedStorage::Directory { .. } => {
                     validate_directory(options, *stat_virtualization, *host_permissions)?
@@ -389,7 +392,20 @@ fn validate_directory(
     Ok(())
 }
 
+/// Entry/attribute caching is a host directory bind policy only.
+fn validate_no_cache(options: &SavedMountOptions) -> SnapshotManifestResult<()> {
+    if options.cache {
+        return invalid(
+            "SCFG_VALUE",
+            "active.storage.mounts.options",
+            "entry and attribute caching is only valid for bind mounts",
+        );
+    }
+    Ok(())
+}
+
 fn validate_non_virtiofs(options: &SavedMountOptions) -> SnapshotManifestResult<()> {
+    validate_no_cache(options)?;
     if options.override_uid.is_some() || options.override_gid.is_some() {
         return invalid(
             "SCFG_VALUE",

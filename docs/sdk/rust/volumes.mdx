@@ -1375,6 +1375,22 @@ let sb = Sandbox::builder("worker")
     .await?;
 ```
 
+#### <span className="msb-recv">mount.</span><span className="msb-hn">cache()</span>
+
+```rust
+fn cache(self, enabled: bool) -> Self
+```
+
+Let the guest cache directory entries and attributes for this bind mount. Off by default, so Host edits are visible at once. Turn it on only for host directories that do not change while the sandbox runs; otherwise the guest may see stale names and sizes for up to about five seconds. Valid only for bind mounts (no effect on single-file binds); other mount kinds are rejected, and a runtime without support refuses the launch with an upgrade-required error.
+
+```rust
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .volume("/projection", |mount| mount.bind("./projection").readonly().cache(true))
+    .create()
+    .await?;
+```
+
 #### <span className="msb-recv">mount.</span><span className="msb-hn">size()</span>
 
 <a id="mb-size"></a>
@@ -1646,6 +1662,7 @@ Guest mount behavior shared by every mount kind. Set via the [`MountBuilder`](#m
 | `nodev` | `bool` | Device files on the mount are ignored |
 | `override_uid` | `Option<u32>` | Guest uid fallback for host files without a per-file override; set together with `override_gid` via [`MountBuilder::owner()`](#mount-owner) |
 | `override_gid` | `Option<u32>` | Guest gid fallback for host files without a per-file override; set together with `override_uid` via [`MountBuilder::owner()`](#mount-owner) |
+| `cache` | `bool` | Guest entry/attribute caching for a bind mount whose host tree does not change while mounted; set via [`MountBuilder::cache()`](#mount-cache) |
 
 ### StatVirtualization
 

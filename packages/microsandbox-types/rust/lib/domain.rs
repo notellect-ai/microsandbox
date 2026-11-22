@@ -294,6 +294,17 @@ pub struct MountOptions {
     /// must be set together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub override_gid: Option<u32>,
+
+    /// Whether the guest may cache directory entries and attributes for this
+    /// host directory bind mount.
+    ///
+    /// Off by default: the guest revalidates every lookup, so Host edits
+    /// (including atomic replacement of a file or folder) are visible at once.
+    /// Turn it on only for host trees that do not change while mounted; otherwise
+    /// the guest may see stale names and sizes for a few seconds. Valid only for
+    /// bind mounts; it has no effect on single-file bind mounts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache: bool,
 }
 
 /// Storage kind for a named volume.
@@ -3459,6 +3470,22 @@ mod tests {
         let decoded: MountOptions = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.override_uid, None);
         assert_eq!(decoded.override_gid, None);
+    }
+
+    #[test]
+    fn mount_options_omit_cache_when_off_and_round_trip_it_when_on() {
+        let value = serde_json::to_value(MountOptions::default()).unwrap();
+        assert!(value.get("cache").is_none());
+
+        let options = MountOptions {
+            cache: true,
+            ..MountOptions::default()
+        };
+        let value = serde_json::to_value(options).unwrap();
+        assert_eq!(value["cache"], true);
+
+        let decoded: MountOptions = serde_json::from_value(value).unwrap();
+        assert!(decoded.cache);
     }
 
     #[test]

@@ -748,6 +748,7 @@ struct CliMountOptions {
     format: Option<DiskImageFormat>,
     override_uid: Option<u32>,
     override_gid: Option<u32>,
+    cache: bool,
 }
 
 /// Which keyed options are valid for a public CLI mount flag.
@@ -760,6 +761,8 @@ struct CliMountOptionSupport {
     fstype: bool,
     format: bool,
     owner: bool,
+    /// `cache=on|off`: host directory bind mounts only.
+    cache: bool,
 }
 
 /// Parsed `SOURCE:DEST[:OPTIONS]` mount specification.
@@ -1990,7 +1993,7 @@ fn validate_guest_path(context: &str, path: &str) -> anyhow::Result<()> {
 
 /// Parse a volume spec and apply it to the builder.
 ///
-/// Accepts: `SRC:DST[:ro|rw][,noexec][,nosuid][,nodev][,follow-root-symlinks][,stat-virt=...][,host-perms=...][,uid=...,gid=...]`.
+/// Accepts: `SRC:DST[:ro|rw][,noexec][,nosuid][,nodev][,follow-root-symlinks][,stat-virt=...][,host-perms=...][,uid=...,gid=...][,cache=on|off]` (`cache` for host paths only).
 pub fn apply_volume(builder: SandboxBuilder, spec: &str) -> anyhow::Result<SandboxBuilder> {
     if builder.is_snapshot_launch() {
         let (guest, mount) = parse_restore_volume(spec)?;
@@ -1998,6 +2001,7 @@ pub fn apply_volume(builder: SandboxBuilder, spec: &str) -> anyhow::Result<Sandb
     }
     let parsed = parse_volume_mount_spec(spec)?;
     let is_path = microsandbox_utils::looks_like_local_path_text(parsed.source);
+    reject_named_volume_cache(is_path, &parsed.options)?;
     let source = parsed.source.to_string();
     let guest = parsed.guest.to_string();
     let options = parsed.options;
@@ -2017,6 +2021,7 @@ pub(crate) fn parse_restore_volume(spec: &str) -> anyhow::Result<(String, MountB
     let parsed = parse_volume_mount_spec(spec)?;
     let guest = parsed.guest.to_string();
     let is_path = microsandbox_utils::looks_like_local_path_text(parsed.source);
+    reject_named_volume_cache(is_path, &parsed.options)?;
     let mount = configure_volume_mount(
         MountBuilder::new(&guest),
         parsed.source,
@@ -2052,9 +2057,18 @@ fn parse_volume_mount_spec(spec: &str) -> anyhow::Result<ParsedCliMountSpec<'_>>
             policies: true,
             quota: true,
             owner: true,
+            cache: true,
             ..CliMountOptionSupport::default()
         },
     )
+}
+
+/// `cache` parses for every `-v` spec but applies only when the source is a host path.
+fn reject_named_volume_cache(is_path: bool, options: &CliMountOptions) -> anyhow::Result<()> {
+    if options.cache && !is_path {
+        anyhow::bail!("mount option `cache` is only valid for host directory mounts");
+    }
+    Ok(())
 }
 
 /// Apply a parsed generic volume source and its common options to a mount.
@@ -2122,6 +2136,7 @@ pub fn apply_explicit_dir_mount(
             policies: true,
             quota: true,
             owner: true,
+            cache: true,
             ..CliMountOptionSupport::default()
         },
     )?;
@@ -2353,6 +2368,9 @@ fn apply_common_mount_options(mut mount: MountBuilder, options: CliMountOptions)
     if let (Some(uid), Some(gid)) = (options.override_uid, options.override_gid) {
         mount = mount.owner(uid, gid);
     }
+    if options.cache {
+        mount = mount.cache(true);
+    }
     mount
 }
 
@@ -2454,6 +2472,7 @@ fn parse_cli_mount_options(
     let mut seen_format = false;
     let mut seen_uid = false;
     let mut seen_gid = false;
+    let mut seen_cache = false;
 
     let Some(opts) = opts else {
         return Ok(parsed);
@@ -2599,8 +2618,19 @@ fn parse_cli_mount_options(
                             anyhow::anyhow!("invalid gid {value:?} (expected an unsigned integer)")
                         })?);
                     }
+                    "cache" if support.cache => {
+                        if seen_cache {
+                            anyhow::bail!("mount option `cache` specified more than once");
+                        }
+                        seen_cache = true;
+                        parsed.cache = match value {
+                            "on" => true,
+                            "off" => false,
+                            other => anyhow::bail!("invalid cache {other:?} (expected on|off)"),
+                        };
+                    }
                     "stat-virt" | "host-perms" | "size" | "quota" | "kind" | "fstype"
-                    | "format" | "uid" | "gid" => {
+                    | "format" | "uid" | "gid" | "cache" => {
                         anyhow::bail!("mount option `{key}` is not valid here");
                     }
                     other => anyhow::bail!("unknown mount option {other:?}"),
@@ -4990,6 +5020,77 @@ mod tests {
             }
             other => panic!("expected Bind, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_dir_mount_cache() {
+        let dir = make_temp_dir("msb-mount-dir-cache");
+        for (opts, expected) in [("ro,cache=on", true), ("cache=off", false), ("ro", false)] {
+            let spec = format!("{}:/proj:{opts}", dir.display());
+            match build_explicit(&spec, apply_explicit_dir_mount).await {
+                VolumeMount::Bind { options, .. } => assert_eq!(options.cache, expected, "{opts}"),
+                other => panic!("expected Bind, got {other:?}"),
+            }
+        }
+        let spec = format!("{}:/proj:cache=on,cache=on", dir.display());
+        let err = validate_mount_dir_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("`cache` specified more than once"), "{err}");
+        let spec = format!("{}:/proj:cache=yes", dir.display());
+        let err = validate_mount_dir_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("invalid cache"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_volume_and_restore_bind_accept_cache() {
+        let dir = make_temp_dir("msb-volume-cache");
+        let spec = format!("{}:/proj:cache=on", dir.display());
+        match build_volume(&spec).await {
+            VolumeMount::Bind { options, .. } => assert!(options.cache),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+        let (_, mount) = parse_restore_volume(&spec).unwrap();
+        match mount.build().unwrap() {
+            VolumeMount::Bind { options, .. } => assert!(options.cache),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cache_rejected_where_not_valid() {
+        let file =
+            std::env::temp_dir().join(format!("msb-mount-file-cache-{}.txt", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let cases = [
+            validate_mount_file_spec(&format!("{}:/f.txt:cache=on", file.display())),
+            validate_mount_disk_spec("/host/disk.raw:/disk:cache=on"),
+            validate_mount_named_spec("cache-vol:/named:cache=on"),
+            validate_mount_owned_spec("/owned:cache=on"),
+        ];
+        for result in cases {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("mount option `cache` is not valid here"),
+                "{err}"
+            );
+        }
+
+        // `-v` parses cache for every source but a named volume cannot use it.
+        let err = validate_volume_spec("cache-vol:/named:cache=on")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("only valid for host directory mounts"),
+            "{err}"
+        );
+        let err = parse_restore_volume("cache-vol:/named:cache=on")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("only valid for host directory mounts"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]

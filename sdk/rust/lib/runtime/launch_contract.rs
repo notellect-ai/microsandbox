@@ -606,9 +606,12 @@ impl LaunchContract {
                 | VolumeMount::Tmpfs { options, .. }
                 | VolumeMount::DiskImage { options, .. } => (options, false),
             };
+            // No v0.6.x runtime parses `cache=`; machine runtimes advertise it
+            // separately (see `validate_mount_cache`).
             if (self.patch < 7 && follow_root_symlinks)
                 || (self.patch < 15
                     && (options.override_uid.is_some() || options.override_gid.is_some()))
+                || options.cache
             {
                 return Err(MicrosandboxError::Runtime(
                     "mount options require a newer runtime launch contract".into(),
@@ -728,6 +731,7 @@ pub(crate) async fn validate_runtime_config(
         .await?;
     validate_exec_limits(&runtime.msb_path, config).await?;
     validate_guest_clock(&runtime.msb_path, config).await?;
+    validate_mount_cache(&runtime.msb_path, config).await?;
     validate_fs_state_limit(&runtime.msb_path, global).await?;
     // Every launch is prepared through here first, so this is the one capability check for
     // the decision the launch renderer makes from the same setting and token.
@@ -956,6 +960,37 @@ pub(crate) async fn validate_guest_clock(
         ));
     }
     Ok(())
+}
+
+/// Probe directory mount caching support only when a mount turns it on. Runtimes that
+/// predate the capability reject `cache=` as an unknown mount option when the VM is built.
+pub(crate) async fn validate_mount_cache(
+    path: &Path,
+    config: &SandboxConfig,
+) -> MicrosandboxResult<()> {
+    if !config.spec.mounts.iter().any(mount_requests_cache) {
+        return Ok(());
+    }
+    let supported = capabilities(path).await.ok().is_some_and(|capabilities| {
+        capabilities.protocols.contains(&2) && capabilities.directory_mount_cache
+    });
+    if !supported {
+        return Err(MicrosandboxError::unsupported(
+            crate::error::Operation::SandboxStart,
+            crate::error::UnsupportedReason::NotAvailable(upgrade_required("mount option cache")),
+        ));
+    }
+    Ok(())
+}
+
+fn mount_requests_cache(mount: &VolumeMount) -> bool {
+    match mount {
+        VolumeMount::Bind { options, .. }
+        | VolumeMount::Named { options, .. }
+        | VolumeMount::Owned { options, .. }
+        | VolumeMount::Tmpfs { options, .. }
+        | VolumeMount::DiskImage { options, .. } => options.cache,
+    }
 }
 
 /// Probe operator resolver support only when a multi-tenant sandbox would send them.
@@ -2012,6 +2047,81 @@ mod tests {
             r#"printf '%s' '{"protocols":[2,1],"guest_clock":true}'"#,
         );
         validate_guest_clock(&path, &config).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    fn cache_bind(cache: bool) -> VolumeMount {
+        VolumeMount::Bind {
+            host: PathBuf::from("/tmp"),
+            guest: "/proj".into(),
+            options: microsandbox_types::MountOptions {
+                cache,
+                ..Default::default()
+            },
+            stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+            host_permissions: microsandbox_types::HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mount_cache_requires_an_explicit_runtime_capability() {
+        let _fixture_guard = PROBE_FIXTURES.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::fixtures::decode(include_str!(
+            "../db/fixtures/config-0.6.18.json"
+        ))
+        .unwrap();
+        // Without a caching mount there is nothing to probe, even on an old runtime.
+        config.spec.mounts.push(cache_bind(false));
+        validate_mount_cache(&dir.path().join("no-probe"), &config)
+            .await
+            .unwrap();
+        config.spec.mounts.push(cache_bind(true));
+        for response in [
+            "exit 1",
+            r#"printf '%s' '{"protocols":[2,1],"guest_clock":true}'"#,
+            r#"printf '%s' '{"protocols":[2,1],"directory_mount_cache":false}'"#,
+            r#"printf '%s' '{"protocols":[2,1],"directory_mount_cache":"true"}'"#,
+            r#"printf '%s' '{"protocols":[1],"directory_mount_cache":true}'"#,
+        ] {
+            let path = script(dir.path(), "unsupported-cache", response);
+            let error = validate_mount_cache(&path, &config).await.unwrap_err();
+            assert!(matches!(error, MicrosandboxError::Unsupported { .. }));
+            assert!(error.to_string().contains("mount option cache"));
+        }
+        let path = script(
+            dir.path(),
+            "supports-cache",
+            r#"printf '%s' '{"protocols":[2,1],"directory_mount_cache":true}'"#,
+        );
+        validate_mount_cache(&path, &config).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_launch_contracts_refuse_mount_cache() {
+        let mut config = crate::test_support::fixtures::decode(include_str!(
+            "../db/fixtures/config-0.6.18.json"
+        ))
+        .unwrap();
+        let legacy = LaunchContract {
+            patch: 18,
+            machine: false,
+            header_fields: false,
+        };
+        config.spec.mounts.push(cache_bind(false));
+        legacy.validate_launch_intent(&config).unwrap();
+        config.spec.mounts.push(cache_bind(true));
+        assert!(
+            legacy
+                .validate_launch_intent(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("mount options require a newer runtime launch contract")
+        );
     }
 
     #[cfg(all(unix, feature = "net"))]

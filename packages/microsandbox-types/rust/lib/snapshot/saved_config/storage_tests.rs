@@ -133,6 +133,60 @@ fn directory_owner_and_literal_metadata_constraints_match_existing_mount_rules()
 }
 
 #[test]
+fn bind_cache_round_trips_and_is_omitted_when_off() {
+    let mut mount = bind("/data", "data");
+    let input = json!({"mounts":saved(json!([mount.clone()]))});
+    let encoded = serde_json::to_value(parse(&input)).unwrap();
+    assert!(
+        encoded["mounts"]["value"][0]["options"]
+            .get("cache")
+            .is_none()
+    );
+
+    mount["options"]["cache"] = json!(true);
+    let input = json!({"mounts":saved(json!([mount]))});
+    let config = parse(&input);
+    assert_eq!(serde_json::to_value(&config).unwrap(), input);
+
+    let Some(SavedMount::Bind { options, .. }) = config
+        .mounts
+        .as_ref()
+        .and_then(SavedValue::value)
+        .and_then(|mounts| mounts.first())
+    else {
+        panic!("expected a saved bind mount");
+    };
+    assert!(MountOptions::from(*options).cache);
+
+    let source = MountOptions {
+        cache: true,
+        ..MountOptions::default()
+    };
+    assert!(SavedMountOptions::from(&source).cache);
+}
+
+#[test]
+fn cache_is_rejected_on_every_saved_mount_except_bind() {
+    for mut mount in [
+        named("/named", "volume"),
+        disk("/disk", "block"),
+        tmpfs("/tmp"),
+        requested_owned("/future"),
+    ] {
+        let pending = mount["kind"] == "requested_owned";
+        mount["options"]["cache"] = json!(true);
+        let mut inventory = saved(json!([mount]));
+        if pending {
+            inventory["origin"] = json!("configured");
+        }
+        reject(
+            &json!({"mounts":inventory}),
+            "caching is only valid for bind mounts",
+        );
+    }
+}
+
+#[test]
 fn block_and_tmpfs_mounts_cannot_apply_filesystem_overlay_ownership() {
     for mut mount in [
         disk("/disk", "block"),

@@ -339,6 +339,7 @@ impl LocalContext {
         };
         launch_contract::validate_exec_limits(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
+        launch_contract::validate_mount_cache(&resolved_runtime.msb_path, config).await?;
         launch_contract::validate_fs_state_limit(&resolved_runtime.msb_path, global).await?;
 
         #[cfg(feature = "net")]
@@ -2069,6 +2070,7 @@ fn push_dir_mount_arg_with_tag(
         follow_root_symlinks,
         options.override_uid,
         options.override_gid,
+        options.cache,
     );
     if let Some(mib) = quota_mib {
         opts.push(format!("quota={mib}"));
@@ -2103,6 +2105,7 @@ fn push_file_mount_arg(
         false,
         options.override_uid,
         options.override_gid,
+        options.cache,
     );
     opts.push(format!("quota={quota_mib}"));
     append_option_block(&mut arg, opts);
@@ -2190,6 +2193,7 @@ fn append_policy_options(
     follow_root_symlinks: bool,
     override_uid: Option<u32>,
     override_gid: Option<u32>,
+    cache: bool,
 ) {
     match stat_virtualization {
         StatVirtualization::Strict => {}
@@ -2216,6 +2220,13 @@ fn append_policy_options(
     }
     if let Some(gid) = override_gid {
         opts.push(format!("gid={gid}"));
+    }
+    // Guest entry/attribute caching is likewise a host-side FUSE reply policy:
+    // runtime `--mount` arg only, never the guest mount specs. Off is the
+    // runtime default, so it is never rendered. Single-file shares accept and
+    // ignore it (they always reply with zero timeouts).
+    if cache {
+        opts.push("cache=on".to_string());
     }
 }
 
@@ -5077,6 +5088,57 @@ mod tests {
         assert!(
             !dir_mounts.contains("uid=") && !dir_mounts.contains("gid="),
             "guest MSB_DIR_MOUNTS must not carry uid/gid, got {dir_mounts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_machine_cli_args_bind_mount_cache_host_only() {
+        // Entry/attribute caching is a host-side FUSE reply policy: it rides the
+        // `--mount` arg only and never reaches the guest mount specs, where
+        // agentd would reject it as unknown.
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/proj", |m| m.bind("/host/proj").readonly().cache(true))
+            .volume("/live", |m| m.bind("/host/live"))
+            .build()
+            .await
+            .unwrap();
+        let rendered = render_args(&config);
+        let mount_arg = |guest: &str, host: &str| {
+            let tag = super::guest_mount_tag(guest);
+            rendered
+                .windows(2)
+                .find(|p| p[0] == "--mount" && p[1].starts_with(&format!("{tag}:{host}")))
+                .map(|p| p[1].clone())
+                .unwrap_or_default()
+        };
+
+        let proj = mount_arg("/proj", "/host/proj");
+        assert!(
+            proj.split(':')
+                .nth(2)
+                .is_some_and(|opts| opts.split(',').any(|o| o == "cache=on")),
+            "host --mount arg must carry cache=on, got {proj:?}"
+        );
+        let live = mount_arg("/live", "/host/live");
+        assert!(
+            !live.is_empty() && !live.contains("cache"),
+            "an uncached mount must keep the runtime default, got {live:?}"
+        );
+
+        let dir_mounts = rendered
+            .iter()
+            .find(|a| a.starts_with("MSB_DIR_MOUNTS="))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !dir_mounts.is_empty() && !dir_mounts.contains("cache"),
+            "guest MSB_DIR_MOUNTS must not carry cache, got {dir_mounts:?}"
+        );
+        let bootstrap = serde_json::to_string(&super::guest_bootstrap(&config)).unwrap();
+        assert!(
+            !bootstrap.contains("cache"),
+            "guest bootstrap must not carry cache, got {bootstrap}"
         );
     }
 

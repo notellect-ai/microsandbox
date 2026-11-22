@@ -132,6 +132,11 @@ pub struct LaunchCapabilities {
     /// Older runtimes omit this capability and reject the field.
     #[serde(default)]
     pub share_elevated_sandboxes: bool,
+
+    /// Directory `--mount` specs accept `cache=on|off`. Older runtimes omit this
+    /// capability and reject the option as unknown when the VM is built.
+    #[serde(default)]
+    pub directory_mount_cache: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.
