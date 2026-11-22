@@ -10,7 +10,7 @@ use std::{
     io::Read as _,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -46,6 +46,7 @@ static CONTRACTS: LazyLock<Mutex<HashMap<PathBuf, CachedContract>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CAPABILITIES: LazyLock<Mutex<HashMap<PathBuf, CachedCapabilities>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static OWN_RUNTIME: OnceLock<OwnRuntime> = OnceLock::new();
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_VERSION_OUTPUT: u64 = 4096;
 
@@ -83,6 +84,15 @@ struct CachedContract {
 struct CachedCapabilities {
     identity: FileIdentity,
     capabilities: Arc<LaunchCapabilities>,
+    _file: File,
+}
+
+/// The running executable, captured at registration: launch checks of a
+/// runtime that is this very file read its advertisement in-process.
+struct OwnRuntime {
+    path: PathBuf,
+    identity: FileIdentity,
+    advertise: fn() -> LaunchCapabilities,
     _file: File,
 }
 
@@ -1101,6 +1111,24 @@ pub(crate) async fn require_storage_reader(path: &Path) -> MicrosandboxResult<()
     .await
 }
 
+/// Register the running executable's launch advertisement. A launch check of
+/// a runtime that is this same file (same canonical path and identity as now)
+/// is then answered without spawning `msb __launch-protocol`. The identity is
+/// captured here, so a file replaced afterwards is probed as usual. Only the
+/// first registration counts.
+pub fn register_own_runtime(advertise: fn() -> LaunchCapabilities) -> std::io::Result<()> {
+    let path = std::fs::canonicalize(std::env::current_exe()?)?;
+    let file = File::open(&path)?;
+    let identity = FileIdentity::capture(&file)?;
+    let _ = OWN_RUNTIME.set(OwnRuntime {
+        path,
+        identity,
+        advertise,
+        _file: file,
+    });
+    Ok(())
+}
+
 // Cache successful discovery for unchanged native executables. Wrappers can
 // switch their target without changing identity.
 async fn capabilities(path: &Path) -> MicrosandboxResult<Arc<LaunchCapabilities>> {
@@ -1120,16 +1148,24 @@ async fn capabilities(path: &Path) -> MicrosandboxResult<Arc<LaunchCapabilities>
             return Ok(entry.capabilities.clone());
         }
     }
-    let capabilities = Arc::new(serde_json::from_slice::<LaunchCapabilities>(
-        &bounded_probe(&path, "__launch-protocol").await?,
-    )?);
-    if FileIdentity::capture(&File::open(&path)?)? != identity
-        || FileIdentity::capture(&file)? != identity
+    let capabilities = if let Some(own) = OWN_RUNTIME
+        .get()
+        .filter(|own| own.path == path && own.identity == identity)
     {
-        return Err(MicrosandboxError::Runtime(
-            "runtime executable changed during capability discovery".into(),
-        ));
-    }
+        Arc::new((own.advertise)())
+    } else {
+        let capabilities = Arc::new(serde_json::from_slice::<LaunchCapabilities>(
+            &bounded_probe(&path, "__launch-protocol").await?,
+        )?);
+        if FileIdentity::capture(&File::open(&path)?)? != identity
+            || FileIdentity::capture(&file)? != identity
+        {
+            return Err(MicrosandboxError::Runtime(
+                "runtime executable changed during capability discovery".into(),
+            ));
+        }
+        capabilities
+    };
     let mut cached = CAPABILITIES.lock().await;
     if cached.len() >= 64 {
         cached.clear();
@@ -2306,6 +2342,87 @@ mod tests {
         std::fs::write(&path, b"still not an executable, but longer").unwrap();
         let error = require_protected_guest_state(&path).await.unwrap_err();
         assert!(error.to_string().contains("Probe failed"), "{error}");
+    }
+
+    fn all_capabilities() -> LaunchCapabilities {
+        serde_json::from_value(serde_json::json!({
+            "protocols": [2, 1],
+            "protected_guest_state": true,
+            "storage_reader": true,
+            "required_restore_backing": true,
+            "tcp_accept_queue_size": true,
+            "http_deny_message": true,
+            "http_deny_json": true,
+            "guest_clock": true,
+            "fs_state_limit": true,
+            "configuration_retention": true,
+            "multi_tenant": true,
+            "share_elevated_sandboxes": true,
+            "deferred_command_bindings": true,
+            "restored_exec_limits": true,
+        }))
+        .unwrap()
+    }
+
+    /// The test binary stands in for msb: run with `__launch-protocol` it
+    /// prints libtest output, not an advertisement, so any probe of it fails
+    /// the check that made it.
+    #[tokio::test]
+    async fn launch_checks_of_the_registered_running_executable_never_probe() {
+        register_own_runtime(all_capabilities).unwrap();
+        let own = std::env::current_exe().unwrap();
+
+        let mut probed = Vec::new();
+        let mut check = |name: &'static str, ok: bool| {
+            if !ok {
+                probed.push(name);
+            }
+        };
+        check(
+            "require_protected_guest_state",
+            require_protected_guest_state(&own).await.is_ok(),
+        );
+        check(
+            "require_storage_reader",
+            require_storage_reader(&own).await.is_ok(),
+        );
+        check(
+            "require_restore_backing",
+            require_restore_backing(&own).await.is_ok(),
+        );
+        check(
+            "supports_configuration_retention",
+            supports_configuration_retention(&own).await,
+        );
+        let mut config = SandboxConfig::default();
+        config.spec.runtime.guest_clock = Some(microsandbox_types::GuestClockPolicy::Off);
+        check(
+            "validate_guest_clock",
+            validate_guest_clock(&own, &config).await.is_ok(),
+        );
+        let mut global = GlobalConfig::default();
+        global.snapshots.max_filesystem_state_mib = 64;
+        check(
+            "validate_fs_state_limit",
+            validate_fs_state_limit(&own, &global).await.is_ok(),
+        );
+        check(
+            "validate_share_elevated_sandboxes",
+            validate_share_elevated_sandboxes(&own, true).await.is_ok(),
+        );
+        check(
+            "require_restore_guard",
+            capabilities(&own)
+                .await
+                .is_ok_and(|caps| require_restore_guard(&caps, true, true).is_ok()),
+        );
+        assert!(probed.is_empty(), "checks that probed: {probed:?}");
+
+        // A byte-identical copy at another path is another runtime: probed.
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join(own.file_name().unwrap());
+        std::fs::copy(&own, &copy).unwrap();
+        assert!(require_protected_guest_state(&copy).await.is_err());
     }
 
     #[test]

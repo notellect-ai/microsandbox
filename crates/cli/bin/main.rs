@@ -413,31 +413,7 @@ fn main() {
         }
         Commands::LaunchProtocol => {
             let capabilities =
-                serde_json::to_value(microsandbox_runtime::launch::LaunchCapabilities {
-                    storage_reader: microsandbox_filesystem::agentd::EMBEDDED_STORAGE_READER,
-                    protected_guest_state: true,
-                    header_fields: Some(cfg!(feature = "net")),
-                    protocols: vec![2, 1],
-                    required_restore_backing: true,
-                    tcp_accept_queue_size: true,
-                    max_inbound_tcp_connections: cfg!(feature = "net"),
-                    http_deny_message: cfg!(feature = "net"),
-                    http_deny_json: cfg!(feature = "net"),
-                    http_connect_proxy: cfg!(feature = "net"),
-                    http_connect_proxy_auth: cfg!(feature = "net"),
-                    guest_clock: true,
-                    fs_state_limit: true,
-                    configuration_retention: true,
-                    nested_virt: Some(
-                        microsandbox_runtime::nested_virt_supported().unwrap_or(false),
-                    ),
-                    exec_limits: true,
-                    multi_tenant: cfg!(feature = "net"),
-                    share_elevated_sandboxes: cfg!(windows),
-                    deferred_command_bindings: true,
-                    restored_exec_limits: true,
-                })
-                .expect("serialize capabilities");
+                serde_json::to_value(own_launch_capabilities()).expect("serialize capabilities");
             println!("{capabilities}");
             return;
         }
@@ -807,6 +783,33 @@ fn extract_quoted_token_str(s: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// What this executable advertises to `__launch-protocol` probes and, without
+/// a probe, to its own launch checks.
+fn own_launch_capabilities() -> microsandbox_runtime::launch::LaunchCapabilities {
+    microsandbox_runtime::launch::LaunchCapabilities {
+        storage_reader: microsandbox_filesystem::agentd::EMBEDDED_STORAGE_READER,
+        protected_guest_state: true,
+        header_fields: Some(cfg!(feature = "net")),
+        protocols: vec![2, 1],
+        required_restore_backing: true,
+        tcp_accept_queue_size: true,
+        max_inbound_tcp_connections: cfg!(feature = "net"),
+        http_deny_message: cfg!(feature = "net"),
+        http_deny_json: cfg!(feature = "net"),
+        http_connect_proxy: cfg!(feature = "net"),
+        http_connect_proxy_auth: cfg!(feature = "net"),
+        guest_clock: true,
+        fs_state_limit: true,
+        configuration_retention: true,
+        nested_virt: Some(microsandbox_runtime::nested_virt_supported().unwrap_or(false)),
+        exec_limits: true,
+        multi_tenant: cfg!(feature = "net"),
+        share_elevated_sandboxes: cfg!(windows),
+        deferred_command_bindings: true,
+        restored_exec_limits: true,
+    }
+}
+
 fn run_async_command_anyhow(
     command: Commands,
     log_level: Option<microsandbox::LogLevel>,
@@ -835,6 +838,11 @@ fn run_async_command_anyhow(
         builder
     };
     let runtime = builder.enable_all().build()?;
+    // Launch checks of this executable read its advertisement in-process. If
+    // registration fails, they probe it as before.
+    if let Err(error) = microsandbox::runtime::register_own_runtime(own_launch_capabilities) {
+        tracing::debug!(%error, "launch checks will probe the running executable");
+    }
 
     runtime.block_on(async move {
         let mut cleanup_backend = None;
