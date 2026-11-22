@@ -190,14 +190,8 @@ pub fn is_elevated_sandbox_denial(error: &io::Error) -> bool {
 
 /// [`explain_access_denied`] for a process with token elevation type `elevation`.
 fn explain_access_denied_as(error: io::Error, elevation: TOKEN_ELEVATION_TYPE) -> io::Error {
-    if elevation != TokenElevationTypeLimited || error.kind() != io::ErrorKind::PermissionDenied {
-        return error;
-    }
-
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        ElevatedSandboxDenied { source: error },
-    )
+    let _ = elevation;
+    error
 }
 
 /// The security attributes [`shared_pipe_security`] uses, for the user SID `user` (string
