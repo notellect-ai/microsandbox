@@ -1,7 +1,11 @@
 //! Existing database run rows and kernel peer credentials bind every exchange.
 
+#[cfg(windows)]
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex;
 
 use microsandbox_control_client::{
     ClientError, ControlClientError, ControlClientResult, ErrorKind, VerifiedControlConnector,
@@ -11,6 +15,8 @@ use microsandbox_db::{
     entity::{run, sandbox},
 };
 use microsandbox_protocol_client::{BoxFuture, BoxTransport};
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
@@ -20,7 +26,7 @@ use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 
 use super::super::LocalContext;
 use super::identity::{DatabaseIdentity, ProcessIdentity};
-use super::registry::RuntimeKey;
+use super::registry::{RuntimeKey, SharedError};
 use super::session::ControlSession;
 use crate::{MicrosandboxError, MicrosandboxResult};
 
@@ -35,7 +41,15 @@ struct RuntimeOwner {
     process: ProcessIdentity,
     endpoints: Vec<PathBuf>,
     allow_starting: bool,
+    #[cfg(windows)]
+    denial: PipeDenial,
 }
+
+/// The explained access denial of a control pipe open, kept for the session setup's caller:
+/// the protocol client's error keeps only the error kind, which would drop the explanation.
+#[cfg(windows)]
+#[derive(Default)]
+struct PipeDenial(Mutex<Option<io::Error>>);
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -111,6 +125,8 @@ impl LocalContext {
             process,
             endpoints,
             allow_starting,
+            #[cfg(windows)]
+            denial: PipeDenial::default(),
         });
         owner
             .verify_session(Instant::now() + std::time::Duration::from_secs(10))
@@ -118,10 +134,43 @@ impl LocalContext {
             .map_err(|error| MicrosandboxError::ControlClient(Arc::new(error)))?;
         self.inner
             .control_sessions
-            .get(key, owner)
+            .get(key, owner.clone())
             .await
             .map(Some)
-            .map_err(MicrosandboxError::ControlClient)
+            .map_err(|error| owner.setup_error(error))
+    }
+}
+
+impl RuntimeOwner {
+    /// The error a failed control session setup reports.
+    fn setup_error(&self, error: SharedError) -> MicrosandboxError {
+        #[cfg(windows)]
+        return self.denial.setup_error(error);
+        #[cfg(not(windows))]
+        MicrosandboxError::ControlClient(error)
+    }
+}
+
+#[cfg(windows)]
+impl PipeDenial {
+    /// The protocol error for a control pipe open that failed with `error`. An access denial
+    /// that [`elevation_share::explain_access_denied`] explained is kept for
+    /// [`Self::setup_error`].
+    fn refused(&self, error: io::Error) -> ClientError {
+        let client = ClientError::new(ErrorKind::Io(error.kind()));
+        if elevation_share::is_elevated_sandbox_denial(&error) {
+            *self.0.lock().unwrap() = Some(error);
+        }
+        client
+    }
+
+    /// The error a failed session setup reports: a kept denial, so its explanation reaches
+    /// the caller, otherwise `error`.
+    fn setup_error(&self, error: SharedError) -> MicrosandboxError {
+        match self.0.lock().unwrap().take() {
+            Some(denied) => MicrosandboxError::Io(denied),
+            None => MicrosandboxError::ControlClient(error),
+        }
     }
 }
 
@@ -197,7 +246,10 @@ impl VerifiedControlConnector for RuntimeOwner {
                         Err(error) if error.raw_os_error() == Some(231) => {
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await
                         }
-                        Err(error) => return Err(ClientError::from(error).into()),
+                        Err(error) => {
+                            let error = elevation_share::explain_access_denied(error);
+                            return Err(self.denial.refused(error).into());
+                        }
                     }
                 }
             }
@@ -262,4 +314,73 @@ fn database_error(_: sea_orm::DbErr) -> ControlClientError {
     // Queries can contain runtime data. The public transport error retains the
     // failure category without exposing SQL or prepared secret material.
     ClientError::new(ErrorKind::Io(std::io::ErrorKind::Other)).into()
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::io;
+    use std::sync::Arc;
+
+    use microsandbox_control_client::{ClientError, ControlClientError, ErrorKind};
+    use microsandbox_utils::elevation_share;
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows_sys::Win32::Security::{TokenElevationTypeDefault, TokenElevationTypeLimited};
+
+    use super::PipeDenial;
+    use crate::MicrosandboxError;
+
+    fn denied() -> io::Error {
+        io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+    }
+
+    fn setup_failure(client: ClientError) -> Arc<ControlClientError> {
+        Arc::new(ControlClientError::Client(client))
+    }
+
+    /// A non-elevated process refused the control pipe gets the explained denial from the
+    /// session setup, as an `io::Error` source the CLI can find, not the bare error kind the
+    /// protocol client keeps; every other failure stays the control client error.
+    #[test]
+    fn a_refused_control_pipe_reports_the_explained_denial() {
+        let denial = PipeDenial::default();
+        let explained =
+            elevation_share::explain_access_denied_as(denied(), TokenElevationTypeLimited);
+        let client = denial.refused(explained);
+        assert_eq!(client.kind, ErrorKind::Io(io::ErrorKind::PermissionDenied));
+        let error = denial.setup_error(setup_failure(client));
+        assert!(matches!(error, MicrosandboxError::Io(_)), "{error}");
+        assert!(
+            elevation_share::has_elevated_sandbox_denial(&error),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(elevation_share::ELEVATED_SANDBOX_HINT),
+            "{error}"
+        );
+
+        // Kept once: a later failure of the same owner is reported as it is.
+        let client = ClientError::new(ErrorKind::Timeout);
+        let error = denial.setup_error(setup_failure(client));
+        assert!(
+            matches!(error, MicrosandboxError::ControlClient(_)),
+            "{error}"
+        );
+
+        // Access denied that was not explained (not a non-elevated process) is not kept.
+        let unexplained =
+            elevation_share::explain_access_denied_as(denied(), TokenElevationTypeDefault);
+        let client = denial.refused(unexplained);
+        let error = denial.setup_error(setup_failure(client));
+        assert!(
+            matches!(error, MicrosandboxError::ControlClient(_)),
+            "{error}"
+        );
+        assert!(!elevation_share::has_elevated_sandbox_denial(&error));
+    }
 }

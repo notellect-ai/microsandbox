@@ -34,6 +34,8 @@ use microsandbox_types::{
     ConfigPatch, CpuPlacement, DeploymentProfile, OutboundProxy, PlacementProfile, RootDisk,
     TransparentHugePagePolicy,
 };
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextKind, Profile};
@@ -404,6 +406,12 @@ pub struct RuntimeConfig {
     /// Host-owned placement profiles selectable by sandbox name.
     #[config_patch(merge)]
     pub placement_profiles: BTreeMap<String, PlacementProfile>,
+
+    /// On Windows, let non-elevated runs in the same sign-in session reach sandboxes that an
+    /// elevated (administrator) run starts: they can connect to, exec in and stop them. Off
+    /// keeps the UAC boundary, and a non-elevated run gets an access-denied error explaining
+    /// it.
+    pub share_elevated_sandboxes: bool,
 }
 
 /// Controls buffered host dirty data for writable raw disks.
@@ -498,6 +506,21 @@ impl GlobalConfig {
     pub(crate) fn fs_state_limit_override(&self) -> Option<u64> {
         (self.snapshots.max_filesystem_state_mib != FS_STATE_LIMIT_DEFAULT_MIB)
             .then(|| self.fs_state_limit() as u64)
+    }
+
+    /// Whether a launch asks the runtime to share elevated sandboxes with non-elevated runs:
+    /// the setting is on and `launcher_can_share` (see [`launched_runtimes_can_share`]) says
+    /// the runtimes this process launches would act on it. The launcher is consulted only
+    /// when the setting is on, and its error fails the launch.
+    pub(crate) fn share_elevated_sandboxes_with(
+        &self,
+        launcher_can_share: impl FnOnce() -> MicrosandboxResult<bool>,
+    ) -> MicrosandboxResult<bool> {
+        if !self.runtime.share_elevated_sandboxes {
+            return Ok(false);
+        }
+
+        launcher_can_share()
     }
 
     /// Resolve and structurally validate a host-owned placement profile.
@@ -805,6 +828,25 @@ fn resolve_default_home() -> PathBuf {
     microsandbox_utils::resolve_home()
 }
 
+/// Whether a runtime this process launches, with this process's token, shares elevated
+/// sandboxes when asked: only the full half of a Windows split token does. An unreadable
+/// token is an error, so an opt-in is never dropped silently.
+#[cfg(windows)]
+pub(crate) fn launched_runtimes_can_share() -> MicrosandboxResult<bool> {
+    let elevation = elevation_share::elevation_type().map_err(|error| {
+        MicrosandboxError::Runtime(format!(
+            "runtime.share_elevated_sandboxes is on, but this process's token elevation type \
+             could not be read: {error}"
+        ))
+    })?;
+    Ok(elevation_share::shares_with_non_elevated(true, elevation))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn launched_runtimes_can_share() -> MicrosandboxResult<bool> {
+    Ok(false)
+}
+
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
@@ -893,7 +935,8 @@ mod tests {
                 "placement_profiles": {"latency": {
                     "numa": {"mode": "prefer_single"},
                     "memory": {"mode": "follow_cpu"}
-                }}
+                }},
+                "share_elevated_sandboxes": true
             },
             "registries": {
                 "ca_certs": "/configured/ca.pem",
@@ -1230,6 +1273,33 @@ mod tests {
                 "placement profile `missing` is not defined in runtime.placement_profiles"
             )
         );
+    }
+
+    #[test]
+    fn test_share_elevated_sandboxes_defaults_off_and_asks_the_launcher_only_when_on() {
+        let default: GlobalConfig = serde_json::from_str("{}").unwrap();
+        let opted_in: GlobalConfig =
+            serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
+
+        assert!(!default.runtime.share_elevated_sandboxes);
+        assert!(opted_in.runtime.share_elevated_sandboxes);
+        for elevated in [false, true] {
+            assert!(
+                !default
+                    .share_elevated_sandboxes_with(|| unreachable!("asked with the setting off"))
+                    .unwrap()
+            );
+            assert_eq!(
+                opted_in
+                    .share_elevated_sandboxes_with(|| Ok(elevated))
+                    .unwrap(),
+                elevated
+            );
+        }
+        let error = opted_in
+            .share_elevated_sandboxes_with(|| Err(MicrosandboxError::Runtime("injected".into())))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected"), "{error}");
     }
 
     #[test]
