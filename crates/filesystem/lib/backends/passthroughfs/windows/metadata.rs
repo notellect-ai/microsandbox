@@ -130,6 +130,7 @@ impl PassthroughFs {
         mode: u32,
         rdev: u32,
     ) -> io::Result<()> {
+        let previous = data.virtual_meta.read().unwrap().clone();
         if self.cfg.stat_virtualization_enabled() {
             let mut meta = data.virtual_meta.write().unwrap();
             meta.uid = uid;
@@ -142,7 +143,7 @@ impl PassthroughFs {
         let retained_stat = owned_metadata::write_retained_stat(data, stat)?;
         if let Some(store) = &self.stat_store
             && !retained_stat
-            && data.retained.lock().unwrap().is_none()
+            && !self.defer_retained_metadata(data, &previous, stat)
         {
             store.write(&data.path(), uid, gid, mode, rdev)?;
         }
@@ -161,6 +162,30 @@ impl PassthroughFs {
         }
 
         Ok(())
+    }
+
+    /// Store the metadata the guest set on a retained file under `path`, the
+    /// name a lookup gives it again. Only the fields the guest changed are
+    /// written over what the store holds for `path`: the rest of
+    /// `virtual_meta` may have been read from another file after the host
+    /// replaced this one. Called with the inode table locked. A failed write
+    /// does not fail the lookup; the change is then lost, as it is when the
+    /// guest closes the file before any lookup names it.
+    pub(super) fn save_unsaved_metadata(&self, data: &InodeData, path: &Path) {
+        let unsaved = std::mem::take(&mut *data.unsaved_metadata.lock().unwrap());
+        if unsaved.uid.is_none() && unsaved.gid.is_none() && unsaved.mode.is_none() {
+            return;
+        }
+        let Some(store) = &self.stat_store else {
+            return;
+        };
+
+        if let Err(error) = self.write_unsaved_metadata(store, path, unsaved) {
+            tracing::warn!(
+                ?error,
+                "failed to save metadata set on a file without a name"
+            );
+        }
     }
 
     pub(super) fn clear_priv_bits(&self, data: &InodeData) -> io::Result<()> {
@@ -316,5 +341,58 @@ impl PassthroughFs {
         }
 
         self.do_getattr(inode, handle)
+    }
+
+    /// A retained file without a pinned ADS has no name to store metadata
+    /// under: the change stays in `virtual_meta` and the changed fields are
+    /// marked for `save_unsaved_metadata`. Checked under the inode table
+    /// lock, which a lookup holds while it names the file again, so the
+    /// lookup either sees the mark or has already named the file.
+    fn defer_retained_metadata(
+        &self,
+        data: &InodeData,
+        previous: &inode::VirtualMetadata,
+        stat: OverrideStat,
+    ) -> bool {
+        let _inodes = self.inodes.read().unwrap();
+        if data.retained.lock().unwrap().is_none() {
+            return false;
+        }
+
+        let mut unsaved = data.unsaved_metadata.lock().unwrap();
+        if stat.uid != previous.uid {
+            unsaved.uid = Some(stat.uid);
+        }
+        if stat.gid != previous.gid {
+            unsaved.gid = Some(stat.gid);
+        }
+        if Some(stat.mode) != previous.mode {
+            unsaved.mode = Some(stat.mode);
+        }
+        true
+    }
+
+    fn write_unsaved_metadata(
+        &self,
+        store: &StatStore,
+        path: &Path,
+        unsaved: inode::UnsavedMetadata,
+    ) -> io::Result<()> {
+        let base = match store.read(path)? {
+            Some(stat) => stat,
+            None => {
+                let metadata = self.safe_metadata(path)?;
+                let (uid, gid) = self.cfg.default_owner.unwrap_or((0, 0));
+                OverrideStat::new(uid, gid, mode_from_metadata(&metadata), 0)
+            }
+        };
+
+        store.write(
+            path,
+            unsaved.uid.unwrap_or(base.uid),
+            unsaved.gid.unwrap_or(base.gid),
+            unsaved.mode.unwrap_or(base.mode),
+            base.rdev,
+        )
     }
 }
