@@ -40,6 +40,9 @@ pub(super) struct InodeData {
     pub(super) retained: Mutex<Option<File>>,
     /// A pinned ADS preserves shared guest metadata even after namespace unlink.
     pub(super) retained_stat: Mutex<Option<File>>,
+    /// Guest metadata set while retained without a pinned ADS: it is only in
+    /// `virtual_meta` until a lookup names the file again and saves it.
+    pub(super) unsaved_metadata: Mutex<UnsavedMetadata>,
     /// Guest lookup references, used for owned detached-object reclamation.
     pub(super) lookups: AtomicU64,
 }
@@ -50,6 +53,15 @@ pub(super) struct VirtualMetadata {
     pub(super) gid: u32,
     pub(super) mode: Option<u32>,
     pub(super) rdev: u64,
+}
+
+/// The fields of `VirtualMetadata` the guest changed while the file had no
+/// name to store them under.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct UnsavedMetadata {
+    pub(super) uid: Option<u32>,
+    pub(super) gid: Option<u32>,
+    pub(super) mode: Option<u32>,
 }
 
 pub(super) struct HandleData {
@@ -180,6 +192,7 @@ impl PassthroughFs {
             virtual_meta: RwLock::new(VirtualMetadata::default()),
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
+            unsaved_metadata: Mutex::new(UnsavedMetadata::default()),
             lookups: AtomicU64::new(0),
         });
 
@@ -258,12 +271,17 @@ impl PassthroughFs {
         {
             // FUSE aliases must share one logical inode, not just equal st_ino values:
             // otherwise the guest can cache conflicting file contents and attributes.
-            inodes.by_path.insert(path.clone(), data.clone());
             if data.retained.lock().unwrap().is_some() {
+                // Another hard link names a retained file again. Its metadata
+                // is read by path from now on, so first save what the guest
+                // set while it had no name.
+                self.save_unsaved_metadata(&data, &path);
+                inodes.by_path.insert(path.clone(), data.clone());
                 *data.path.write().unwrap() = path;
                 *data.retained.lock().unwrap() = None;
                 *data.retained_stat.lock().unwrap() = None;
             } else {
+                inodes.by_path.insert(path.clone(), data.clone());
                 Self::follow_host_rename(&mut inodes, &data, &path, |p| self.path_identity(p));
             }
             return Ok(data);
@@ -277,6 +295,7 @@ impl PassthroughFs {
             virtual_meta: RwLock::new(VirtualMetadata::default()),
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
+            unsaved_metadata: Mutex::new(UnsavedMetadata::default()),
             lookups: AtomicU64::new(0),
         });
         inodes.by_inode.insert(inode, data.clone());

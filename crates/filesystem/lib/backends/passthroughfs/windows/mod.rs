@@ -38,7 +38,7 @@ mod remove_ops;
 mod stat_store;
 
 use dax::{DaxFiles, DaxWindows};
-use inode::{DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable};
+use inode::{DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable, UnsavedMetadata};
 pub(super) use owned_metadata::{
     capture_owned_metadata, clear_owned_payload_metadata, owned_component, restore_owned_metadata,
 };

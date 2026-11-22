@@ -11,7 +11,10 @@ use std::{
         io::AsRawHandle,
     },
     path::{Component, PathBuf},
-    sync::{Arc, Mutex, RwLock, atomic::Ordering},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -23,8 +26,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::{
     DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable, LINUX_O_ACCMODE, PassthroughFs,
-    host_error, inode::VirtualMetadata, is_reserved_name, open_options_from_flags,
-    reject_reparse_metadata,
+    host_error,
+    inode::{UnsavedMetadata, VirtualMetadata},
+    is_reserved_name, open_options_from_flags, reject_reparse_metadata,
 };
 use crate::backends::{mobility, passthroughfs::quota::QuotaState};
 
@@ -896,7 +900,8 @@ fn rebuild(
             }),
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
-            lookups: std::sync::atomic::AtomicU64::new(0),
+            unsaved_metadata: Mutex::new(UnsavedMetadata::default()),
+            lookups: AtomicU64::new(0),
         });
         if let Some(identity) = data.identity {
             // Older external snapshots assigned separate inode IDs to hardlinks.
