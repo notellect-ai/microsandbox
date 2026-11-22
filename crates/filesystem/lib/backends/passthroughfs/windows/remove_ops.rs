@@ -37,6 +37,12 @@ thread_local! {
     /// inode table follows it, so a test can act inside that window.
     pub(super) static AFTER_HOST_UNLINK: RefCell<Option<Box<dyn FnOnce()>>> =
         const { RefCell::new(None) };
+
+    /// Runs on the unlinking thread after a pin found that the name still
+    /// holds the inode's file and before it pins the file's metadata stream,
+    /// so a test can replace the name inside that window.
+    pub(super) static AFTER_PIN_CHECK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -232,15 +238,24 @@ impl PassthroughFs {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .map_err(host_error)?;
-        reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
+        let file_metadata = file.metadata().map_err(host_error)?;
+        reject_reparse_metadata(&file_metadata)?;
         if !Self::holds_own_object(&data, &file) {
             return Ok(None);
         }
-        let stat_file = self.pin_owned_stat(path, current)?;
+
+        after_pin_check();
+        // A metadata stream pinned through the checked handle is the file's
+        // own, so its contents replace what was read by path above.
+        let (stat_file, stat) =
+            match self.pin_owned_stat(&file, self.default_override(&file_metadata))? {
+                Some((stat_file, stat)) => (Some(stat_file), stat),
+                None => (None, current),
+            };
         Ok(Some(PreparedOwnedUnlink {
             data,
             file,
-            stat: current,
+            stat,
             stat_file,
         }))
     }
@@ -275,24 +290,27 @@ impl PassthroughFs {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .ok()?;
-        reject_reparse_metadata(&file.metadata().ok()?).ok()?;
+        let file_metadata = file.metadata().ok()?;
+        reject_reparse_metadata(&file_metadata).ok()?;
         if !Self::holds_own_object(&data, &file) {
             return None;
         }
 
+        after_pin_check();
         // Pin the file's own metadata stream too, so that a chmod or chown
         // made while the file has no name is stored with the file, where a
         // lookup of another hard link reads it. Without it the change stays
-        // in memory only.
-        let stat_file = self
-            .pin_owned_stat(path, current)
-            .ok()
-            .flatten()
-            .filter(|stat_file| Self::holds_own_object(&data, stat_file));
+        // in memory only. A stream pinned through the checked handle is the
+        // file's own, so its contents replace what was read by path above.
+        let (stat_file, stat) =
+            match self.pin_owned_stat(&file, self.default_override(&file_metadata)) {
+                Ok(Some((stat_file, stat))) => (Some(stat_file), stat),
+                _ => (None, current),
+            };
         Some(PreparedOwnedUnlink {
             data,
             file,
-            stat: current,
+            stat,
             stat_file,
         })
     }
@@ -583,3 +601,13 @@ fn after_retain() {
 
 #[cfg(not(test))]
 fn after_retain() {}
+
+#[cfg(test)]
+fn after_pin_check() {
+    if let Some(hook) = AFTER_PIN_CHECK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_pin_check() {}
