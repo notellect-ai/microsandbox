@@ -59,11 +59,6 @@ fn share_with_non_elevated_as(
     opt_in: bool,
     elevation: impl FnOnce() -> io::Result<TOKEN_ELEVATION_TYPE>,
 ) {
-    if !opt_in {
-        SHARE_ELEVATED.store(false, Ordering::Relaxed);
-        return;
-    }
-
     let share = match elevation() {
         Ok(elevation) => elevation_share::shares_with_non_elevated(opt_in, elevation),
         Err(error) => {
