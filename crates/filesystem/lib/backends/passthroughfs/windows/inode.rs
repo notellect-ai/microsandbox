@@ -1,11 +1,6 @@
 //! Inode, handle, and lookup helpers for the Windows passthrough backend.
 
-use std::os::windows::io::AsRawHandle;
-
-use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
-};
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 
 use super::*;
 
@@ -272,59 +267,18 @@ impl PassthroughFs {
 
     /// A name a moved descendant took from a stale cached entry: that inode
     /// lost it as in an unlink. A file the guest still has open stays
-    /// tracked: reads and writes through its open handles keep working, and
-    /// a lookup of the name the host moved the file to finds it again by its
-    /// identity.
+    /// tracked, as it was before this repair: reads and writes through its
+    /// open handles keep working, and a lookup of the name the host moved the
+    /// file to finds it again by its identity. Until then its path still
+    /// names the displaced entry, so metadata read by path is that of the
+    /// file now there, also as before this repair.
     fn finish_displaced(&self, inodes: &mut InodeTable, displaced: Vec<Arc<InodeData>>) {
         for data in displaced {
             if self.has_open_handle(data.inode) {
-                self.follow_open_handle(&data);
                 continue;
             }
             self.finish_removed_alias(inodes, &data);
         }
-    }
-
-    /// Point a displaced inode the guest still has open at the name its file
-    /// has now, read from an open handle, so that metadata read and set by
-    /// path reaches that file and not the one that took its old name. A file
-    /// the host moved out of the mount keeps its old path.
-    fn follow_open_handle(&self, data: &InodeData) {
-        if let Some(path) = self.open_file_path(data) {
-            *data.path.write().unwrap() = path;
-        }
-    }
-
-    /// The path under the mount root that names the file an open handle of
-    /// `data` holds, if the handle holds the inode's own file.
-    fn open_file_path(&self, data: &InodeData) -> Option<PathBuf> {
-        let handles = self.handles.read().unwrap();
-        let handle = handles.values().find(|handle| handle.inode == data.inode)?;
-        let file = handle.file.lock().unwrap();
-        if data
-            .identity
-            .is_some_and(|identity| mobility::file_identity(&file).ok() != Some(identity))
-        {
-            return None;
-        }
-        let host = final_path(&file).ok()?;
-        drop(file);
-        drop(handles);
-
-        let root = StdOpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&self.root)
-            .ok()?;
-        let relative = host.strip_prefix(final_path(&root).ok()?).ok()?;
-        if relative.as_os_str().is_empty()
-            || !relative
-                .components()
-                .all(|component| matches!(component, Component::Normal(_)))
-        {
-            return None;
-        }
-        Some(self.root.join(relative))
     }
 
     /// A directory renamed on the host takes its cached descendants along:
@@ -432,34 +386,5 @@ impl PassthroughFs {
             .filter(|data| data.inode == inode)
             .cloned()
             .ok_or_else(|| linux_error(LINUX_EBADF))
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-/// The normalized host path of an open file, as `\\?\` plus a drive path.
-fn final_path(file: &File) -> io::Result<PathBuf> {
-    let mut buffer = vec![0u16; 512];
-    loop {
-        // SAFETY: the handle is open for the duration of the call, and the
-        // buffer is writable for the length passed.
-        let len = unsafe {
-            GetFinalPathNameByHandleW(
-                file.as_raw_handle() as HANDLE,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-            )
-        } as usize;
-        if len == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if len < buffer.len() {
-            buffer.truncate(len);
-            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
-        }
-        buffer.resize(len, 0);
     }
 }
