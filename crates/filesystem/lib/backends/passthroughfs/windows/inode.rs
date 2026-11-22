@@ -1,9 +1,7 @@
 //! Inode, handle, and lookup helpers for the Windows passthrough backend.
 
-use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::ptr::null;
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -277,29 +275,18 @@ impl PassthroughFs {
 
     /// Names a moved descendant took from stale cached entries. An inode that
     /// held one follows its file to the name the file has now, found by its
-    /// file id, taking its cached descendants along as a host rename does, so
-    /// reads, writes, listings and metadata through it, by handle or by path,
-    /// reach its own file or directory and not the one that took its old
-    /// name. A stale entry the followed name or a descendant takes over is
-    /// finished the same way. An inode whose file is gone, or has no name the
-    /// guest can reach, lost its name as in an unlink.
+    /// file id, so reads, writes, listings and metadata through it, by handle
+    /// or by path, reach its own file or directory and not the one that took
+    /// its old name. An inode whose file is gone, or has no name the guest can
+    /// reach, lost its name as in an unlink.
     fn finish_displaced(&self, inodes: &mut InodeTable, displaced: Vec<Arc<InodeData>>) {
-        let mut pending = displaced;
-        let mut seen = BTreeSet::new();
-        while let Some(data) = pending.pop() {
-            // A host racing these moves could hand an inode back; finish it
-            // instead of following it again.
-            let name = if seen.insert(data.inode) {
-                self.current_name(&data)
-            } else {
-                Ok(None)
-            };
-            let path = match name {
-                Ok(Some(path)) => path,
-                Ok(None) => {
-                    self.finish_removed_alias(inodes, &data);
-                    continue;
+        for data in displaced {
+            match self.current_name(&data) {
+                Ok(Some(path)) => {
+                    *data.path.write().unwrap() = path.clone();
+                    inodes.by_path.entry(path).or_insert(data);
                 }
+                Ok(None) => self.finish_removed_alias(inodes, &data),
                 Err(error) => {
                     tracing::debug!(
                         ?error,
@@ -307,24 +294,8 @@ impl PassthroughFs {
                         "cannot find the host name of a displaced inode"
                     );
                     self.finish_removed_alias(inodes, &data);
-                    continue;
                 }
-            };
-
-            let old = data.path();
-            *data.path.write().unwrap() = path.clone();
-            if let Some(stale) = inodes.by_path.insert(path.clone(), data.clone())
-                && !Arc::ptr_eq(&stale, &data)
-            {
-                pending.push(stale);
             }
-            pending.extend(Self::follow_host_rename_descendants(
-                inodes,
-                &data,
-                &old,
-                &path,
-                &|p: &Path| self.path_identity(p),
-            ));
         }
     }
 
@@ -500,7 +471,7 @@ fn open_by_file_index(volume: &File, index: u64) -> io::Result<File> {
             &descriptor,
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
+            std::ptr::null(),
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         )
     };
