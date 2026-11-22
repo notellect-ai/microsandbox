@@ -1,7 +1,5 @@
 //! Directory enumeration helpers for the Windows passthrough backend.
 
-use std::os::windows::fs::MetadataExt as _;
-
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
     ERROR_NOT_SUPPORTED, MAX_PATH, SetLastError,
