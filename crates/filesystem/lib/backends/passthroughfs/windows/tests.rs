@@ -3677,3 +3677,86 @@ fn a_stale_child_closed_before_a_host_move_takes_its_name_is_dropped_on_a_plain_
 fn a_stale_child_closed_before_a_host_move_takes_its_name_is_dropped_on_an_owned_mount() {
     stale_child_closed_before_a_host_move_takes_its_name_is_dropped(true);
 }
+
+/// A stale directory the guest still has open when a host directory move
+/// takes its cached name stays tracked: reading it through its open handle
+/// keeps working, and a lookup of the name the host moved it to finds it.
+#[test]
+fn a_stale_directory_open_when_a_host_move_takes_its_name_stays_usable() {
+    let temp = TempDir::new();
+    for path in ["d/sub", "e/sub"] {
+        std::fs::create_dir_all(temp.path.join(path)).unwrap();
+    }
+    let fs = fs_for(&temp.path);
+    let moved = lookup_relative(&fs, "d/sub").unwrap().inode;
+    let stale = lookup_relative(&fs, "e/sub").unwrap().inode;
+    let (handle, _) = fs
+        .opendir(context(), stale, LINUX_O_DIRECTORY as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+
+    std::fs::rename(temp.path.join("e/sub"), temp.path.join("kept")).unwrap();
+    fs.rmdir(context(), ROOT_INODE, c"e").unwrap();
+    std::fs::rename(temp.path.join("d"), temp.path.join("e")).unwrap();
+    lookup_relative(&fs, "e").unwrap();
+    assert_eq!(lookup_relative(&fs, "e/sub").unwrap().inode, moved);
+
+    assert!(fs.readdir(context(), stale, handle, 4096, 0).is_ok());
+    assert!(fs.getattr(context(), stale, None).is_ok());
+    assert_eq!(lookup_relative(&fs, "kept").unwrap().inode, stale);
+    fs.releasedir(context(), stale, 0, handle).unwrap();
+}
+
+/// A stale child the guest still has open when a host directory move takes
+/// its cached name stays tracked: writes through its handle keep working,
+/// and a lookup of the name the host moved it to finds the same inode.
+#[test]
+fn a_stale_child_open_when_a_host_move_takes_its_name_stays_usable() {
+    let temp = TempDir::new();
+    for (path, contents) in [("d/c", "moved"), ("e/c", "stale")] {
+        std::fs::create_dir_all(temp.path.join(path).parent().unwrap()).unwrap();
+        std::fs::write(temp.path.join(path), contents).unwrap();
+    }
+    let fs = fs_for(&temp.path);
+    let moved = lookup_relative(&fs, "d/c").unwrap().inode;
+    let stale = lookup_relative(&fs, "e/c").unwrap().inode;
+    let (handle, _) = fs
+        .open(context(), stale, false, LINUX_O_RDWR as u32)
+        .unwrap();
+    let handle = handle.unwrap();
+
+    std::fs::rename(temp.path.join("e/c"), temp.path.join("kept")).unwrap();
+    fs.rmdir(context(), ROOT_INODE, c"e").unwrap();
+    std::fs::rename(temp.path.join("d"), temp.path.join("e")).unwrap();
+
+    lookup_relative(&fs, "e").unwrap();
+    assert_eq!(lookup_relative(&fs, "e/c").unwrap().inode, moved);
+
+    let mut reader = SourceReader {
+        bytes: b" still open".to_vec(),
+        pos: 0,
+    };
+    let written = fs
+        .write(
+            context(),
+            stale,
+            handle,
+            &mut reader,
+            11,
+            5,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+    assert_eq!(written, 11);
+    assert_eq!(
+        std::fs::read(temp.path.join("kept")).unwrap(),
+        b"stale still open"
+    );
+    assert_eq!(std::fs::read(temp.path.join("e/c")).unwrap(), b"moved");
+    assert_eq!(lookup_relative(&fs, "kept").unwrap().inode, stale);
+    fs.release(context(), stale, 0, handle, false, false, None)
+        .unwrap();
+}
