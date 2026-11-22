@@ -701,17 +701,11 @@ pub(crate) async fn validate_runtime_config(
     };
     require_protected_guest_state(&runtime.msb_path).await?;
     if needs_guard {
-        let advertisement = capabilities(&runtime.msb_path).await?;
-        if config.retained_exec_limits().is_some() && !advertisement.restored_exec_limits {
-            return Err(MicrosandboxError::Runtime(upgrade_required(
-                "retained execution limits",
-            )));
-        }
-        if needs_bindings && !advertisement.deferred_command_bindings {
-            return Err(MicrosandboxError::Runtime(upgrade_required(
-                "deferred command bindings",
-            )));
-        }
+        require_restore_guard(
+            &*capabilities(&runtime.msb_path).await?,
+            config.retained_exec_limits().is_some(),
+            needs_bindings,
+        )?;
     }
     let contract = resolve(&runtime.msb_path).await?;
     validate_nested_virt(&runtime.msb_path, config, contract).await?;
@@ -1210,6 +1204,26 @@ fn parse_version(bytes: &[u8]) -> MicrosandboxResult<Version> {
 }
 
 /// A consistent, actionable refusal for features that cannot be downgraded.
+/// Restored execution limits and deferred command bindings are honored only by
+/// runtimes that advertise them; older ones would drop them silently.
+fn require_restore_guard(
+    advertisement: &LaunchCapabilities,
+    needs_limits: bool,
+    needs_bindings: bool,
+) -> MicrosandboxResult<()> {
+    if needs_limits && !advertisement.restored_exec_limits {
+        return Err(MicrosandboxError::Runtime(upgrade_required(
+            "retained execution limits",
+        )));
+    }
+    if needs_bindings && !advertisement.deferred_command_bindings {
+        return Err(MicrosandboxError::Runtime(upgrade_required(
+            "deferred command bindings",
+        )));
+    }
+    Ok(())
+}
+
 fn upgrade_required(feature: &str) -> String {
     format!(
         "selected msb runtime does not support {feature}; \
@@ -2190,6 +2204,16 @@ mod tests {
         assert!(bounded_probe(&path, "__launch-protocol").await.is_err());
 
         let canonical = std::fs::canonicalize(&path).unwrap();
+        // Drop the global entry (and its open handle) even when an assert fails.
+        struct Evict(PathBuf);
+        impl Drop for Evict {
+            fn drop(&mut self) {
+                if let Ok(mut cached) = CAPABILITIES.try_lock() {
+                    cached.remove(&self.0);
+                }
+            }
+        }
+        let _evict = Evict(canonical.clone());
         let file = File::open(&canonical).unwrap();
         let advertised: LaunchCapabilities = serde_json::from_value(serde_json::json!({
             "protocols": [2, 1],
@@ -2276,14 +2300,51 @@ mod tests {
             );
         }
         assert!(probed.is_empty(), "checks that probed again: {probed:?}");
-        let cached = capabilities(&path).await.unwrap();
-        assert!(cached.deferred_command_bindings && cached.restored_exec_limits);
+        require_restore_guard(&*capabilities(&path).await.unwrap(), true, true).unwrap();
 
         // A changed executable is never answered from the old advertisement.
         std::fs::write(&path, b"still not an executable, but longer").unwrap();
         let error = require_protected_guest_state(&path).await.unwrap_err();
         assert!(error.to_string().contains("Probe failed"), "{error}");
-        CAPABILITIES.lock().await.remove(&canonical);
+    }
+
+    #[test]
+    fn restore_guard_requires_each_advertised_field() {
+        for limits in [None, Some(false), Some(true)] {
+            for bindings in [None, Some(false), Some(true)] {
+                let mut advertised = serde_json::json!({"protocols": [2, 1]});
+                if let Some(limits) = limits {
+                    advertised["restored_exec_limits"] = limits.into();
+                }
+                if let Some(bindings) = bindings {
+                    advertised["deferred_command_bindings"] = bindings.into();
+                }
+                let advertised: LaunchCapabilities = serde_json::from_value(advertised).unwrap();
+                for (needs_limits, needs_bindings) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let cell = format!(
+                        "advertised limits {limits:?} bindings {bindings:?}, \
+                         needs limits {needs_limits} bindings {needs_bindings}"
+                    );
+                    let result = require_restore_guard(&advertised, needs_limits, needs_bindings);
+                    let refused_limits = needs_limits && limits != Some(true);
+                    let refused_bindings = needs_bindings && bindings != Some(true);
+                    match result {
+                        Ok(()) => assert!(!refused_limits && !refused_bindings, "{cell}"),
+                        Err(error) => {
+                            let error = error.to_string();
+                            if refused_limits {
+                                assert!(error.contains("retained execution limits"), "{cell}");
+                            } else {
+                                assert!(refused_bindings, "{cell}: {error}");
+                                assert!(error.contains("deferred command bindings"), "{cell}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
