@@ -6,6 +6,8 @@ use std::os::windows::fs::FileExt;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES};
+
 struct TempDir {
     path: PathBuf,
 }
@@ -100,6 +102,22 @@ fn fs_for(path: &Path) -> PassthroughFs {
         ..Default::default()
     })
     .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+    fs
+}
+
+/// A mount whose guest metadata goes to the sidecar store, as on a volume
+/// without named streams.
+fn sidecar_fs_for(path: &Path) -> PassthroughFs {
+    let mut fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: path.to_path_buf(),
+        inject_init: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let store = StatStore::sidecar(&fs.root);
+    store.probe().unwrap();
+    fs.stat_store = Some(store);
     fs.init(FsOptions::empty()).unwrap();
     fs
 }
@@ -3704,9 +3722,9 @@ fn open_file_survives_unlink() {
 /// Pinning an open file before its name goes away is best effort on a mount
 /// without an owned checkpoint: a host-corrupted metadata stream fails the
 /// pin's stat read, yet the unlink or rename-over goes ahead and the guest's
-/// handle keeps working through the fallback pin. The fallback reads the
-/// override by path after the host operation; with `corrupt_replacement` the
-/// replacing file's override is unreadable too, and the pin still holds.
+/// handle keeps working through the fallback pin. The fallback keeps the
+/// inode's own metadata, not the replacing file's; with `corrupt_replacement`
+/// the replacing file's override is unreadable too, and the pin still holds.
 fn unreadable_metadata_does_not_block_name_loss(replace: bool, corrupt_replacement: bool) {
     let temp = TempDir::new();
     let fs = fs_for(&temp.path);
@@ -3738,6 +3756,7 @@ fn unreadable_metadata_does_not_block_name_loss(replace: bool, corrupt_replaceme
         let (st, _) = fs.getattr(context(), inode, fh).unwrap();
         assert_eq!(st.st_ino, inode);
         assert_eq!(st.st_size, 12);
+        assert_eq!(st.st_mode, S_IFREG | 0o640);
     }
     assert_eq!(read_all(&fs, inode, handle).unwrap(), b"old contents");
     let mut reader = SourceReader {
@@ -3780,6 +3799,111 @@ fn unreadable_metadata_does_not_block_unlink() {
 #[test]
 fn unreadable_metadata_on_both_sides_does_not_drop_a_renamed_over_file() {
     unreadable_metadata_does_not_block_name_loss(true, true);
+}
+
+/// An open file whose pin cannot be taken, because an ACL denies opening it
+/// for attribute writes, keeps the owner and mode set in an earlier mount
+/// after it loses its name: they are read before the pin is attempted.
+fn denied_pin_keeps_earlier_metadata(replace: bool) {
+    let temp = TempDir::new();
+    let owner = Context {
+        uid: 111,
+        gid: 222,
+        pid: 0,
+    };
+    let earlier = fs_for(&temp.path);
+    let (inode, handle) = create_with(&earlier, owner, c"data", 0o640, b"old contents");
+    earlier
+        .release(owner, inode, 0, handle, false, false, None)
+        .unwrap();
+    drop(earlier);
+
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+    let inode = fs.lookup(context(), ROOT_INODE, c"data").unwrap().inode;
+    let (handle, _) = fs.open(context(), inode, false, 0).unwrap();
+    let handle = handle.unwrap();
+    let path = temp.path.join("data");
+    let output = Command::new("icacls")
+        .arg(&path)
+        .args(["/deny", "*S-1-1-0:(WA)"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "icacls failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    StdOpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .open(&path)
+        .expect_err("the ACL denies attribute writes");
+
+    if replace {
+        let (tmp, tmp_handle) = create_with(&fs, context(), c"tmp", 0o600, b"new");
+        fs.release(context(), tmp, 0, tmp_handle, false, false, None)
+            .unwrap();
+        fs.rename(context(), ROOT_INODE, c"tmp", ROOT_INODE, c"data", 0)
+            .unwrap();
+    } else {
+        fs.unlink(context(), ROOT_INODE, c"data").unwrap();
+    }
+    let (st, _) = fs.getattr(context(), inode, Some(handle)).unwrap();
+
+    assert_eq!(
+        (st.st_uid, st.st_gid, st.st_mode),
+        (111, 222, S_IFREG | 0o640)
+    );
+    assert_eq!(read_all(&fs, inode, handle).unwrap(), b"old contents");
+
+    fs.release(context(), inode, 0, handle, false, false, None)
+        .unwrap();
+}
+
+#[test]
+fn denied_pin_keeps_earlier_metadata_on_rename_over() {
+    denied_pin_keeps_earlier_metadata(true);
+}
+
+#[test]
+fn denied_pin_keeps_earlier_metadata_on_unlink() {
+    denied_pin_keeps_earlier_metadata(false);
+}
+
+/// A guest unlink of a name the host replaced since the guest looked it up
+/// removes the replacing file; the open inode must not take that file's
+/// owner and mode.
+#[test]
+fn unlinking_a_name_the_host_replaced_keeps_the_replacing_metadata_out() {
+    let temp = TempDir::new();
+    let fs = fs_for(&temp.path);
+    assert_ads_store(&fs);
+    let owner = Context {
+        uid: 111,
+        gid: 222,
+        pid: 0,
+    };
+    let other = Context {
+        uid: 333,
+        gid: 444,
+        pid: 0,
+    };
+    let (inode, handle) = create_with(&fs, owner, c"config", 0o640, b"old contents");
+    let (staged, staged_handle) = create_with(&fs, other, c"config.new", 0o600, b"new");
+    fs.release(other, staged, 0, staged_handle, false, false, None)
+        .unwrap();
+
+    std::fs::rename(temp.path.join("config.new"), temp.path.join("config")).unwrap();
+    fs.unlink(context(), ROOT_INODE, c"config").unwrap();
+    let (st, _) = fs.getattr(owner, inode, Some(handle)).unwrap();
+
+    assert!(!temp.path.join("config").exists());
+    assert_ne!((st.st_uid, st.st_gid), (333, 444));
+    assert_ne!(st.st_mode, S_IFREG | 0o600);
+
+    fs.release(owner, inode, 0, handle, false, false, None)
+        .unwrap();
 }
 
 /// A chmod on an open file after its name is gone survives a later lookup of
@@ -4225,6 +4349,97 @@ fn a_host_replace_gives_the_name_a_new_inode() {
         );
         fs.release(context(), entry.inode, 0, new_handle, false, false, None)
             .unwrap();
+        fs.release(context(), old, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
+/// The old inode of a name the host replaced keeps reporting its own owner
+/// and mode through the guest's handle, not the replacing file's.
+#[test]
+fn a_host_replace_keeps_the_old_inode_metadata() {
+    for delete_first in [true, false] {
+        let temp = TempDir::new();
+        let fs = fs_for(&temp.path);
+        assert_ads_store(&fs);
+        let owner = Context {
+            uid: 111,
+            gid: 222,
+            pid: 0,
+        };
+        let other = Context {
+            uid: 333,
+            gid: 444,
+            pid: 0,
+        };
+        let (old, handle) = create_with(&fs, owner, c"config", 0o640, b"old contents");
+        let (staged, staged_handle) = create_with(&fs, other, c"config.new", 0o600, b"new");
+        fs.release(other, staged, 0, staged_handle, false, false, None)
+            .unwrap();
+
+        let path = temp.path.join("config");
+        if delete_first {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::rename(temp.path.join("config.new"), &path).unwrap();
+        let entry = fs.lookup(context(), ROOT_INODE, c"config").unwrap();
+
+        assert_ne!(entry.inode, old, "delete first: {delete_first}");
+        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (333, 444));
+        let (st, _) = fs.getattr(owner, old, Some(handle)).unwrap();
+        assert_eq!(
+            (st.st_uid, st.st_gid, st.st_mode),
+            (111, 222, S_IFREG | 0o640),
+            "delete first: {delete_first}"
+        );
+
+        fs.release(owner, old, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
+/// On a mount whose metadata store is the sidecar, the old inode of a name
+/// the host replaced keeps the owner and mode the guest set in an earlier
+/// mount, which the store still holds under the name.
+#[test]
+fn a_host_replace_keeps_sidecar_metadata_set_before_the_mount() {
+    for delete_first in [true, false] {
+        let temp = TempDir::new();
+        let owner = Context {
+            uid: 111,
+            gid: 222,
+            pid: 0,
+        };
+        let earlier = sidecar_fs_for(&temp.path);
+        let (inode, handle) = create_with(&earlier, owner, c"config", 0o640, b"old contents");
+        earlier
+            .release(owner, inode, 0, handle, false, false, None)
+            .unwrap();
+        drop(earlier);
+
+        let fs = sidecar_fs_for(&temp.path);
+        let old = fs.lookup(context(), ROOT_INODE, c"config").unwrap().inode;
+        let (handle, _) = fs.open(context(), old, false, 0).unwrap();
+        let handle = handle.unwrap();
+
+        let path = temp.path.join("config");
+        let staged = temp.path.join("config.new");
+        std::fs::write(&staged, b"new").unwrap();
+        if delete_first {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::rename(&staged, &path).unwrap();
+
+        let entry = fs.lookup(context(), ROOT_INODE, c"config").unwrap();
+        let (st, _) = fs.getattr(context(), old, Some(handle)).unwrap();
+
+        assert_ne!(entry.inode, old, "delete first: {delete_first}");
+        assert_eq!(
+            (st.st_uid, st.st_gid, st.st_mode),
+            (111, 222, S_IFREG | 0o640),
+            "delete first: {delete_first}"
+        );
+
         fs.release(context(), old, 0, handle, false, false, None)
             .unwrap();
     }
