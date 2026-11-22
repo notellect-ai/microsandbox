@@ -381,17 +381,9 @@ impl PassthroughFs {
     }
 
     pub(super) fn entry_for_path(&self, path: PathBuf) -> io::Result<Entry> {
-        let read = || {
-            let metadata = self.safe_metadata(&path)?;
-            let data = self.intern_path(path.clone())?;
-            self.entry_from_metadata(&metadata, data.as_ref())
-        };
-        match read() {
-            // The host put another file at the name after it was interned:
-            // read it again, which gives that file an inode of its own.
-            Err(error) if error.raw_os_error() == Some(LINUX_ESTALE) => read(),
-            entry => entry,
-        }
+        let metadata = self.safe_metadata(&path)?;
+        let data = self.intern_path(path.clone())?;
+        self.entry_from_metadata(&metadata, data.as_ref())
     }
 
     pub(super) fn do_lookup(&self, parent: u64, name: &CStr) -> io::Result<Entry> {
