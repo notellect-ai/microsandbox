@@ -168,7 +168,10 @@ impl RuntimeProcess {
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Err(error) => return Err(explain(error).into()),
+                Err(error) => {
+                    let _ = &explain;
+                    return Err(error.into());
+                }
             }
         }
     }
