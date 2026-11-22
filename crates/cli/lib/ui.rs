@@ -388,7 +388,7 @@ pub fn error_with_lines(msg: &str, lines: &[ErrorLine<'_>]) {
 /// sandbox that an elevated process started, add the `msb` way to act on it.
 pub fn sandbox_error(err: &(dyn Error + 'static)) {
     #[cfg(windows)]
-    if is_elevated_sandbox_denial(err) {
+    if has_elevated_sandbox_denial(err) {
         error_with_lines(&err.to_string(), &[ErrorLine::Hint(ELEVATED_SANDBOX_HINT)]);
         return;
     }
@@ -399,7 +399,7 @@ pub fn sandbox_error(err: &(dyn Error + 'static)) {
 /// Whether `err`'s chain holds an access-denied error the SDK explained as a sandbox that an
 /// elevated process started.
 #[cfg(windows)]
-pub fn is_elevated_sandbox_denial(err: &(dyn Error + 'static)) -> bool {
+pub fn has_elevated_sandbox_denial(err: &(dyn Error + 'static)) -> bool {
     elevation_share::has_elevated_sandbox_denial(err)
 }
 
@@ -906,6 +906,9 @@ mod tests {
     #[cfg(windows)]
     use windows_sys::Win32::Security::TokenElevationTypeLimited;
 
+    #[cfg(windows)]
+    use super::has_elevated_sandbox_denial;
+
     #[test]
     fn detail_values_align_without_touching_long_keys() {
         for (key, indented) in [
@@ -1048,8 +1051,8 @@ mod tests {
         let bare = anyhow::Error::from(MicrosandboxError::Io(denied()));
 
         for error in [&io_error, &connect_error] {
-            assert!(super::is_elevated_sandbox_denial(error.as_ref()), "{error}");
+            assert!(has_elevated_sandbox_denial(error.as_ref()), "{error}");
         }
-        assert!(!super::is_elevated_sandbox_denial(bare.as_ref()), "{bare}");
+        assert!(!has_elevated_sandbox_denial(bare.as_ref()), "{bare}");
     }
 }

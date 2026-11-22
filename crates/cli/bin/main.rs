@@ -680,7 +680,7 @@ fn render_anyhow_error(err: &anyhow::Error) -> i32 {
         return 1;
     }
     #[cfg(windows)]
-    if microsandbox_cli::ui::is_elevated_sandbox_denial(err.as_ref()) {
+    if microsandbox_cli::ui::has_elevated_sandbox_denial(err.as_ref()) {
         microsandbox_cli::ui::sandbox_error(err.as_ref());
         return 1;
     }

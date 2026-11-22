@@ -66,8 +66,7 @@ pub const ELEVATED_SANDBOX_HINT: &str = "the sandbox was most likely started by 
     (administrator) process, and this process is not elevated. Run this process elevated, or \
     stop the sandbox from an elevated process and then start it again from this one. To let \
     non-elevated processes in the same sign-in session reach sandboxes that elevated processes \
-    start, set \
-    runtime.share_elevated_sandboxes to true in the microsandbox config file \
+    start, set runtime.share_elevated_sandboxes to true in the microsandbox config file \
     (~/.microsandbox/config.json by default) and start the sandbox again from an elevated \
     process";
 
@@ -178,7 +177,8 @@ pub fn elevation_type() -> io::Result<TOKEN_ELEVATION_TYPE> {
 }
 
 /// Whether this process's token is elevated: the full half of a split token, or an
-/// administrator token without UAC.
+/// administrator token without UAC. Public for the runtime's tests, which need an elevated
+/// process.
 pub fn is_elevated() -> io::Result<bool> {
     let token = open_token()?;
     let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
@@ -209,7 +209,7 @@ pub fn shared_pipe_security() -> io::Result<SharedSecurity> {
 }
 
 /// The string logon SID of this process's token: the SID that [`shared_pipe_security`]
-/// grants.
+/// grants. Public for the runtime's tests, which check the pipes grant it.
 pub fn current_logon_sid() -> io::Result<String> {
     logon_sid_string(&open_token()?)
 }
@@ -313,6 +313,7 @@ fn logon_sid_string(token: &Token) -> io::Result<String> {
     let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
     let value = String::from_utf16_lossy(unsafe { from_raw_parts(text, len) });
     unsafe { LocalFree(text.cast()) };
+
     Ok(value)
 }
 
@@ -357,7 +358,7 @@ mod tests {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
-        GetSecurityInfo, SE_KERNEL_OBJECT,
+        GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
@@ -378,6 +379,12 @@ mod tests {
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
         PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    use super::{
+        ELEVATED_SANDBOX_HINT, current_logon_sid, descriptor, elevation_type,
+        explain_access_denied_as, is_elevated, is_elevated_sandbox_denial, shared_pipe_security,
+        shares_with_non_elevated,
     };
 
     const CHILD_ENV: &str = "MSB_TEST_ELEVATION_SHARE_CHILD";
@@ -412,7 +419,7 @@ mod tests {
     /// The access tests create objects owned by Administrators and restricted tokens of this
     /// account, which only an elevated administrator can; fail with what to do otherwise.
     fn require_elevated() {
-        let elevated = super::is_elevated().unwrap();
+        let elevated = is_elevated().unwrap();
 
         assert!(
             elevated,
@@ -426,7 +433,7 @@ mod tests {
     /// object gets what an elevated launcher gives a process it creates: that DACL mapped to
     /// process rights and a High label with no-write-up and no-read-up.
     fn emulate_elevated_runtime() {
-        let logon = super::current_logon_sid().unwrap();
+        let logon = current_logon_sid().unwrap();
         let mut token = null_mut();
         assert_ne!(
             unsafe {
@@ -439,7 +446,7 @@ mod tests {
             0
         );
 
-        let defaults = super::descriptor(&format!(
+        let defaults = descriptor(&format!(
             "O:BAD:(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;{logon})"
         ))
         .unwrap();
@@ -482,7 +489,7 @@ mod tests {
 
         // As seen on an elevated runtime under real UAC (`0x121411` is GENERIC_READ |
         // GENERIC_EXECUTE for a process).
-        let process = super::descriptor(&format!(
+        let process = descriptor(&format!(
             "O:BAD:(A;;0x1fffff;;;BA)(A;;0x1fffff;;;SY)(A;;0x121411;;;{logon})S:(ML;;NWNR;;;HI)"
         ))
         .unwrap();
@@ -504,24 +511,29 @@ mod tests {
 
     /// Child half of the access tests: an emulated elevated runtime with the opt-in on
     /// (`CHILD_ENV` = `shared`) or off (`default`), one runtime pipe and one mapping created
-    /// with default security. Ignored, so it runs only when an access test starts it.
+    /// with default security. Ignored, so it runs only when an access test starts it; run on
+    /// its own, it fails rather than pass without testing anything.
     #[test]
     #[ignore = "started by the access tests"]
     fn elevated_runtime_child() {
         let share = match env::var(CHILD_ENV).as_deref() {
             Ok("shared") => true,
             Ok("default") => false,
-            _ => return,
+            other => panic!(
+                "{CHILD_ENV} is {other:?}: this child is started by the access tests, run those \
+                 instead"
+            ),
         };
+
         // What an elevated runtime decides from the launch's opt-in.
-        let share = super::shares_with_non_elevated(share, TokenElevationTypeFull);
+        let share = shares_with_non_elevated(share, TokenElevationTypeFull);
         eprintln!("child: emulating an elevated runtime (share={share})");
         emulate_elevated_runtime();
         eprintln!("child: creating the pipe and the mapping");
 
         let id = process::id();
         let pipe_name = format!(r"\\.\pipe\msb-elevation-share-test-{id}");
-        let pipe_security = share.then(|| super::shared_pipe_security().unwrap());
+        let pipe_security = share.then(|| shared_pipe_security().unwrap());
         let mut attributes = pipe_security.as_ref().map(|security| security.attributes());
         let pipe = unsafe {
             CreateNamedPipeW(
@@ -538,6 +550,7 @@ mod tests {
             )
         };
         assert_ne!(pipe, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+
         // Default security, as the metrics registry creates its mapping (no explicit
         // descriptor). The mapping inherits the session object directory's ACEs, full access
         // for SYSTEM, Administrators and the logon SID, rather than the token's default DACL,
@@ -559,6 +572,7 @@ mod tests {
         // libtest has already printed `test <name> ... ` without a newline.
         println!("\n{READY} {pipe_name} {mapping_name}");
         io::stdout().flush().unwrap();
+
         // Stay alive, holding the pipe and the mapping, until the parent closes stdin.
         let mut line = String::new();
         let _ = io::stdin().read_line(&mut line);
@@ -587,12 +601,13 @@ mod tests {
             )
         };
         assert_eq!(status, 0, "{}", io::Error::from_raw_os_error(status as i32));
+
         let mut text = null_mut();
         assert_ne!(
             unsafe {
                 ConvertSecurityDescriptorToStringSecurityDescriptorW(
                     security,
-                    super::SDDL_REVISION_1,
+                    SDDL_REVISION_1,
                     information,
                     &mut text,
                     null_mut(),
@@ -602,12 +617,14 @@ mod tests {
             "{}",
             io::Error::last_os_error()
         );
+
         let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
         let value = String::from_utf16_lossy(unsafe { from_raw_parts(text, len) });
         unsafe {
             LocalFree(text.cast());
             LocalFree(security);
         }
+
         value
     }
 
@@ -634,7 +651,7 @@ mod tests {
         }];
         if other_sign_in {
             disabled.push(SID_AND_ATTRIBUTES {
-                Sid: sid(&super::current_logon_sid().unwrap()),
+                Sid: sid(&current_logon_sid().unwrap()),
                 Attributes: 0,
             });
         }
@@ -743,8 +760,9 @@ mod tests {
     fn probe_elevated_runtime(share: bool) -> Access {
         println!(
             "elevation type of this test process: {:?}",
-            super::elevation_type()
+            elevation_type()
         );
+
         let mut child = Command::new(current_exe().unwrap())
             .args([
                 "--ignored",
@@ -759,6 +777,8 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
+
+        // Kill the child, and fail, if the probe does not finish in time.
         let (finished, deadline) = channel::<()>();
         let watchdog_target = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) } as usize;
         assert_ne!(watchdog_target, 0, "{}", io::Error::last_os_error());
@@ -770,6 +790,8 @@ mod tests {
             }
             false
         });
+
+        // Wait for the child to report its pipe and mapping names.
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         let mut ready = None;
         let mut transcript = String::new();
@@ -827,12 +849,14 @@ mod tests {
                 }
                 result
             };
+
             // Each right on its own: the union of those that open is what the caller can get.
             let granted = (0..32)
                 .map(|bit| 1u32 << bit)
                 .filter(|&right| PROBED_PROCESS_RIGHTS & right != 0)
                 .filter(|&right| can_open_process(pid, right))
                 .fold(0, |granted, right| granted | right);
+
             let pipe_result = open_pipe(&pipe_name);
             let mapping_result =
                 [FILE_MAP_READ, FILE_MAP_WRITE, FILE_MAP_ALL_ACCESS].map(|access| {
@@ -844,6 +868,7 @@ mod tests {
                     }
                     result
                 });
+
             assert_ne!(unsafe { RevertToSelf() }, 0);
 
             Access {
@@ -860,6 +885,8 @@ mod tests {
             CloseHandle(filtered as HANDLE);
             CloseHandle(other_sign_in as HANDLE);
         }
+
+        // Let the child exit, then stop the watchdog.
         eprintln!("parent: closing the child's stdin");
         drop(child.stdin.take());
         let status = child.wait().unwrap();
@@ -867,12 +894,14 @@ mod tests {
         let killed = watchdog.join().unwrap();
         unsafe { CloseHandle(watchdog_target as HANDLE) };
         assert!(!killed, "the test did not finish within {DEADLINE:?}");
+
         println!(
             "share={share} stop={:?} granted={:#010x} pipe={:?} pipe_other_sign_in={:?} \
              mapping={:?}",
             access.stop, access.granted, access.pipe, access.pipe_other_sign_in, access.mapping
         );
         assert!(status.success(), "child failed: {status}");
+
         access
     }
 
@@ -905,6 +934,7 @@ mod tests {
             mapping,
             ..
         } = probe_elevated_runtime(true);
+
         assert!(
             pipe.is_ok(),
             "open the shared pipe for read/write: {pipe:?}"
@@ -966,18 +996,21 @@ mod tests {
             mapping,
             ..
         } = probe_elevated_runtime(false);
+
         let other = pipe_other_sign_in.expect_err("another sign-in must not open an unshared pipe");
         assert_eq!(
             other.raw_os_error(),
             Some(ERROR_ACCESS_DENIED as i32),
             "{other}"
         );
+
         let pipe = pipe.expect_err("a non-elevated run must not open an unshared pipe");
         assert_eq!(
             pipe.raw_os_error(),
             Some(ERROR_ACCESS_DENIED as i32),
             "{pipe}"
         );
+
         assert_eq!(
             granted, ALLOWED_PROCESS_RIGHTS,
             "process rights a non-elevated run gets on the elevated runtime \
@@ -987,11 +1020,12 @@ mod tests {
         assert_default_mapping_opens(&mapping);
 
         let original = pipe.to_string();
-        let explained = super::explain_access_denied_as(pipe, TokenElevationTypeLimited);
+        let explained = explain_access_denied_as(pipe, TokenElevationTypeLimited);
         let message = explained.to_string();
         println!("explained: {message}");
+
         assert_eq!(explained.kind(), io::ErrorKind::PermissionDenied);
-        assert!(super::is_elevated_sandbox_denial(&explained), "{message}");
+        assert!(is_elevated_sandbox_denial(&explained), "{message}");
         for phrase in [
             original.as_str(),
             "most likely started by an elevated (administrator) process",
@@ -1016,22 +1050,22 @@ mod tests {
         let missing = || io::Error::from_raw_os_error(2);
 
         for elevation in [TokenElevationTypeDefault, TokenElevationTypeFull] {
-            let error = super::explain_access_denied_as(denied(), elevation);
+            let error = explain_access_denied_as(denied(), elevation);
 
             assert_eq!(error.to_string(), denied().to_string(), "type {elevation}");
         }
 
-        let error = super::explain_access_denied_as(missing(), TokenElevationTypeLimited);
+        let error = explain_access_denied_as(missing(), TokenElevationTypeLimited);
 
         assert_eq!(error.to_string(), missing().to_string());
 
-        let error = super::explain_access_denied_as(denied(), TokenElevationTypeLimited);
+        let error = explain_access_denied_as(denied(), TokenElevationTypeLimited);
         let source = Error::source(error.get_ref().unwrap()).unwrap();
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(
             error.to_string(),
-            format!("{}: {}", denied(), super::ELEVATED_SANDBOX_HINT)
+            format!("{}: {}", denied(), ELEVATED_SANDBOX_HINT)
         );
         assert_eq!(source.to_string(), denied().to_string());
     }
@@ -1048,7 +1082,7 @@ mod tests {
             (true, TokenElevationTypeLimited, false),
         ] {
             assert_eq!(
-                super::shares_with_non_elevated(opt_in, elevation),
+                shares_with_non_elevated(opt_in, elevation),
                 expected,
                 "opt_in={opt_in} elevation type {elevation}"
             );

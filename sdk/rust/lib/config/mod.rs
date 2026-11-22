@@ -837,11 +837,6 @@ pub fn resolve_libkrunfw_path() -> MicrosandboxResult<PathBuf> {
     config()?.resolve_libkrunfw_path()
 }
 
-/// Resolve the default home directory (`~/.microsandbox`, or non-empty `$MSB_HOME`).
-fn resolve_default_home() -> PathBuf {
-    microsandbox_utils::resolve_home()
-}
-
 /// Whether a runtime this process launches, with this process's token, shares elevated
 /// sandboxes when asked: only the full half of a Windows split token does. An unreadable
 /// token is an error, so an opt-in is never dropped silently.
@@ -853,6 +848,11 @@ pub(crate) fn launched_runtimes_can_share() -> MicrosandboxResult<bool> {
 #[cfg(not(windows))]
 pub(crate) fn launched_runtimes_can_share() -> MicrosandboxResult<bool> {
     Ok(false)
+}
+
+/// Resolve the default home directory (`~/.microsandbox`, or non-empty `$MSB_HOME`).
+fn resolve_default_home() -> PathBuf {
+    microsandbox_utils::resolve_home()
 }
 
 /// [`launched_runtimes_can_share`] for the result of reading this process's token elevation
@@ -1326,9 +1326,11 @@ mod tests {
                 elevated
             );
         }
+
         let error = opted_in
             .share_elevated_sandboxes_with(|| Err(MicrosandboxError::Runtime("injected".into())))
             .unwrap_err();
+
         assert!(error.to_string().contains("injected"), "{error}");
     }
 

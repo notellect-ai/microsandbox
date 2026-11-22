@@ -789,6 +789,7 @@ mod tests {
     #[test]
     fn share_elevated_sandboxes_is_omitted_by_default_and_survives_the_handoff() {
         let default = serde_json::to_value(LaunchConfig::default()).unwrap();
+
         assert!(default.get("share_elevated_sandboxes").is_none());
         assert!(!decode(default).unwrap().share_elevated_sandboxes);
 

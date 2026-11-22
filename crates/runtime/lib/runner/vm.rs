@@ -49,6 +49,8 @@ use sea_orm::{ColumnTrait, EntityTrait, Set};
 use serde::Serialize;
 
 #[cfg(windows)]
+use super::elevation::share_with_non_elevated;
+#[cfg(windows)]
 use crate::bootstrap_fs::AgentBootstrapFs;
 #[cfg(windows)]
 use crate::console::AgentConsolePipeBridge;
@@ -750,7 +752,7 @@ fn run(
     // Before any pipe exists: an elevated runtime keeps the UAC boundary unless the launch
     // opted in to sharing its pipes with non-elevated runs in its sign-in session.
     #[cfg(windows)]
-    super::elevation::share_with_non_elevated(config.share_elevated_sandboxes)?;
+    share_with_non_elevated(config.share_elevated_sandboxes)?;
 
     let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
 

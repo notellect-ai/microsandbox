@@ -4007,6 +4007,7 @@ mod tests {
                     asked = true;
                     Ok(elevated)
                 });
+
                 assert_eq!(
                     launch.share_elevated_sandboxes,
                     opt_in && elevated,
@@ -4028,10 +4029,12 @@ mod tests {
             .unwrap();
         let opted_in: GlobalConfigPatch =
             serde_json::from_str(r#"{"runtime":{"share_elevated_sandboxes":true}}"#).unwrap();
+
         let error = try_render_launch_on(&test_local_backend_with(opted_in), &config, || {
             Err(MicrosandboxError::Runtime("injected".into()))
         })
         .unwrap_err();
+
         assert!(error.to_string().contains("injected"), "{error}");
     }
 

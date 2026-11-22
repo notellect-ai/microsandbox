@@ -186,12 +186,14 @@ mod tests {
             )
         };
         assert_ne!(converted, 0, "{}", io::Error::last_os_error());
+
         let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
         let sddl = String::from_utf16_lossy(unsafe { from_raw_parts(text, len) });
         unsafe {
             LocalFree(text.cast());
             LocalFree(descriptor);
         }
+
         sddl.to_ascii_lowercase()
     }
 
@@ -206,9 +208,11 @@ mod tests {
             elevation_share::is_elevated().unwrap(),
             "this test creates pipes owned by Administrators: run it elevated (administrator)"
         );
+
         let _decision = Decision::take();
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let _guard = runtime.enter();
+
         let client_ace = format!(
             "(a;;0x12019b;;;{})",
             elevation_share::current_logon_sid()
@@ -234,6 +238,7 @@ mod tests {
                 elevation_share::shared_pipe_security,
             )
             .unwrap();
+
             assert_eq!(queried, opt_in, "opt_in={opt_in}: elevation type read");
 
             let name = format!(
@@ -243,20 +248,22 @@ mod tests {
             let mut options = ServerOptions::new();
             options.first_pipe_instance(true);
             let pipe = create_shared_pipe(&options, &name).unwrap();
-            let pipe = dacl(pipe.as_raw_handle());
-            println!("opt_in={opt_in} elevation type {elevation}: pipe {pipe}");
+            let dacl_sddl = dacl(pipe.as_raw_handle());
+            println!("opt_in={opt_in} elevation type {elevation}: pipe {dacl_sddl}");
+
             assert_eq!(
-                pipe.contains(&client_ace),
+                dacl_sddl.contains(&client_ace),
                 shared,
-                "pipe DACL for opt_in={opt_in} elevation type {elevation}: {pipe}"
+                "pipe DACL for opt_in={opt_in} elevation type {elevation}: {dacl_sddl}"
             );
             // Only the sign-in is granted client rights, never the account.
             assert_eq!(
-                pipe.matches("(a;;0x12019b;;;").count(),
+                dacl_sddl.matches("(a;;0x12019b;;;").count(),
                 usize::from(shared),
-                "pipe DACL for opt_in={opt_in} elevation type {elevation}: {pipe}"
+                "pipe DACL for opt_in={opt_in} elevation type {elevation}: {dacl_sddl}"
             );
         }
+
         share_with_non_elevated_as(false, || unreachable!(), unbuilt).unwrap();
 
         assert!(!shared());

@@ -49,6 +49,7 @@ pub(super) trait SessionConnector: VerifiedControlConnector {
         None
     }
 }
+
 type Entries = Mutex<HashMap<RuntimeKey, Arc<Entry>>>;
 
 pub(crate) struct ControlSessions {

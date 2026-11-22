@@ -156,6 +156,7 @@ impl PipeDenial {
         if elevation_share::is_elevated_sandbox_denial(&error) {
             *self.0.lock().unwrap() = Some(Arc::new(error));
         }
+
         client
     }
 
@@ -182,6 +183,8 @@ impl fmt::Display for SharedCause {
     }
 }
 
+// By hand: a derived `#[source]` would be the `Arc` itself, which callers cannot downcast to
+// the `io::Error` they look for.
 impl Error for SharedCause {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&*self.0)
