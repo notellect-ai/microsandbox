@@ -797,8 +797,12 @@ fn deliver(read: &mut PendingIo, shared: &SharedState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::panic::resume_unwind;
     use std::process;
-    use std::sync::{Barrier, mpsc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Condvar, OnceLock, mpsc};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
@@ -811,6 +815,18 @@ mod tests {
     use super::*;
 
     const DEADLINE: Duration = Duration::from_secs(10);
+
+    /// The quota test pipes are created with, in each direction.
+    const PIPE_QUOTA: usize = 4096;
+
+    /// Guest bytes the relay may have accepted beyond MAX_BUFFERED_BYTES
+    /// while blocked writing to a Host that reads nothing: the IO_CHUNK_SIZE
+    /// write it took from the queue, plus what earlier writes left in the
+    /// pipe's buffers (counted for both directions, to be safe).
+    const RELAY_SLACK: usize = IO_CHUNK_SIZE + 2 * PIPE_QUOTA;
+
+    /// The probe of each test pipe's relay workers, by pipe name.
+    static PROBES: OnceLock<Mutex<HashMap<PathBuf, Arc<WorkerProbe>>>> = OnceLock::new();
 
     #[test]
     fn rejects_remote_and_ambiguous_pipe_paths() {
@@ -909,7 +925,7 @@ mod tests {
     #[derive(Default)]
     pub(super) struct WorkerProbe {
         waits: Mutex<WorkerWaits>,
-        changed: std::sync::Condvar,
+        changed: Condvar,
     }
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -926,9 +942,6 @@ mod tests {
         /// The probe of the workers relaying to `path`; tests use a pipe name
         /// of their own, so each test sees only its own workers.
         pub(super) fn for_pipe(path: &Path) -> Arc<Self> {
-            static PROBES: std::sync::OnceLock<
-                Mutex<std::collections::HashMap<PathBuf, Arc<WorkerProbe>>>,
-            > = std::sync::OnceLock::new();
             let probes = PROBES.get_or_init(Default::default);
             Arc::clone(
                 probes
@@ -1440,19 +1453,6 @@ mod tests {
         }
     }
 
-    //----------------------------------------------------------------------------------------------
-    // Fault injection
-    //----------------------------------------------------------------------------------------------
-
-    /// The quota test pipes are created with, in each direction.
-    const PIPE_QUOTA: usize = 4096;
-
-    /// Guest bytes the relay may have accepted beyond MAX_BUFFERED_BYTES
-    /// while blocked writing to a Host that reads nothing: the IO_CHUNK_SIZE
-    /// write it took from the queue, plus what earlier writes left in the
-    /// pipe's buffers (counted for both directions, to be safe).
-    const RELAY_SLACK: usize = IO_CHUNK_SIZE + 2 * PIPE_QUOTA;
-
     /// A Host pipe end several Host threads use at once. Each holds an Arc,
     /// so the handle is closed only after the last of them is done with it,
     /// even when a test fails part way.
@@ -1480,7 +1480,7 @@ mod tests {
                 4096,
                 4096,
                 0,
-                std::ptr::null(),
+                null(),
             )
         };
         assert_ne!(server, INVALID_HANDLE_VALUE);
@@ -1493,7 +1493,7 @@ mod tests {
         start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
     ) -> io::Result<usize> {
         let event = Event::new(true)?;
-        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
         overlapped.hEvent = event.0;
         if start(pipe.raw(), &mut overlapped) == 0 {
             let error = io::Error::last_os_error();
@@ -1528,7 +1528,7 @@ mod tests {
                     handle,
                     rest.as_mut_ptr(),
                     rest.len().min(IO_CHUNK_SIZE) as u32,
-                    std::ptr::null_mut(),
+                    null_mut(),
                     overlapped,
                 )
             })
@@ -1547,7 +1547,7 @@ mod tests {
                     handle,
                     chunk.as_ptr(),
                     chunk.len() as u32,
-                    std::ptr::null_mut(),
+                    null_mut(),
                     overlapped,
                 )
             })
@@ -1575,14 +1575,14 @@ mod tests {
         let name = pipe_name("floodin");
         let server = host_pipe(&name);
         const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
-        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = Arc::new(AtomicUsize::new(0));
         let host_sent = Arc::clone(&sent);
-        let host = std::thread::spawn(move || {
+        let host = thread::spawn(move || {
             host_accept(&server);
             let flood = pattern(LENGTH, 7);
             for chunk in flood.chunks(IO_CHUNK_SIZE) {
                 host_write_all(&server, chunk);
-                host_sent.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+                host_sent.fetch_add(chunk.len(), Ordering::SeqCst);
             }
             server
         });
@@ -1600,7 +1600,7 @@ mod tests {
         );
         // So the Host's writes stall: the relay has no read in flight, so the
         // Host completed no more than the buffer plus what the pipe holds.
-        let sent_now = sent.load(std::sync::atomic::Ordering::SeqCst);
+        let sent_now = sent.load(Ordering::SeqCst);
         assert!(
             sent_now <= MAX_BUFFERED_BYTES + PIPE_QUOTA,
             "the Host wrote {sent_now} bytes the guest has not read"
@@ -1614,9 +1614,9 @@ mod tests {
         let name = pipe_name("floodout");
         let server = host_pipe(&name);
         const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
-        let (read_tx, read_rx) = std::sync::mpsc::channel::<()>();
-        let host = std::thread::spawn(move || {
+        let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
+        let (read_tx, read_rx) = mpsc::channel::<()>();
+        let host = thread::spawn(move || {
             host_accept(&server);
             accepted_tx.send(()).unwrap();
             read_rx
@@ -1651,9 +1651,9 @@ mod tests {
         let name = pipe_name("bothways");
         let server = host_pipe_duplex(&name);
         const LENGTH: usize = 2 * MAX_BUFFERED_BYTES + 12_345;
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
         let pipe = Arc::clone(&server);
-        let host_writer = std::thread::spawn(move || {
+        let host_writer = thread::spawn(move || {
             duplex_accept(&pipe);
             accepted_tx.send(()).unwrap();
             duplex_write_all(&pipe, &pattern(LENGTH, 9));
@@ -1663,7 +1663,7 @@ mod tests {
             .recv_timeout(DEADLINE)
             .expect("Host accepting the guest");
         let pipe = Arc::clone(&server);
-        let host_reader = std::thread::spawn(move || duplex_read_exact(&pipe, LENGTH));
+        let host_reader = thread::spawn(move || duplex_read_exact(&pipe, LENGTH));
         // The guest writes and reads together on one thread, as the muxer
         // does: neither direction may wait for the other to finish.
         let outgoing = pattern(LENGTH, 10);
@@ -1703,7 +1703,7 @@ mod tests {
                     "both ways stalled: sent {sent}, received {}",
                     received.len()
                 );
-                std::thread::yield_now();
+                thread::yield_now();
             }
         }
         assert_eq!(received, pattern(LENGTH, 9));
@@ -1717,9 +1717,9 @@ mod tests {
         let name = pipe_name("shutwrite");
         let server = host_pipe(&name);
         const LENGTH: usize = 1 << 20;
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
-        let (shut_tx, shut_rx) = std::sync::mpsc::channel::<()>();
-        let host = std::thread::spawn(move || {
+        let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
+        let (shut_tx, shut_rx) = mpsc::channel::<()>();
+        let host = thread::spawn(move || {
             host_accept(&server);
             accepted_tx.send(()).unwrap();
             shut_rx
@@ -1753,7 +1753,7 @@ mod tests {
     fn a_guest_full_shutdown_mid_write_releases_the_pipe() {
         let name = pipe_name("shutboth");
         let server = host_pipe(&name);
-        let host = std::thread::spawn(move || {
+        let host = thread::spawn(move || {
             host_accept(&server);
             server
         });
@@ -1783,9 +1783,9 @@ mod tests {
     fn a_host_disconnect_mid_write_ends_the_guest_stream() {
         let name = pipe_name("disconnect");
         let server = host_pipe(&name);
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
-        let (disconnect_tx, disconnect_rx) = std::sync::mpsc::channel::<()>();
-        let host = std::thread::spawn(move || {
+        let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
+        let (disconnect_tx, disconnect_rx) = mpsc::channel::<()>();
+        let host = thread::spawn(move || {
             host_accept(&server);
             accepted_tx.send(()).unwrap();
             disconnect_rx
@@ -1817,7 +1817,7 @@ mod tests {
                 Instant::now() < deadline,
                 "guest writes kept going after the Host disconnected"
             );
-            std::thread::yield_now();
+            thread::yield_now();
         }
         loop {
             match endpoint.read(&mut [0_u8; 16]) {
@@ -1829,14 +1829,13 @@ mod tests {
                 Instant::now() < deadline,
                 "the guest stream never ended after the Host disconnected"
             );
-            std::thread::yield_now();
+            thread::yield_now();
         }
         drop(server);
     }
 
     /// Join `thread` within DEADLINE, re-raising its panic.
-    fn join_in_time<T: Send + 'static>(thread: std::thread::JoinHandle<T>) -> T {
-        within_deadline(move || thread.join())
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    fn join_in_time<T: Send + 'static>(thread: JoinHandle<T>) -> T {
+        within_deadline(move || thread.join()).unwrap_or_else(|panic| resume_unwind(panic))
     }
 }
