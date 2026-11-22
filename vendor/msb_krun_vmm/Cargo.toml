@@ -66,3 +66,18 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 
 [dev-dependencies]
 devices = { package = "msb_krun_devices", version = "0.1.46", git = "https://github.com/superradcompany/libkrun", rev = "77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3", features = ["test_utils"] }
+
+# Notellect: this crate is a workspace member (so cargo runs its tests) but
+# stays a copy of libkrun 77cad8a1; these are that code's own findings under
+# current clippy, allowed so the workspace and Windows lint gates hold for
+# every other lint.
+[lints.rust]
+dead_code = "allow"
+
+[lints.clippy]
+collapsible_match = "allow"
+io_other_error = "allow"
+manual_is_multiple_of = "allow"
+needless_borrow = "allow"
+needless_return = "allow"
+too_many_arguments = "allow"

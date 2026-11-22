@@ -1225,12 +1225,19 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 /// x86_64 (vendor/libkrunfw/config-libkrunfw-windows_x86_64). The
 /// `bundled_kernel_hz_matches_libkrunfw_config` test reads that config, so a
 /// libkrunfw update that changes HZ fails the test instead of booting guests
-/// with a wrong loops-per-jiffy.
+/// with a wrong loops-per-jiffy. A libkrunfw built elsewhere (MSB_LIBKRUNFW_PATH)
+/// must keep HZ=250 too: every upstream x86_64 config has it.
 #[cfg(any(
     test,
     all(target_os = "windows", target_arch = "x86_64", not(feature = "tee"))
 ))]
 const BUNDLED_KERNEL_HZ: u64 = 250;
+
+/// The guest kernel's HZ, known only for the kernel bundle (libkrunfw).
+#[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee")))]
+fn bundled_kernel_hz(payload: &Payload) -> Option<u64> {
+    matches!(payload, Payload::KernelCopy).then_some(BUNDLED_KERNEL_HZ)
+}
 
 // Assemble a fresh command line so a failed boot does not modify the resources.
 // `kernel_hz` is the guest kernel's CONFIG_HZ when the builder knows it (the
@@ -1256,7 +1263,8 @@ fn initial_kernel_cmdline(
         // the TSC as delay source, Linux's own value is tsc_khz * 1000 / HZ
         // (tsc_init sets lpj_fine that way), so pass exactly that. Only for a
         // kernel whose HZ is known: with a wrong HZ, udelay would be off by
-        // the same factor. A caller's lpj later in the command line wins.
+        // the same factor. A caller's lpj later in the command line wins; a
+        // caller who overrides tsc_early_khz should pass a matching lpj too.
         if let Some(hz) = kernel_hz.filter(|hz| *hz != 0) {
             cmdline.insert("lpj", &(khz * 1000 / hz).to_string())?;
         }
@@ -1339,7 +1347,7 @@ pub fn build_microvm_paused(
     let tsc_frequency_hz = None;
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee")))]
-    let kernel_hz = matches!(payload, Payload::KernelCopy).then_some(BUNDLED_KERNEL_HZ);
+    let kernel_hz = bundled_kernel_hz(&payload);
     #[cfg(not(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee"))))]
     let kernel_hz = None;
 
@@ -4996,6 +5004,22 @@ pub mod tests {
                 "tsc_early_khz=3792883 lpj=15171532 quiet lpj=1000 -- lpj=7"
             );
         }
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn bundled_kernel_hz_is_known_only_for_the_kernel_bundle() {
+        assert_eq!(bundled_kernel_hz(&Payload::KernelCopy), Some(250));
+        assert_eq!(bundled_kernel_hz(&Payload::Firmware), None);
+        assert_eq!(bundled_kernel_hz(&Payload::Empty), None);
+        let external = Payload::ExternalKernel(ExternalKernel {
+            path: PathBuf::from("vmlinux"),
+            format: crate::vmm_config::external_kernel::KernelFormat::Raw,
+            initramfs_path: None,
+            initramfs_size: 0,
+            cmdline: None,
+        });
+        assert_eq!(bundled_kernel_hz(&external), None);
     }
 
     #[test]
