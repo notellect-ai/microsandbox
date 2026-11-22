@@ -38,9 +38,6 @@ thread_local! {
     pub(super) static AFTER_HOST_UNLINK: RefCell<Option<Box<dyn FnOnce()>>> =
         const { RefCell::new(None) };
 
-    /// Runs on the unlinking thread after a pin found that the name still
-    /// holds the inode's file and before it pins the file's metadata stream,
-    /// so a test can replace the name inside that window.
     pub(super) static AFTER_PIN_CHECK: RefCell<Option<Box<dyn FnOnce()>>> =
         const { RefCell::new(None) };
 }
@@ -231,33 +228,23 @@ impl PassthroughFs {
         }
         // Read the guest metadata now: an ADS override moves with whichever
         // file holds the name, so after a rename-over it is the new file's.
-        // Read it at this name, which the check below confirms still holds
-        // the inode's file, not at the inode's path, another hard link.
-        let current = self.current_override_at(&metadata, &data, path)?;
+        let current = self.current_override(&metadata, &data)?;
         let file = StdOpenOptions::new()
             .read(true)
             .write(!metadata.permissions().readonly())
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .map_err(host_error)?;
-        let file_metadata = file.metadata().map_err(host_error)?;
-        reject_reparse_metadata(&file_metadata)?;
+        reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
         if !Self::holds_own_object(&data, &file) {
             return Ok(None);
         }
-
         after_pin_check();
-        // A metadata stream pinned through the checked handle is the file's
-        // own, so its contents replace what was read by path above.
-        let (stat_file, stat) =
-            match self.pin_owned_stat(&file, self.default_override(&file_metadata))? {
-                Some((stat_file, stat)) => (Some(stat_file), stat),
-                None => (None, current),
-            };
+        let stat_file = self.pin_owned_stat(path, current)?;
         Ok(Some(PreparedOwnedUnlink {
             data,
             file,
-            stat,
+            stat: current,
             stat_file,
         }))
     }
@@ -273,9 +260,7 @@ impl PassthroughFs {
         }
         // Read the guest metadata now: an ADS override moves with whichever
         // file holds the name, so after a rename-over it is the new file's.
-        // Read it at this name, which the check below confirms still holds
-        // the inode's file, not at the inode's path, another hard link.
-        let current = self.current_override_at(&metadata, &data, path).ok()?;
+        let current = self.current_override(&metadata, &data).ok()?;
         // Keep it in memory as well: if a step below fails, the fallback pin
         // after the host operation can no longer read the stream by path.
         // Only while the name still holds this file: once the host replaced
@@ -294,27 +279,25 @@ impl PassthroughFs {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .ok()?;
-        let file_metadata = file.metadata().ok()?;
-        reject_reparse_metadata(&file_metadata).ok()?;
+        reject_reparse_metadata(&file.metadata().ok()?).ok()?;
         if !Self::holds_own_object(&data, &file) {
             return None;
         }
-
         after_pin_check();
+
         // Pin the file's own metadata stream too, so that a chmod or chown
         // made while the file has no name is stored with the file, where a
         // lookup of another hard link reads it. Without it the change stays
-        // in memory only. A stream pinned through the checked handle is the
-        // file's own, so its contents replace what was read by path above.
-        let (stat_file, stat) =
-            match self.pin_owned_stat(&file, self.default_override(&file_metadata)) {
-                Ok(Some((stat_file, stat))) => (Some(stat_file), stat),
-                _ => (None, current),
-            };
+        // in memory only.
+        let stat_file = self
+            .pin_owned_stat(path, current)
+            .ok()
+            .flatten()
+            .filter(|stat_file| Self::holds_own_object(&data, stat_file));
         Some(PreparedOwnedUnlink {
             data,
             file,
-            stat,
+            stat: current,
             stat_file,
         })
     }
