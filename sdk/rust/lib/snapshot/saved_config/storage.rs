@@ -482,7 +482,11 @@ fn admit_mount_shape(
         | VolumeMount::DiskImage { options, .. }
         | VolumeMount::Tmpfs { options, .. } => options,
     };
-    if *saved_options != SavedMountOptions::from(target_options) {
+    // `cache` is the Host's reply-caching policy for the bind; the guest keeps
+    // no state from it, so a resumed sandbox may choose it afresh.
+    let mut target_saved = SavedMountOptions::from(target_options);
+    target_saved.cache = saved_options.cache;
+    if *saved_options != target_saved {
         return Err(error(
             "SCFG_FULL_STATE",
             "storage.mounts",

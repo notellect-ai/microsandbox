@@ -91,6 +91,17 @@ export type MountOptions = {
    * must be set together.
    */
   override_gid?: number | null;
+  /**
+   * Whether the guest may cache directory entries and attributes for this
+   * host directory bind mount.
+   *
+   * Off by default: the guest revalidates every lookup, so Host edits
+   * (including atomic replacement of a file or folder) are visible at once.
+   * Turn it on only for host trees that do not change while mounted; otherwise
+   * the guest may see stale names and sizes for a few seconds. Valid only for
+   * bind mounts; it has no effect on single-file bind mounts.
+   */
+  cache?: boolean;
 };
 
 export type OwnedVolumeStorage = {

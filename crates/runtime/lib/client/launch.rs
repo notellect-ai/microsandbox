@@ -142,6 +142,11 @@ pub struct LaunchCapabilities {
     /// Older runtimes omit this capability.
     #[serde(default)]
     pub restored_exec_limits: bool,
+
+    /// Directory `--mount` specs accept `cache=on|off`. Older runtimes omit this
+    /// capability and reject the option as unknown when the VM is built.
+    #[serde(default)]
+    pub directory_mount_cache: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.

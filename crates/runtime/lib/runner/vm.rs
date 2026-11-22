@@ -2580,11 +2580,12 @@ fn build_vm(
                 stale_inodes: external_options.invalid_inodes.clone(),
             });
         }
+        let (entry_timeout, attr_timeout) = directory_mount_cache_timeouts(parsed.cache);
         let cfg = PassthroughConfig {
             max_state_bytes: vm.fs_state_limit(),
             root_dir: host_path.clone(),
-            entry_timeout: Duration::ZERO,
-            attr_timeout: Duration::ZERO,
+            entry_timeout,
+            attr_timeout,
             external_checkpoint: owned_checkpoint.is_none().then_some(external_options),
             owned_checkpoint,
             inject_init: false,
@@ -3838,6 +3839,9 @@ struct ParsedMountSpec {
     /// (`gid=` option). `None` keeps the runtime default. Must be set together
     /// with [`override_uid`](Self::override_uid).
     override_gid: Option<u32>,
+    /// Let the guest cache entries and attributes (`cache=on`). Off by default;
+    /// see [`directory_mount_cache_timeouts`].
+    cache: bool,
 }
 
 /// Parse a `--mount` spec into [`ParsedMountSpec`].
@@ -3849,6 +3853,7 @@ struct ParsedMountSpec {
 /// default no-follow root resolution; its absence keeps the protective default on.
 /// `uid=`/`gid=` set the guest owner presented for host files that have no per-file
 /// override (see [`ParsedMountSpec::override_uid`]); they must be given together.
+/// `cache=on|off` selects guest entry/attribute caching (see [`ParsedMountSpec::cache`]).
 fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let (tag, rest) = spec
         .split_once(':')
@@ -3877,6 +3882,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut quota_bytes = None;
     let mut override_uid = None;
     let mut override_gid = None;
+    let mut cache = false;
     let mut seen_stat_virt = false;
     let mut seen_host_perms = false;
     let mut seen_access = false;
@@ -3887,6 +3893,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut seen_quota = false;
     let mut seen_uid = false;
     let mut seen_gid = false;
+    let mut seen_cache = false;
 
     if let Some(opts) = options {
         for opt in opts.split(',') {
@@ -4008,6 +4015,23 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
                                 format!("invalid gid {value:?} (expected an unsigned integer)")
                             })?);
                         }
+                        "cache" => {
+                            if seen_cache {
+                                return Err(
+                                    "mount option `cache` specified more than once".to_string()
+                                );
+                            }
+                            seen_cache = true;
+                            cache = match value {
+                                "on" => true,
+                                "off" => false,
+                                other => {
+                                    return Err(format!(
+                                        "invalid cache {other:?} (expected on|off)"
+                                    ));
+                                }
+                            }
+                        }
                         other => return Err(format!("unknown mount option {other:?}")),
                     }
                 }
@@ -4037,7 +4061,25 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
         quota_bytes,
         override_uid,
         override_gid,
+        cache,
     })
+}
+
+/// Guest FUSE entry and attribute timeouts for a host directory mount.
+///
+/// Zero by default: the Host atomically replaces authoring folders between runs
+/// (d1d0d366), so the guest must revalidate every lookup to see the new names and
+/// sizes. `cache=on` restores the passthrough defaults (5 s) and is meant only for
+/// host trees that do not change while mounted, such as per-run projection trees;
+/// on a tree that does change, the guest may see stale names and sizes for up to
+/// the timeout.
+fn directory_mount_cache_timeouts(cache: bool) -> (Duration, Duration) {
+    if !cache {
+        return (Duration::ZERO, Duration::ZERO);
+    }
+
+    let defaults = PassthroughConfig::default();
+    (defaults.entry_timeout, defaults.attr_timeout)
 }
 
 /// Split `host_path[:opts]`, skipping the drive colon in Windows paths.
@@ -4153,10 +4195,11 @@ mod tests {
     use super::{
         AGENT_BULK_QUEUE_SIZE, AGENT_CONTROL_QUEUE_SIZE, AgentTransportProfile, ConsoleSharedState,
         HostPermissions, StatVirtualization, agent_kernel_cmdline, agent_primary_queue_size,
-        append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame,
-        guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override, parse_mount_spec,
-        prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline, validate_disk_format,
+        append_block_root_env, bind_rootfs_backend, directory_mount_cache_timeouts,
+        encode_bootstrap_frame, guest_shutdown_flush_timeout,
+        guest_shutdown_flush_timeout_with_override, parse_mount_spec, prepend_scripts_path,
+        request_guest_shutdown, request_guest_shutdown_with_timeout, thp_kernel_cmdline,
+        validate_disk_format,
     };
     #[cfg(unix)]
     use super::{
@@ -4924,6 +4967,43 @@ mod tests {
             err.contains("cannot be combined with stat-virt=off"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_parse_mount_spec_cache_selects_directory_timeouts() {
+        let five = Duration::from_secs(5);
+
+        // Absent and explicit off keep the zero timeouts that make Host edits
+        // visible at once (d1d0d366).
+        for spec in ["work:/host/work", "work:/host/work:cache=off"] {
+            let p = parse_mount_spec(spec).unwrap();
+            assert!(!p.cache, "{spec}");
+            assert_eq!(
+                directory_mount_cache_timeouts(p.cache),
+                (Duration::ZERO, Duration::ZERO),
+                "{spec}"
+            );
+        }
+
+        let p = parse_mount_spec("proj:/host/proj:ro,cache=on").unwrap();
+        assert!(p.cache);
+        assert!(p.readonly);
+        assert_eq!(directory_mount_cache_timeouts(p.cache), (five, five));
+    }
+
+    #[test]
+    fn test_parse_mount_spec_cache_rejects_duplicates_and_invalid_values() {
+        let err = parse_mount_spec("proj:/host/proj:cache=on,cache=on").unwrap_err();
+        assert!(err.contains("`cache` specified more than once"), "{err}");
+        let err = parse_mount_spec("proj:/host/proj:cache=on,cache=off").unwrap_err();
+        assert!(err.contains("`cache` specified more than once"), "{err}");
+
+        for value in ["yes", "true", "1", ""] {
+            let err = parse_mount_spec(&format!("proj:/host/proj:cache={value}")).unwrap_err();
+            assert!(err.contains("invalid cache"), "{value}: {err}");
+        }
+        let err = parse_mount_spec("proj:/host/proj:cache").unwrap_err();
+        assert!(err.contains("expected flag or key=value"), "{err}");
     }
 
     #[test]

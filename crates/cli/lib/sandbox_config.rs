@@ -253,6 +253,7 @@ struct MountObject {
     host_permissions: Option<HostPermissionsInput>,
     uid: Option<u32>,
     gid: Option<u32>,
+    cache: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1461,6 +1462,9 @@ fn materialize_mount_object(object: &MountObject) -> anyhow::Result<VolumeMount>
     if object.uid.is_some() && object.bind.is_none() && object.named.is_none() {
         anyhow::bail!("mount.uid and mount.gid are only valid for bind or named mounts");
     }
+    if object.cache.is_some() && object.bind.is_none() {
+        anyhow::bail!("mount.cache is only valid for bind mounts");
+    }
 
     let tmpfs_size = object
         .tmpfs
@@ -1513,6 +1517,9 @@ fn materialize_mount_object(object: &MountObject) -> anyhow::Result<VolumeMount>
     }
     if let (Some(uid), Some(gid)) = (object.uid, object.gid) {
         mount = mount.owner(uid, gid);
+    }
+    if let Some(cache) = object.cache {
+        mount = mount.cache(cache);
     }
     mount.build().map_err(Into::into)
 }
@@ -2813,6 +2820,45 @@ patches:
             }
             other => panic!("expected bind mount, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn yaml_mounts_accept_cache_on_binds_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = write_config(
+            dir.path(),
+            "valid-cache.yaml",
+            r#"
+image: alpine
+mounts:
+  - bind: "./projection"
+    target: "/projection"
+    readonly: true
+    cache: true
+  - "./other:/other:cache=on"
+"#,
+        );
+        let patch = load_root(&valid).unwrap();
+        for input in patch.mounts.unwrap() {
+            match materialize_mount(&input).unwrap() {
+                VolumeMount::Bind { options, .. } => assert!(options.cache),
+                other => panic!("expected bind mount, got {other:?}"),
+            }
+        }
+
+        let named = write_config(
+            dir.path(),
+            "named-cache.yaml",
+            "image: alpine\nmounts:\n  - named: cache\n    target: /cache\n    cache: true\n",
+        );
+        let error =
+            resolve(&SandboxConfigSources::default().source(SandboxConfigKind::Root, named))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("mount.cache is only valid for bind mounts"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -13,11 +13,13 @@ use crate::ui::{self, OutputFormat};
 /// Render a non-default mount policy suffix for `msb inspect` output.
 ///
 /// Returns an empty string when every policy is at its conservative default
-/// (`Strict` + `Private` + no-follow root), so common mounts stay terse.
+/// (`Strict` + `Private` + no-follow root + no guest caching), so common mounts
+/// stay terse.
 fn mount_policy_suffix(
     sv: StatVirtualization,
     hp: HostPermissions,
     follow_root_symlinks: bool,
+    cache: bool,
 ) -> String {
     let mut tokens = Vec::new();
     match sv {
@@ -31,6 +33,9 @@ fn mount_policy_suffix(
     }
     if follow_root_symlinks {
         tokens.push("follow-root-symlinks");
+    }
+    if cache {
+        tokens.push("cache=on");
     }
     if tokens.is_empty() {
         String::new()
@@ -303,7 +308,8 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                                     mount_policy_suffix(
                                         *stat_virtualization,
                                         *host_permissions,
-                                        false
+                                        false,
+                                        options.cache,
                                     )
                                 )
                             }
@@ -327,6 +333,7 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                             *stat_virtualization,
                             *host_permissions,
                             *follow_root_symlinks,
+                            options.cache,
                         );
                         let quota = quota_mib
                             .map(|mib| format!(" [quota={mib}MiB]"))
@@ -350,6 +357,7 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                             *stat_virtualization,
                             *host_permissions,
                             *follow_root_symlinks,
+                            options.cache,
                         );
                         println!("  {guest:<16}\u{2192} volume:{name}{flags}{suffix}");
                     }
@@ -525,6 +533,37 @@ mod tests {
         let plain = console::strip_ansi_codes(&rendered).to_string();
         assert_eq!(plain, "1 GiB \u{2192} 4 GiB next start");
         assert!(rendered.starts_with("1 GiB"));
+    }
+
+    #[test]
+    fn mount_policy_suffix_shows_cache_only_when_on() {
+        assert_eq!(
+            mount_policy_suffix(
+                StatVirtualization::Strict,
+                HostPermissions::Private,
+                false,
+                false
+            ),
+            ""
+        );
+        assert_eq!(
+            mount_policy_suffix(
+                StatVirtualization::Strict,
+                HostPermissions::Private,
+                false,
+                true
+            ),
+            " [cache=on]"
+        );
+        assert_eq!(
+            mount_policy_suffix(
+                StatVirtualization::Relaxed,
+                HostPermissions::Private,
+                true,
+                true
+            ),
+            " [stat-virt=relaxed,follow-root-symlinks,cache=on]"
+        );
     }
 
     #[test]

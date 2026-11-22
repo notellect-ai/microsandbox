@@ -467,6 +467,19 @@ impl MountBuilder {
         self
     }
 
+    /// Let the guest cache directory entries and attributes for this bind mount.
+    ///
+    /// Off by default, so Host edits (including atomic replacement of a file or
+    /// folder) are visible in the guest at once. Turn it on only for host trees
+    /// that do not change while the sandbox runs, such as a tree built just for
+    /// one run; on a tree that does change, the guest may see stale names and
+    /// sizes for a few seconds. Valid only for bind mounts; it has no effect on
+    /// single-file bind mounts. Requires a runtime that supports it.
+    pub fn cache(mut self, enabled: bool) -> Self {
+        self.options.cache = enabled;
+        self
+    }
+
     /// Set size limit (for tmpfs).
     ///
     /// Accepts bare `u32` (interpreted as MiB) or a [`SizeExt`](crate::size::SizeExt) helper:
@@ -600,6 +613,11 @@ impl MountBuilder {
             return Err(crate::MicrosandboxError::InvalidConfig(
                 ".host_permissions() is only valid for bind and directory-backed named or owned volume mounts"
                     .into(),
+            ));
+        }
+        if self.options.cache && !is_bind {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                ".cache() is only valid for bind mounts".into(),
             ));
         }
         if has_mount_owner(&self.options) && !is_virtiofs {
@@ -1294,9 +1312,11 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
             host_permissions,
         } => match storage {
             OwnedVolumeStorage::Directory { .. } => {
+                validate_mount_cache_unset(options)?;
                 validate_virtiofs_policies(*stat_virtualization, *host_permissions, options)?
             }
             OwnedVolumeStorage::Disk { capacity_mib } => {
+                validate_mount_cache_unset(options)?;
                 if *capacity_mib == 0 {
                     return Err(crate::MicrosandboxError::InvalidConfig(
                         "owned disk volumes require a positive size".into(),
@@ -1329,6 +1349,7 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
             ..
         } => {
             crate::volume::validate_volume_name(name)?;
+            validate_mount_cache_unset(options)?;
             if create
                 .as_ref()
                 .is_some_and(|create| create.kind() == VolumeKind::Disk)
@@ -1343,7 +1364,10 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
                 validate_virtiofs_policies(*stat_virtualization, *host_permissions, options)?;
             }
         }
-        VolumeMount::Tmpfs { options, .. } => validate_non_virtiofs_ownership(options)?,
+        VolumeMount::Tmpfs { options, .. } => {
+            validate_mount_cache_unset(options)?;
+            validate_non_virtiofs_ownership(options)?
+        }
         VolumeMount::DiskImage {
             host,
             fstype,
@@ -1351,6 +1375,7 @@ fn validate_volume_mount(mount: &VolumeMount) -> crate::MicrosandboxResult<()> {
             ..
         } => {
             validate_host_path_wire_safe(host, "disk image host path")?;
+            validate_mount_cache_unset(options)?;
             validate_non_virtiofs_ownership(options)?;
             if let Some(fstype) = fstype {
                 validate_fstype(fstype)?;
@@ -1451,6 +1476,16 @@ fn validate_mount_ownership(
         return Err(crate::MicrosandboxError::InvalidConfig(
             "mount owner (uid/gid) cannot be combined with stat_virtualization=Off because Off exposes literal host metadata"
                 .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Guest entry/attribute caching is a host directory bind policy only.
+fn validate_mount_cache_unset(options: &MountOptions) -> crate::MicrosandboxResult<()> {
+    if options.cache {
+        return Err(crate::MicrosandboxError::InvalidConfig(
+            "mount cache is only valid for bind mounts".into(),
         ));
     }
     Ok(())
@@ -1739,6 +1774,66 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("cannot be combined with stat_virtualization=Off"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_mount_builder_cache_on_bind_only() {
+        match MountBuilder::new("/proj")
+            .bind("/host/proj")
+            .cache(true)
+            .build()
+            .unwrap()
+        {
+            VolumeMount::Bind { options, .. } => assert!(options.cache),
+            other => panic!("expected bind, got {other:?}"),
+        }
+        match MountBuilder::new("/live")
+            .bind("/host/live")
+            .build()
+            .unwrap()
+        {
+            VolumeMount::Bind { options, .. } => assert!(!options.cache),
+            other => panic!("expected bind, got {other:?}"),
+        }
+
+        for result in [
+            MountBuilder::new("/tmp").tmpfs().cache(true).build(),
+            MountBuilder::new("/disk")
+                .disk("/host/disk.raw")
+                .cache(true)
+                .build(),
+            MountBuilder::new("/named")
+                .named("cache-dir")
+                .cache(true)
+                .build(),
+            MountBuilder::new("/owned").owned().cache(true).build(),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(".cache() is only valid for bind mounts"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_volume_mounts_rejects_direct_cache_outside_bind() {
+        let options = MountOptions {
+            cache: true,
+            ..MountOptions::default()
+        };
+        let mut mounts = vec![VolumeMount::Tmpfs {
+            guest: "/tmp".into(),
+            size_mib: None,
+            options,
+        }];
+        let err = validate_volume_mounts(&mut mounts).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mount cache is only valid for bind mounts"),
             "{err}"
         );
     }

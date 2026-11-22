@@ -812,6 +812,7 @@ fn own_launch_capabilities() -> microsandbox_runtime::launch::LaunchCapabilities
         share_elevated_sandboxes: cfg!(windows),
         deferred_command_bindings: true,
         restored_exec_limits: true,
+        directory_mount_cache: true,
     }
 }
 

@@ -502,13 +502,25 @@ Bind mounts and directory-backed named volumes normally present host files witho
 
 Both IDs are required together and may range from `0` through `4294967295`. Mount owners require stat virtualization, so they cannot be combined with `stat-virt=off`, tmpfs, host disk images, or disk-backed named volumes. Local contexts and managed cloud support this policy. On managed cloud, it changes the guest view of files in the organization volume; it does not change host ownership or permissions.
 
+### Guest entry and attribute caching
+
+By default the guest revalidates every name lookup and file attribute on a host directory bind mount, so Host edits, including atomic replacement of a file or folder, are visible immediately. Each guest file open then costs several round trips to the host filesystem server.
+
+Set `cache=on` (Rust: `.cache(true)`) to let the guest cache names and attributes for a few seconds. Use it only for host directories that do not change while the sandbox runs, such as a tree built just before the sandbox starts and removed after it stops.
+
+<Warning>
+On a directory that the Host changes while it is mounted, `cache=on` can make the guest see stale names, sizes, and attributes for up to about five seconds. Leave caching off for live working folders.
+</Warning>
+
+`cache` is accepted only for host directory bind mounts (`--mount-dir`, or `-v` with a host path); it has no effect on single-file binds and is rejected for named volumes, owned storage, tmpfs, and disk images. It requires a runtime that supports it: an older runtime is refused before launch with an upgrade-required error. Snapshots keep the setting.
+
 ### CLI syntax and flags
 
 Most CLI mount flags use `SOURCE:DEST[:OPTIONS]`; `--mount-owned` only needs `DEST[:OPTIONS]`. The `:` before `OPTIONS` starts the option block, and commas separate options inside that block.
 
 | Flag | Source | Options |
 |------|--------|---------|
-| `--mount-dir` | Host directory | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `quota=<size>`, paired `uid=<N>,gid=<N>` |
+| `--mount-dir` | Host directory | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `quota=<size>`, paired `uid=<N>,gid=<N>`, `cache=on\|off` (see [caching](#guest-entry-and-attribute-caching)) |
 | `--mount-file` | Host file | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `quota=<size>`, paired `uid=<N>,gid=<N>` |
 | `--mount-named` | Named volume | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `kind=dir\|disk`, `size=<size>` for `kind=disk`, `quota=<size>` for directory volumes; directory-backed named volumes also support `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, paired `uid=<N>,gid=<N>` |
 | `--mount-disk` | Host disk image | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `format=raw\|qcow2\|vmdk`, `fstype=<type>` |
