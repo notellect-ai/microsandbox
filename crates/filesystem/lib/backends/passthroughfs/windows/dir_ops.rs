@@ -37,31 +37,13 @@ impl PassthroughFs {
         Ok(snapshot.as_ref().unwrap().clone())
     }
 
-    pub(super) fn snapshot_entry_attributes(
-        &self,
-        parent: u64,
-        entry: &DirSnapshotEntry,
-    ) -> io::Result<Entry> {
+    pub(super) fn snapshot_entry_attributes(&self, entry: &DirSnapshotEntry) -> io::Result<Entry> {
         if self.cfg.inject_init && entry.inode == INIT_INODE {
             return Ok(init_entry(self.cfg.entry_timeout, self.cfg.attr_timeout));
         }
         let data = self.inode(entry.inode)?;
-        let attributes = self
-            .inode_metadata(&data)
-            .and_then(|metadata| self.entry_from_metadata(&metadata, data.as_ref()));
-        match attributes {
-            // The host put another file at the name after the listing: report
-            // what the name holds now, as a fresh listing would.
-            Err(error) if error.raw_os_error() == Some(LINUX_ESTALE) => {
-                let name = std::ffi::CString::new(entry.name.clone())
-                    .map_err(|_| linux_error(LINUX_EINVAL))?;
-                let path = self.child_path(parent, &name)?;
-                let metadata = self.safe_metadata(&path)?;
-                let child = self.intern_path(path)?;
-                self.entry_from_metadata(&metadata, child.as_ref())
-            }
-            attributes => attributes,
-        }
+        let metadata = self.inode_metadata(&data)?;
+        self.entry_from_metadata(&metadata, data.as_ref())
     }
 
     pub(super) fn dir_entries(&self, inode: u64) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
