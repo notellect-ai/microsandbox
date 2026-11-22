@@ -142,7 +142,7 @@ impl PassthroughFs {
         let retained_stat = owned_metadata::write_retained_stat(data, stat)?;
         if let Some(store) = &self.stat_store
             && !retained_stat
-            && !self.defer_retained_metadata(data)
+            && data.retained.lock().unwrap().is_none()
         {
             store.write(&data.path(), uid, gid, mode, rdev)?;
         }
@@ -160,38 +160,6 @@ impl PassthroughFs {
             }
         }
 
-        Ok(())
-    }
-
-    /// A retained file without a pinned ADS has no name to store metadata
-    /// under: the change stays in `virtual_meta` and is marked for
-    /// `save_unsaved_metadata`. Checked under the inode table lock, which a
-    /// lookup holds while it names the file again, so the lookup either sees
-    /// the mark or has already named the file.
-    fn defer_retained_metadata(&self, data: &InodeData) -> bool {
-        let _inodes = self.inodes.read().unwrap();
-        let retained = data.retained.lock().unwrap().is_some();
-        if retained {
-            data.unsaved_metadata.store(true, Ordering::Release);
-        }
-        retained
-    }
-
-    /// Store the metadata the guest set on a retained file under `path`, the
-    /// name a lookup gives it again. Called with the inode table locked.
-    pub(super) fn save_unsaved_metadata(&self, data: &InodeData, path: &Path) -> io::Result<()> {
-        if !data.unsaved_metadata.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        let meta = data.virtual_meta.read().unwrap().clone();
-        if let Some(store) = &self.stat_store
-            && let Some(mode) = meta.mode
-        {
-            let rdev = meta.rdev.try_into().unwrap_or(u32::MAX);
-            store.write(path, meta.uid, meta.gid, mode, rdev)?;
-        }
-        data.unsaved_metadata.store(false, Ordering::Release);
         Ok(())
     }
 
