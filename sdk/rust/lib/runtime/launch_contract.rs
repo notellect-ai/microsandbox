@@ -2401,6 +2401,7 @@ mod tests {
             "share_elevated_sandboxes": true,
             "deferred_command_bindings": true,
             "restored_exec_limits": true,
+            "directory_mount_cache": true,
         }))
         .unwrap();
         CAPABILITIES.lock().await.insert(
@@ -2447,6 +2448,12 @@ mod tests {
             "validate_share_elevated_sandboxes",
             validate_share_elevated_sandboxes(&path, true).await.is_ok(),
         );
+        check(
+            "validate_mount_cache",
+            validate_mount_cache(&path, &cache_mount_config())
+                .await
+                .is_ok(),
+        );
         #[cfg(feature = "net")]
         {
             check(
@@ -2480,6 +2487,24 @@ mod tests {
         assert!(error.to_string().contains("Probe failed"), "{error}");
     }
 
+    /// A config whose only mount turns directory caching on.
+    fn cache_mount_config() -> SandboxConfig {
+        let mut config = SandboxConfig::default();
+        config.spec.mounts.push(VolumeMount::Bind {
+            host: std::env::temp_dir(),
+            guest: "/proj".into(),
+            options: microsandbox_types::MountOptions {
+                cache: true,
+                ..Default::default()
+            },
+            stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+            host_permissions: microsandbox_types::HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+        });
+        config
+    }
+
     fn all_capabilities() -> LaunchCapabilities {
         serde_json::from_value(serde_json::json!({
             "protocols": [2, 1],
@@ -2496,6 +2521,7 @@ mod tests {
             "share_elevated_sandboxes": true,
             "deferred_command_bindings": true,
             "restored_exec_limits": true,
+            "directory_mount_cache": true,
         }))
         .unwrap()
     }
@@ -2565,6 +2591,12 @@ mod tests {
         check(
             "validate_share_elevated_sandboxes",
             validate_share_elevated_sandboxes(&own, true).await.is_ok(),
+        );
+        check(
+            "validate_mount_cache",
+            validate_mount_cache(&own, &cache_mount_config())
+                .await
+                .is_ok(),
         );
         check(
             "require_restore_guard",
