@@ -1,0 +1,49 @@
+# Proof-only workflow for an upstream PR draft. It lives ONLY on the fork's
+# notellect/pr-proof/<name>[-unfixed] branches (one extra commit on top of the
+# PR branch); the PR branch itself never carries it.
+#
+# Runs the whole Windows passthrough backend module, as the PR's ci commit
+# makes upstream's windows-quality job do, on both of that job's runners.
+name: PR proof
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Show toolchain
+        shell: bash
+        run: rustc -vV
+      # The tests run first: an -unfixed branch must fail here.
+      - name: Tests
+        shell: bash
+        run: cargo test --locked --no-default-features -p microsandbox-filesystem --lib 'backends::passthroughfs::windows::'
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --locked --no-default-features -p microsandbox-filesystem --all-targets -- -D warnings
