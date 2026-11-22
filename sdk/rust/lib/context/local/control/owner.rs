@@ -11,6 +11,8 @@ use microsandbox_db::{
     entity::{run, sandbox},
 };
 use microsandbox_protocol_client::{BoxFuture, BoxTransport};
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
@@ -96,8 +98,8 @@ impl LocalContext {
         let pid = run.pid.ok_or_else(|| {
             MicrosandboxError::ControlClient(Arc::new(ControlClientError::RuntimeChanged))
         })?;
-        let process = ProcessIdentity::capture(pid)
-            .map_err(|error| MicrosandboxError::ControlClient(Arc::new(error)))?;
+        let process =
+            ProcessIdentity::capture(pid).map_err(|error| control_error(Arc::new(error)))?;
         let key = RuntimeKey {
             sandbox_id: model.id,
             run_id: run.id,
@@ -115,13 +117,13 @@ impl LocalContext {
         owner
             .verify_session(Instant::now() + std::time::Duration::from_secs(10))
             .await
-            .map_err(|error| MicrosandboxError::ControlClient(Arc::new(error)))?;
+            .map_err(|error| control_error(Arc::new(error)))?;
         self.inner
             .control_sessions
             .get(key, owner)
             .await
             .map(Some)
-            .map_err(MicrosandboxError::ControlClient)
+            .map_err(control_error)
     }
 }
 
@@ -230,6 +232,22 @@ impl VerifiedControlConnector for RuntimeOwner {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// On Windows, an access-denied control connection from a non-elevated run most likely means
+/// an elevated run started the sandbox without sharing it; say so. Other errors are unchanged.
+fn control_error(error: Arc<ControlClientError>) -> MicrosandboxError {
+    #[cfg(windows)]
+    if let ControlClientError::Client(client) = &*error
+        && let ErrorKind::Io(kind) = client.kind
+    {
+        let denied = std::io::Error::new(kind, error.to_string());
+        if elevation_share::is_elevated_sandbox_denial(&denied) {
+            return elevation_share::explain_access_denied(denied).into();
+        }
+    }
+
+    MicrosandboxError::ControlClient(error)
+}
 
 async fn current_run(
     db: &DbReadConnection,
