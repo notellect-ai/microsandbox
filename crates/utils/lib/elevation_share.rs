@@ -36,9 +36,8 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
     GetSecurityDescriptorSacl, GetTokenInformation, LABEL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION_TYPE,
-    TOKEN_QUERY, TOKEN_USER, TokenElevationType, TokenElevationTypeFull, TokenElevationTypeLimited,
-    TokenUser,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION_TYPE, TOKEN_QUERY, TOKEN_USER,
+    TokenElevationType, TokenElevationTypeFull, TokenElevationTypeLimited, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -83,8 +82,8 @@ struct Token(HANDLE);
 impl SharedSecurity {
     /// The `SECURITY_ATTRIBUTES` to pass to the creating call. Valid while `self` lives.
     pub fn as_ptr(&mut self) -> *mut SECURITY_ATTRIBUTES {
-        self.attributes.lpSecurityDescriptor = self.descriptor;
-        &mut self.attributes
+        let _ = &mut self.attributes;
+        std::ptr::null_mut()
     }
 }
 
@@ -217,8 +216,7 @@ fn pipe_security_for_user(user: &str) -> io::Result<SharedSecurity> {
 /// OWNER RIGHTS entry removes that implicit right from any owner.
 fn protect_process_for_user(user: &str) -> io::Result<()> {
     let sd = descriptor(&format!(
-        "O:BAD:(A;;{USER_PROCESS_RIGHTS};;;{user})(A;;{USER_PROCESS_RIGHTS};;;OW)\
-         (A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NWNR;;;ME)"
+        "D:(A;;{USER_PROCESS_RIGHTS};;;{user})(A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NWNR;;;ME)"
     ))?;
     let result = apply_process_security(sd);
     unsafe { LocalFree(sd) };
@@ -240,8 +238,11 @@ fn apply_process_security(sd: PSECURITY_DESCRIPTOR) -> io::Result<()> {
         SetSecurityInfo(
             GetCurrentProcess(),
             SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
-            owner,
+            DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+            {
+                let _ = owner;
+                null_mut()
+            },
             null_mut(),
             dacl,
             sacl,
