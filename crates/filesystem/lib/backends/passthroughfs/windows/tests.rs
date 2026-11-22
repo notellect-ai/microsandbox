@@ -3704,9 +3704,9 @@ fn open_file_survives_unlink() {
 /// Pinning an open file before its name goes away is best effort on a mount
 /// without an owned checkpoint: a host-corrupted metadata stream fails the
 /// pin's stat read, yet the unlink or rename-over goes ahead and the guest's
-/// handle keeps working through the fallback pin. The fallback reads the
-/// override by path after the host operation; with `corrupt_replacement` the
-/// replacing file's override is unreadable too, and the pin still holds.
+/// handle keeps working through the fallback pin. The fallback keeps the
+/// inode's own metadata, not the replacing file's; with `corrupt_replacement`
+/// the replacing file's override is unreadable too, and the pin still holds.
 fn unreadable_metadata_does_not_block_name_loss(replace: bool, corrupt_replacement: bool) {
     let temp = TempDir::new();
     let fs = fs_for(&temp.path);
@@ -3738,6 +3738,7 @@ fn unreadable_metadata_does_not_block_name_loss(replace: bool, corrupt_replaceme
         let (st, _) = fs.getattr(context(), inode, fh).unwrap();
         assert_eq!(st.st_ino, inode);
         assert_eq!(st.st_size, 12);
+        assert_eq!(st.st_mode, S_IFREG | 0o640);
     }
     assert_eq!(read_all(&fs, inode, handle).unwrap(), b"old contents");
     let mut reader = SourceReader {
