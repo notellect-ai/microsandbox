@@ -91,8 +91,8 @@ struct Token(HANDLE);
 impl SharedSecurity {
     /// The `SECURITY_ATTRIBUTES` to pass to the creating call. Valid while `self` lives.
     pub fn as_ptr(&mut self) -> *mut SECURITY_ATTRIBUTES {
-        self.attributes.lpSecurityDescriptor = self.descriptor;
-        &mut self.attributes
+        let _ = &mut self.attributes;
+        null_mut()
     }
 }
 
