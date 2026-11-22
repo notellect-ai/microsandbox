@@ -513,7 +513,7 @@ impl DynFileSystem for PassthroughFs {
             .into_iter()
             .filter(|entry| entry.offset > offset)
             .map(|entry| {
-                let full = self.snapshot_entry_attributes(inode, &entry)?;
+                let full = self.snapshot_entry_attributes(&entry)?;
                 Ok((snapshot_dir_entry(entry), full))
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -536,7 +536,7 @@ impl DynFileSystem for PassthroughFs {
             if entry.offset <= offset {
                 continue;
             }
-            let full = self.snapshot_entry_attributes(inode, &entry)?;
+            let full = self.snapshot_entry_attributes(&entry)?;
             let id = full.inode;
             if add_entry(snapshot_dir_entry(entry), full)? == 0 {
                 break;
