@@ -4516,6 +4516,43 @@ fn a_lookup_inside_the_rename_window_keeps_the_moved_inode() {
     expect_errno(fs.lookup(context(), ROOT_INODE, c"tmp"), LINUX_ENOENT);
 }
 
+/// The Host replaces the mount's root directory (moves it away and creates
+/// a new one at its path). The root keeps its inode and serves the new
+/// directory: listing it (whose `..` entry looks the root up again) and
+/// stat of the root keep working.
+#[test]
+fn a_host_replace_of_the_root_keeps_the_root_inode() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("before"), b"old").unwrap();
+    let fs = fs_for(&temp.path);
+    let moved = TempDir {
+        path: temp.path.with_extension("moved"),
+    };
+    std::fs::rename(&temp.path, &moved.path).unwrap();
+    std::fs::create_dir(&temp.path).unwrap();
+    std::fs::write(temp.path.join("after"), b"new").unwrap();
+
+    for pass in 0..2 {
+        let (handle, _) = fs
+            .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+            .unwrap();
+        let handle = handle.unwrap();
+        let entries = fs.readdir(context(), ROOT_INODE, handle, 4096, 0).unwrap();
+        let names: Vec<_> = entries.iter().map(|entry| entry.name).collect();
+        assert_eq!(names, [b".".as_slice(), b"..", b"after"], "listing {pass}");
+        fs.releasedir(context(), ROOT_INODE, 0, handle).unwrap();
+        fs.getattr(context(), ROOT_INODE, None)
+            .unwrap_or_else(|error| panic!("stat of the root after listing {pass}: {error}"));
+    }
+    assert_eq!(
+        fs.lookup(context(), ROOT_INODE, c"after")
+            .unwrap()
+            .attr
+            .st_size,
+        3
+    );
+}
+
 /// The Host replaces a directory whose child the guest has looked up, by
 /// deleting it and renaming another directory into its place. The child's
 /// name must reach the new directory's child (or nothing), never the cached
