@@ -740,7 +740,7 @@ fn directory_rename_preserves_cached_descendants() {
         fs.release(context(), file.inode, 0, handle, false, false, None)
             .unwrap();
         let entries = fs.dir_entries(nested.inode).unwrap();
-        assert!(entries.iter().any(|(entry, _)| entry.name == b"file"));
+        assert!(entries.iter().any(|entry| entry.name == b"file"));
         assert_eq!(
             fs.lookup(context(), ROOT_INODE, c"moved").unwrap().inode,
             directory.inode
@@ -779,7 +779,7 @@ fn host_side_rename_keeps_directory_listable() {
         .dir_entries(sub.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name.to_vec())
         .collect();
     assert!(names.contains(&b"g.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
@@ -807,7 +807,7 @@ fn host_hard_link_keeps_both_names() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name.to_vec())
         .collect();
     assert!(names.contains(&b"a.txt".to_vec()) && names.contains(&b"b.txt".to_vec()));
     fs.getattr(context(), a.inode, None).unwrap();
@@ -835,7 +835,7 @@ fn host_rename_of_cached_hard_link_keeps_alias_usable() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name.to_vec())
         .collect();
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"c.txt".to_vec()), "{names:?}");
@@ -858,7 +858,7 @@ fn host_rename_of_cached_hard_link_repairs_during_listing() {
         .dir_entries(ROOT_INODE)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name.to_vec())
         .collect();
     assert!(names.contains(&b"b.txt".to_vec()), "{names:?}");
     assert!(names.contains(&b"c.txt".to_vec()), "{names:?}");
@@ -891,7 +891,7 @@ fn host_directory_rename_moves_cached_descendants() {
         .dir_entries(nested.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name.to_vec())
         .collect();
     assert!(names.contains(&b"file.txt".to_vec()), "{names:?}");
     // Lookups under the new name return the cached inodes.
@@ -941,7 +941,7 @@ fn host_move_into_recreated_parent_path_repairs_once() {
         .dir_entries(moved.inode)
         .unwrap()
         .into_iter()
-        .map(|(entry, _)| entry.name.to_vec())
+        .map(|entry| entry.name.to_vec())
         .collect();
     assert!(names.contains(&b"nested".to_vec()), "{names:?}");
     let (stat, _) = fs.getattr(context(), file.inode, None).unwrap();
@@ -4516,6 +4516,96 @@ fn a_lookup_inside_the_rename_window_keeps_the_moved_inode() {
     expect_errno(fs.lookup(context(), ROOT_INODE, c"tmp"), LINUX_ENOENT);
 }
 
+/// The Host replaces the mount's root directory (moves it away and creates
+/// a new one at its path). The root keeps its inode and serves the new
+/// directory: listing it (whose `..` entry looks the root up again) and
+/// stat of the root keep working.
+#[test]
+fn a_host_replace_of_the_root_keeps_the_root_inode() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("before"), b"old").unwrap();
+    let fs = fs_for(&temp.path);
+    let moved = TempDir {
+        path: temp.path.with_extension("moved"),
+    };
+    std::fs::rename(&temp.path, &moved.path).unwrap();
+    std::fs::create_dir(&temp.path).unwrap();
+    std::fs::write(temp.path.join("after"), b"new").unwrap();
+
+    for pass in 0..2 {
+        let (handle, _) = fs
+            .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+            .unwrap();
+        let handle = handle.unwrap();
+        let entries = fs.readdir(context(), ROOT_INODE, handle, 4096, 0).unwrap();
+        let names: Vec<_> = entries.iter().map(|entry| entry.name).collect();
+        assert_eq!(names, [b".".as_slice(), b"..", b"after"], "listing {pass}");
+        fs.releasedir(context(), ROOT_INODE, 0, handle).unwrap();
+        fs.getattr(context(), ROOT_INODE, None)
+            .unwrap_or_else(|error| panic!("stat of the root after listing {pass}: {error}"));
+    }
+    assert_eq!(
+        fs.lookup(context(), ROOT_INODE, c"after")
+            .unwrap()
+            .attr
+            .st_size,
+        3
+    );
+}
+
+/// The Host replaces the mount root and moves the old root inside the new
+/// one. The old root is an ordinary directory there, never inode 1, and the
+/// root keeps serving the new directory.
+#[test]
+fn the_old_root_moved_under_its_replacement_is_not_the_root() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("before"), b"old").unwrap();
+    let fs = fs_for(&temp.path);
+    let root_path = fs.inode(ROOT_INODE).unwrap().path();
+    let moved = TempDir {
+        path: temp.path.with_extension("moved"),
+    };
+    std::fs::rename(&temp.path, &moved.path).unwrap();
+    std::fs::create_dir(&temp.path).unwrap();
+    std::fs::write(temp.path.join("after"), b"new").unwrap();
+    std::fs::rename(&moved.path, temp.path.join("old")).unwrap();
+
+    for pass in 0..2 {
+        let (handle, _) = fs
+            .opendir(context(), ROOT_INODE, LINUX_O_DIRECTORY as u32)
+            .unwrap();
+        let handle = handle.unwrap();
+        let entries = fs.readdir(context(), ROOT_INODE, handle, 4096, 0).unwrap();
+        fs.releasedir(context(), ROOT_INODE, 0, handle).unwrap();
+        let mut names: Vec<_> = entries.iter().map(|entry| entry.name).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [b".".as_slice(), b"..", b"after", b"old"],
+            "listing {pass}"
+        );
+        let old = entries.iter().find(|entry| entry.name == b"old").unwrap();
+        assert_ne!(old.ino, ROOT_INODE, "listing {pass}");
+    }
+    let old = fs.lookup(context(), ROOT_INODE, c"old").unwrap();
+    assert_ne!(old.inode, ROOT_INODE);
+    assert_eq!(
+        fs.lookup(context(), old.inode, c"before")
+            .unwrap()
+            .attr
+            .st_size,
+        3
+    );
+    assert_eq!(
+        fs.lookup(context(), ROOT_INODE, c"after")
+            .unwrap()
+            .attr
+            .st_size,
+        3
+    );
+    assert_eq!(fs.inode(ROOT_INODE).unwrap().path(), root_path);
+}
+
 /// The Host replaces a directory whose child the guest has looked up, by
 /// deleting it and renaming another directory into its place. The child's
 /// name must reach the new directory's child (or nothing), never the cached
@@ -5044,4 +5134,233 @@ fn matrix_guest_rename_over_races() {
 #[test]
 fn matrix_guest_directory_rename_races() {
     run_matrix(MatrixGuest::RenameDir);
+}
+
+/// Host opens per operation: lookup and getattr read the object through one
+/// handle (plus the mount root's reparse check and the stat override), and
+/// readdir lists a directory in batches through its own handle, so its opens do
+/// not grow with the number of children except for each child's stat override.
+#[test]
+fn host_open_budget_for_lookup_getattr_and_readdir() {
+    const CHILDREN: u64 = 300;
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("dir")).unwrap();
+    for index in 0..CHILDREN {
+        std::fs::write(temp.path.join(format!("dir/f{index:03}.txt")), b"x").unwrap();
+    }
+
+    for (fs, override_reads) in [
+        (fs_for(&temp.path), 1),
+        (external_fs_for(&temp.path, false, false), 0),
+    ] {
+        let opens = host_opens();
+        let dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap();
+        assert_eq!(host_opens() - opens, 2 + override_reads, "lookup");
+
+        let opens = host_opens();
+        fs.getattr(context(), dir.inode, None).unwrap();
+        assert_eq!(host_opens() - opens, 2 + override_reads, "getattr");
+
+        let opens = host_opens();
+        let enumerations = host_enumerations();
+        let entries = fs.dir_entries(dir.inode).unwrap();
+        assert_eq!(entries.len() as u64, CHILDREN + 2);
+        assert_eq!(
+            host_opens() - opens,
+            2 + override_reads * CHILDREN,
+            "readdir"
+        );
+        // 300 short names fit in one 64 KiB batch; the next call ends the listing.
+        assert_eq!(host_enumerations() - enumerations, 2, "readdir batches");
+
+        let opens = host_opens();
+        let child = fs.lookup(context(), dir.inode, c"f007.txt").unwrap();
+        assert_eq!(host_opens() - opens, 3 + override_reads, "nested lookup");
+        let ino = entries
+            .iter()
+            .find(|entry| entry.name == b"f007.txt")
+            .unwrap()
+            .ino;
+        assert_eq!(child.inode, ino);
+
+        // readdirplus reads each listed child's attributes like getattr does.
+        let opens = host_opens();
+        let attributes = fs
+            .snapshot_entry_attributes(&DirSnapshotEntry {
+                inode: ino,
+                name: b"f007.txt".to_vec(),
+                offset: 0,
+                file_type: DT_REG,
+            })
+            .unwrap();
+        assert_eq!(
+            host_opens() - opens,
+            3 + override_reads,
+            "readdirplus child"
+        );
+        assert_eq!(attributes.attr.st_nlink, 1);
+        assert_eq!(attributes.attr.st_size, 1);
+    }
+}
+
+/// Readdir and lookup give a Host object one inode in either order, hard links
+/// share it, and the entry types match getattr, also on the per-child identity
+/// path non-NTFS volumes take.
+#[test]
+fn readdir_and_lookup_agree_on_inodes_types_and_hard_links() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("a.txt"), b"a").unwrap();
+    std::fs::hard_link(temp.path.join("a.txt"), temp.path.join("b.txt")).unwrap();
+    std::fs::create_dir(temp.path.join("d")).unwrap();
+
+    for listing_ids_disabled in [false, true] {
+        LISTING_IDS_DISABLED.with(|disabled| disabled.set(listing_ids_disabled));
+        for readdir_first in [true, false] {
+            let fs = fs_for(&temp.path);
+            let looked_up = |name: &CStr| fs.lookup(context(), ROOT_INODE, name).unwrap();
+            let (a, d, entries) = if readdir_first {
+                let entries = fs.dir_entries(ROOT_INODE).unwrap();
+                (looked_up(c"a.txt"), looked_up(c"d"), entries)
+            } else {
+                let (a, d) = (looked_up(c"a.txt"), looked_up(c"d"));
+                (a, d, fs.dir_entries(ROOT_INODE).unwrap())
+            };
+            let listed = |name: &[u8]| {
+                let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+                (entry.ino, entry.type_)
+            };
+            assert_eq!(listed(b"a.txt"), (a.inode, DT_REG));
+            assert_eq!(listed(b"b.txt"), (a.inode, DT_REG));
+            assert_eq!(listed(b"d"), (d.inode, DT_DIR));
+            assert_eq!(listed(b".."), (ROOT_INODE, DT_DIR));
+            assert_eq!(listed(b"."), (ROOT_INODE, DT_DIR));
+            assert_eq!(looked_up(c"b.txt").inode, a.inode);
+        }
+    }
+    LISTING_IDS_DISABLED.with(|disabled| disabled.set(false));
+}
+
+/// A guest symlink is a regular Host file whose stat override says S_IFLNK;
+/// readdir reports the type getattr reports, not the Host file type, from the
+/// ADS store, the sidecar store and storeless in-memory metadata alike. With
+/// stat virtualization off it reports the Host type.
+#[test]
+fn readdir_reports_the_virtual_entry_type() {
+    #[derive(Clone, Copy, Debug)]
+    enum Store {
+        Ads,
+        Sidecar,
+        Storeless,
+    }
+    for store in [Store::Ads, Store::Sidecar, Store::Storeless] {
+        let temp = TempDir::new();
+        let mount = || {
+            let mut fs = fs_for(&temp.path);
+            match store {
+                Store::Ads => assert_ads_store(&fs),
+                Store::Sidecar => fs.stat_store = Some(StatStore::sidecar(&fs.root)),
+                Store::Storeless => fs.stat_store = None,
+            }
+            fs
+        };
+        let fs = mount();
+        fs.symlink(
+            context(),
+            c"target.txt",
+            ROOT_INODE,
+            c"link",
+            Extensions::default(),
+        )
+        .unwrap();
+        fs.mkdir(
+            context(),
+            ROOT_INODE,
+            c"dir",
+            S_IFDIR | 0o755,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        std::fs::write(temp.path.join("host.txt"), b"h").unwrap();
+
+        // A fresh mount reads the types from the stored overrides, not memory;
+        // storeless metadata lives only in the mount that wrote it.
+        let mounts = match store {
+            Store::Storeless => vec![fs],
+            _ => vec![fs, mount()],
+        };
+        for fs in mounts {
+            let entries = fs.dir_entries(ROOT_INODE).unwrap();
+            let listed = |name: &[u8]| {
+                entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap_or_else(|| panic!("{store:?}: {name:?} not listed"))
+                    .type_
+            };
+            assert_eq!(listed(b"link"), DT_LNK, "{store:?}");
+            assert_eq!(listed(b"dir"), DT_DIR, "{store:?}");
+            assert_eq!(listed(b"host.txt"), DT_REG, "{store:?}");
+            let link = fs.lookup(context(), ROOT_INODE, c"link").unwrap();
+            assert_eq!(link.attr.st_mode & S_IFMT, S_IFLNK, "{store:?}");
+        }
+    }
+
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("dir")).unwrap();
+    std::fs::write(temp.path.join("file"), b"f").unwrap();
+    let fs = external_fs_for(&temp.path, false, false);
+    let entries = fs.dir_entries(ROOT_INODE).unwrap();
+    let listed = |name: &[u8]| {
+        entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
+            .type_
+    };
+    assert_eq!(listed(b"dir"), DT_DIR);
+    assert_eq!(listed(b"file"), DT_REG);
+}
+
+/// A listing longer than one batch: every name once, offsets in order, more
+/// than one batch read, and the same entries through the `read_dir` fallback
+/// that filesystems without batched listings take.
+#[test]
+fn readdir_lists_every_batch_and_the_fallback_agrees() {
+    const CHILDREN: usize = 1000;
+    let temp = TempDir::new();
+    let long = "n".repeat(120);
+    for index in 0..CHILDREN {
+        std::fs::write(temp.path.join(format!("{long}{index:04}")), b"x").unwrap();
+    }
+    std::fs::create_dir(temp.path.join("sub")).unwrap();
+    let fs = external_fs_for(&temp.path, false, false);
+
+    let enumerations = host_enumerations();
+    let batched = fs.dir_entries(ROOT_INODE).unwrap();
+    // About 190 records of 352 bytes fit in 64 KiB: six batches and the end.
+    assert!(host_enumerations() - enumerations >= 4);
+    assert_eq!(batched.len(), CHILDREN + 3);
+    let offsets: Vec<u64> = batched.iter().map(|entry| entry.offset).collect();
+    assert_eq!(offsets, (1..=batched.len() as u64).collect::<Vec<_>>());
+    let mut names: Vec<&[u8]> = batched.iter().map(|entry| entry.name).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), CHILDREN + 3);
+
+    LISTING_CLASS_UNSUPPORTED.with(|unsupported| unsupported.set(true));
+    let enumerations = host_enumerations();
+    let fallback = fs.dir_entries(ROOT_INODE);
+    LISTING_CLASS_UNSUPPORTED.with(|unsupported| unsupported.set(false));
+    let fallback = fallback.unwrap();
+    assert_eq!(host_enumerations() - enumerations, 1);
+    let key = |entries: &[DirEntry<'static>]| {
+        let mut key: Vec<(Vec<u8>, u64, u32)> = entries
+            .iter()
+            .map(|entry| (entry.name.to_vec(), entry.ino, entry.type_))
+            .collect();
+        key.sort();
+        key
+    };
+    assert_eq!(key(&fallback), key(&batched));
 }

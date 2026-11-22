@@ -20,19 +20,41 @@ impl PassthroughFs {
         safe_metadata_under_root(&self.root, path)
     }
 
+    /// Metadata, identity and link count of the object at `path`, read through
+    /// one handle after the same reparse-free resolution as `safe_metadata`.
+    pub(super) fn safe_attrs(&self, path: &Path) -> io::Result<HostAttrs> {
+        ensure_lexically_under_root(&self.root, path)?;
+        safe_attrs_under_root(&self.root, path)
+    }
+
     pub(super) fn stat_from_metadata(
         &self,
         metadata: &std::fs::Metadata,
         data: &InodeData,
     ) -> io::Result<stat64> {
+        self.stat_from_metadata_links(metadata, data, None)
+    }
+
+    /// `links` is the Host link count already read with `metadata`, from the
+    /// object at the inode's path; without it the count is read again.
+    pub(super) fn stat_from_metadata_links(
+        &self,
+        metadata: &std::fs::Metadata,
+        data: &InodeData,
+        links: Option<u32>,
+    ) -> io::Result<stat64> {
         if !self.cfg.stat_virtualization_enabled() {
-            return self.stat_link_count(host_stat_from_metadata(metadata, data.inode), data);
+            return self.stat_link_count(
+                host_stat_from_metadata(metadata, data.inode),
+                data,
+                links,
+            );
         }
 
         if let Some(override_stat) = owned_metadata::read_retained_stat(data)? {
             let mut st = host_stat_from_metadata(metadata, data.inode);
             apply_override_stat(&mut st, override_stat);
-            return self.stat_link_count(st, data);
+            return self.stat_link_count(st, data, links);
         }
 
         if let Some(store) = &self.stat_store
@@ -47,7 +69,7 @@ impl PassthroughFs {
                 st.st_uid = uid;
                 st.st_gid = gid;
             }
-            return self.stat_link_count(st, data);
+            return self.stat_link_count(st, data, links);
         }
 
         // Storeless path (e.g. relaxed mode with no persistent stat store):
@@ -61,7 +83,7 @@ impl PassthroughFs {
             st.st_uid = uid;
             st.st_gid = gid;
         }
-        self.stat_link_count(st, data)
+        self.stat_link_count(st, data, links)
     }
 
     pub(super) fn entry_from_metadata(
@@ -69,10 +91,19 @@ impl PassthroughFs {
         metadata: &std::fs::Metadata,
         data: &InodeData,
     ) -> io::Result<Entry> {
+        self.entry_from_metadata_links(metadata, data, None)
+    }
+
+    pub(super) fn entry_from_metadata_links(
+        &self,
+        metadata: &std::fs::Metadata,
+        data: &InodeData,
+        links: Option<u32>,
+    ) -> io::Result<Entry> {
         Ok(Entry {
             inode: data.inode,
             generation: 0,
-            attr: self.stat_from_metadata(metadata, data)?,
+            attr: self.stat_from_metadata_links(metadata, data, links)?,
             attr_flags: 0,
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
@@ -185,12 +216,19 @@ impl PassthroughFs {
         let data = self.inode(inode)?;
         // An open handle names the object itself, even while its path is being
         // replaced and before the inode bookkeeping catches up.
-        let metadata = match handle.map(|handle| self.handle(inode, handle)) {
-            Some(Ok(handle)) => handle.file.lock().unwrap().metadata().map_err(host_error)?,
-            _ => self.inode_metadata(&data)?,
+        let (metadata, links) = match handle.map(|handle| self.handle(inode, handle)) {
+            Some(Ok(handle)) => (
+                handle.file.lock().unwrap().metadata().map_err(host_error)?,
+                None,
+            ),
+            _ if data.retained.lock().unwrap().is_some() => (self.inode_metadata(&data)?, None),
+            _ => {
+                let attrs = self.safe_attrs(&data.path())?;
+                (attrs.metadata, Some(attrs.links))
+            }
         };
         Ok((
-            self.stat_from_metadata(&metadata, data.as_ref())?,
+            self.stat_from_metadata_links(&metadata, data.as_ref(), links)?,
             self.cfg.attr_timeout,
         ))
     }

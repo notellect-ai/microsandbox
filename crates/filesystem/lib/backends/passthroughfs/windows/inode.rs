@@ -68,13 +68,9 @@ impl InodeData {
 
 impl PassthroughFs {
     pub(super) fn path_identity(&self, path: &Path) -> io::Result<Option<(u32, u64)>> {
-        let file = StdOpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .map_err(host_error)?;
-        reject_reparse_metadata(&file.metadata().map_err(host_error)?)?;
-        mobility::file_identity(&file).map(Some)
+        let attrs = host_attrs(&open_host_object(path, FILE_READ_ATTRIBUTES)?)?;
+        reject_reparse_metadata(&attrs.metadata)?;
+        Ok(Some(attrs.identity))
     }
 
     pub(super) fn record_owned_entry(&self, entry: Entry) -> Entry {
@@ -194,7 +190,17 @@ impl PassthroughFs {
     }
 
     pub(super) fn intern_path(&self, path: PathBuf) -> io::Result<Arc<InodeData>> {
-        let mut identity = self.path_identity(&path)?;
+        let identity = self.path_identity(&path)?;
+        self.intern_identified_path(path, identity)
+    }
+
+    /// Intern `path` whose object had `identity` when the caller read it (from
+    /// its own handle or a directory enumeration), before the table lock.
+    pub(super) fn intern_identified_path(
+        &self,
+        path: PathBuf,
+        mut identity: Option<(u32, u64)>,
+    ) -> io::Result<Arc<InodeData>> {
         let mut inodes = self.inodes.write().unwrap();
         if let Some(data) = inodes.by_path.get(&path).cloned() {
             if identity.is_some() && data.identity.is_some() && data.identity != identity {
@@ -203,7 +209,13 @@ impl PassthroughFs {
                 // now holds. Read it again under the lock.
                 identity = self.path_identity(&path)?;
             }
-            if identity.is_none() || data.identity.is_none() || data.identity == identity {
+            // The mount root keeps its inode when the Host replaces the
+            // directory at its path: the guest cannot look it up again.
+            if data.inode == ROOT_INODE
+                || identity.is_none()
+                || data.identity.is_none()
+                || data.identity == identity
+            {
                 // A cached alias (hard link) can outlive the canonical name.
                 if identity.is_some() && data.identity == identity {
                     let displaced = Self::follow_host_rename(&mut inodes, &data, &path, |p| {
@@ -233,8 +245,11 @@ impl PassthroughFs {
                 }
             }
         }
+        // The root never takes another name: after the Host replaced it, its
+        // old directory may come back under the mount as an ordinary one.
         if let Some(identity) = identity
             && let Some(data) = inodes.by_identity.get(&identity).cloned()
+            && data.inode != ROOT_INODE
         {
             // FUSE aliases must share one logical inode, not just equal st_ino values:
             // otherwise the guest can cache conflicting file contents and attributes.
@@ -379,9 +394,9 @@ impl PassthroughFs {
     }
 
     pub(super) fn entry_for_path(&self, path: PathBuf) -> io::Result<Entry> {
-        let metadata = self.safe_metadata(&path)?;
-        let data = self.intern_path(path.clone())?;
-        self.entry_from_metadata(&metadata, data.as_ref())
+        let attrs = self.safe_attrs(&path)?;
+        let data = self.intern_identified_path(path, Some(attrs.identity))?;
+        self.entry_from_metadata_links(&attrs.metadata, data.as_ref(), Some(attrs.links))
     }
 
     pub(super) fn do_lookup(&self, parent: u64, name: &CStr) -> io::Result<Entry> {
