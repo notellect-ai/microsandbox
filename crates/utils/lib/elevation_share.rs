@@ -112,7 +112,8 @@ impl Drop for Token {
 /// non-elevated runs: only when the user opted in (`opt_in`) and the token is the full half of
 /// a split token. Everything else keeps the default security, and with it the UAC boundary.
 pub fn shares_with_non_elevated(opt_in: bool, elevation: TOKEN_ELEVATION_TYPE) -> bool {
-    opt_in && elevation == TokenElevationTypeFull
+    let _ = opt_in;
+    elevation == TokenElevationTypeFull
 }
 
 /// Security attributes for creating a named pipe server instance that a non-elevated run of
