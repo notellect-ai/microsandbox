@@ -5013,7 +5013,7 @@ pub mod tests {
         assert_eq!(bundled_kernel_hz(&Payload::Firmware), None);
         assert_eq!(bundled_kernel_hz(&Payload::Empty), None);
         let external = Payload::ExternalKernel(ExternalKernel {
-            path: PathBuf::from("vmlinux"),
+            path: std::path::PathBuf::from("vmlinux"),
             format: crate::vmm_config::external_kernel::KernelFormat::Raw,
             initramfs_path: None,
             initramfs_size: 0,
