@@ -9,12 +9,13 @@ use microsandbox_protocol::{
     exec_bindings::{BoundExecRequest, ExecBindingCapability, ExecBindingOverrides},
     message::{Message, MessageType},
 };
+#[cfg(windows)]
+use microsandbox_utils::elevation_share;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     time::Instant,
 };
 
-#[cfg(feature = "local")]
 use super::AgentClientError;
 use super::AgentClientResult;
 
@@ -76,6 +77,7 @@ impl AgentClient {
         microsandbox_agent_client::OptimizedAgentClient::connect(sock_path)
             .await
             .map(Self::from_transport)
+            .map_err(explain_connect_error)
     }
 
     /// Connect over an arbitrary byte-stream transport with an explicit
@@ -106,6 +108,7 @@ impl AgentClient {
         microsandbox_agent_client::OptimizedAgentClient::connect_with_timeout(sock_path, timeout)
             .await
             .map(Self::from_transport)
+            .map_err(explain_connect_error)
     }
 
     /// Connect to an arbitrary agent relay socket path with an explicit
@@ -117,6 +120,7 @@ impl AgentClient {
         microsandbox_agent_client::OptimizedAgentClient::connect_with_deadline(sock_path, deadline)
             .await
             .map(Self::from_transport)
+            .map_err(explain_connect_error)
     }
 
     /// Resolve a sandbox name to its agent socket path and connect.
@@ -227,4 +231,18 @@ fn agent_endpoint_may_exist(path: &Path) -> bool {
 #[cfg(all(feature = "local", windows))]
 fn agent_endpoint_may_exist(_path: &Path) -> bool {
     true
+}
+
+/// On Windows, explain an access-denied connect: the sandbox was most likely started by an
+/// elevated run that did not share it with non-elevated runs.
+fn explain_connect_error(error: AgentClientError) -> AgentClientError {
+    #[cfg(windows)]
+    if let AgentClientError::Connect { path, source } = error {
+        return AgentClientError::Connect {
+            path,
+            source: elevation_share::explain_access_denied(source),
+        };
+    }
+
+    error
 }
