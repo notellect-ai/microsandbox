@@ -303,7 +303,8 @@ mod tests {
         INVALID_HANDLE_VALUE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSidToSidW,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+        ConvertStringSidToSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
@@ -317,7 +318,8 @@ mod tests {
     };
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX};
     use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, FILE_MAP_READ, OpenFileMappingW, PAGE_READWRITE,
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, FILE_MAP_WRITE, OpenFileMappingW,
+        PAGE_READWRITE,
     };
     use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
     use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
@@ -509,8 +511,12 @@ mod tests {
             )
         };
         assert_ne!(pipe, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
-        // Default security, as the metrics registry creates its mapping; readers open it
-        // read-only, which the logon SID's read access allows: no sharing needed.
+        // Default security, as the metrics registry creates its mapping (no explicit
+        // descriptor). A named object in an object directory takes its DACL from the
+        // directory's inheritable ACEs when it has any, not from the token's default DACL,
+        // and only process, thread and token objects get the creator's High label; the
+        // descriptor printed here is what the filtered token's opens below are checked
+        // against.
         let mapping_name = format!("Local\\msb-elevation-share-test-{id}");
         let mapping = unsafe {
             CreateFileMappingW(
@@ -523,6 +529,7 @@ mod tests {
             )
         };
         assert!(!mapping.is_null(), "{}", io::Error::last_os_error());
+        eprintln!("child: mapping security: {}", kernel_object_sddl(mapping));
 
         // libtest has already printed `test <name> ... ` without a newline.
         println!("\n{READY} {pipe_name} {mapping_name}");
@@ -535,6 +542,48 @@ mod tests {
             CloseHandle(pipe);
             CloseHandle(mapping);
         }
+    }
+
+    /// The owner, DACL and label of a kernel object, in SDDL.
+    fn kernel_object_sddl(handle: HANDLE) -> String {
+        let information =
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+        let mut security = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                information,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut security,
+            )
+        };
+        assert_eq!(status, 0, "{}", io::Error::from_raw_os_error(status as i32));
+        let mut text = null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    security,
+                    super::SDDL_REVISION_1,
+                    information,
+                    &mut text,
+                    null_mut(),
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        unsafe {
+            LocalFree(text.cast());
+            LocalFree(security);
+        }
+        value
     }
 
     /// This process's token with Administrators for deny only and Medium integrity: the
@@ -616,9 +665,9 @@ mod tests {
         granted: u32,
         /// The runtime pipe opened for read/write, or the error.
         pipe: io::Result<()>,
-        /// The default-security mapping opened for reading, as metrics readers do, or the
-        /// error.
-        mapping: io::Result<()>,
+        /// The default-security mapping opened for `FILE_MAP_READ`, `FILE_MAP_WRITE` and
+        /// `FILE_MAP_ALL_ACCESS`, in that order, or the errors.
+        mapping: [io::Result<()>; 3],
     }
 
     fn opened(ok: bool) -> io::Result<()> {
@@ -725,12 +774,16 @@ mod tests {
             if pipe != INVALID_HANDLE_VALUE {
                 unsafe { CloseHandle(pipe) };
             }
-            let mapping =
-                unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide(&mapping_name).as_ptr()) };
-            let mapping_result = opened(!mapping.is_null());
-            if !mapping.is_null() {
-                unsafe { CloseHandle(mapping) };
-            }
+            let mapping_result =
+                [FILE_MAP_READ, FILE_MAP_WRITE, FILE_MAP_ALL_ACCESS].map(|access| {
+                    let mapping =
+                        unsafe { OpenFileMappingW(access, 0, wide(&mapping_name).as_ptr()) };
+                    let result = opened(!mapping.is_null());
+                    if !mapping.is_null() {
+                        unsafe { CloseHandle(mapping) };
+                    }
+                    result
+                });
             assert_ne!(unsafe { RevertToSelf() }, 0);
             Access {
                 stop,
@@ -757,6 +810,21 @@ mod tests {
         access
     }
 
+    /// The filtered token opens a mapping the elevated runtime created with default
+    /// security for reading, writing and all access, with or without the opt-in, as it did
+    /// on the metrics registry mapping of a real elevated runtime under UAC.
+    fn assert_default_mapping_opens(mapping: &[io::Result<()>; 3]) {
+        for (access, result) in ["FILE_MAP_READ", "FILE_MAP_WRITE", "FILE_MAP_ALL_ACCESS"]
+            .iter()
+            .zip(mapping)
+        {
+            assert!(
+                result.is_ok(),
+                "open a default-security mapping for {access}: {result:?}"
+            );
+        }
+    }
+
     /// With the opt-in, a non-elevated run of the same account (Administrators deny-only,
     /// Medium) can open the elevated runtime's pipe, and opens its process and a mapping it
     /// created with default security exactly as it could without the opt-in.
@@ -781,10 +849,7 @@ mod tests {
             "process rights a non-elevated run gets on the elevated runtime \
              (granted {granted:#010x}, expected {ALLOWED_PROCESS_RIGHTS:#010x})"
         );
-        assert!(
-            mapping.is_ok(),
-            "open a default-security mapping for reading: {mapping:?}"
-        );
+        assert_default_mapping_opens(&mapping);
     }
 
     /// Without the opt-in, a non-elevated run of the same account cannot open the elevated
@@ -811,10 +876,7 @@ mod tests {
              (granted {granted:#010x}, expected {ALLOWED_PROCESS_RIGHTS:#010x})"
         );
         // The registry mapping never depended on the opt-in.
-        assert!(
-            mapping.is_ok(),
-            "open a default-security mapping for reading: {mapping:?}"
-        );
+        assert_default_mapping_opens(&mapping);
 
         let original = pipe.to_string();
         let explained = super::explain_access_denied_as(pipe, TokenElevationTypeLimited);
