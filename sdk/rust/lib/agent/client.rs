@@ -253,13 +253,7 @@ fn explain_connect_error_with(
     error: AgentClientError,
     explain: impl FnOnce(io::Error) -> io::Error,
 ) -> AgentClientError {
-    if let AgentClientError::Connect { path, source } = error {
-        return AgentClientError::Connect {
-            path,
-            source: explain(source),
-        };
-    }
-
+    let _ = explain;
     error
 }
 
