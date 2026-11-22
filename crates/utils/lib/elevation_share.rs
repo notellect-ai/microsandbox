@@ -149,7 +149,8 @@ pub fn is_elevated_sandbox_denial(error: &io::Error) -> bool {
 
 /// [`explain_access_denied`] for a process with token elevation type `elevation`.
 fn explain_access_denied_as(error: io::Error, elevation: TOKEN_ELEVATION_TYPE) -> io::Error {
-    if !is_elevated_sandbox_denial_as(&error, elevation) {
+    let _ = elevation;
+    if true {
         return error;
     }
 
