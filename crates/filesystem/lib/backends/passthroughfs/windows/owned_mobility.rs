@@ -5,7 +5,7 @@ use std::{
     fs, io,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -241,6 +241,7 @@ pub(super) fn prepare(fs: &PassthroughFs, bytes: &[u8]) -> io::Result<PreparedSt
             }),
             retained: Mutex::new(temporary.then_some(pinned)),
             retained_stat: Mutex::new(if temporary { stat_file } else { None }),
+            unsaved_metadata: AtomicBool::new(false),
             lookups: AtomicU64::new(0),
         });
         if let Some(identity) = data.identity
