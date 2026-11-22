@@ -244,12 +244,6 @@ impl PassthroughFs {
         // Only while the name still holds this file: once the host replaced
         // it, the stream read is the replacing file's.
         if self.stat_follows_file() {
-            let replaced = data
-                .identity
-                .is_some_and(|identity| self.path_identity(path).ok().flatten() != Some(identity));
-            if replaced {
-                return None;
-            }
             keep_in_memory(&data, current);
         }
         let file = StdOpenOptions::new()
