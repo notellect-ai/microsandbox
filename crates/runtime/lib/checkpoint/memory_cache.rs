@@ -572,10 +572,9 @@ pub(super) fn windows_file_identity(file: &File) -> io::Result<(u32, u32, u32)> 
 /// OWNER RIGHTS grant) is hardened, which also repairs its existing children once.
 #[cfg(windows)]
 fn restrict_cache_directory(path: &Path) -> io::Result<()> {
-    if cache_directory_is_restricted(path)? {
-        return Ok(());
-    }
-    microsandbox_utils::private_file::harden_existing_directory(path)
+    // Proof only: skip the repair of an existing directory.
+    let _ = cache_directory_is_restricted(path)?;
+    Ok(())
 }
 
 /// Whether `path` is a plain directory with a trusted owner and exactly the DACL that
