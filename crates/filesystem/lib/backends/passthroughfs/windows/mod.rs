@@ -11,10 +11,15 @@ use std::fs::{File, FileTimes, OpenOptions as StdOpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
+};
 
 use crate::agentd::agentd_bytes;
 use crate::{
@@ -347,30 +352,129 @@ fn resolve_root_no_reparse(root_dir: &Path) -> io::Result<PathBuf> {
     Ok(cursor)
 }
 
-fn safe_metadata_under_root(root: &Path, path: &Path) -> io::Result<std::fs::Metadata> {
+/// Host metadata, identity and link count of one object, read through one handle.
+struct HostAttrs {
+    metadata: std::fs::Metadata,
+    identity: (u32, u64),
+    links: u32,
+}
+
+/// Resolve `path` under `root` without following a reparse point, and open the
+/// final object once with `access`. Every ancestor, the root included, is checked
+/// by its own metadata before the next name is resolved under it; the final
+/// object's metadata, identity and link count all come from the returned handle.
+fn safe_open_under_root(root: &Path, path: &Path, access: u32) -> io::Result<(File, HostAttrs)> {
     ensure_lexically_under_root(root, path)?;
     let relative = path
         .strip_prefix(root)
         .map_err(|_| linux_error(LINUX_EACCES))?;
+    let components = relative.components().collect::<Vec<_>>();
     let mut cursor = root.to_path_buf();
-    reject_reparse_metadata(&std::fs::symlink_metadata(&cursor).map_err(host_error)?)?;
+    let last = components
+        .iter()
+        .rposition(|component| matches!(component, Component::Normal(_)));
+    if last.is_some() {
+        reject_reparse_metadata(&host_symlink_metadata(&cursor)?)?;
+    }
 
-    for component in relative.components() {
+    for (index, component) in components.iter().enumerate() {
         match component {
             Component::Normal(part) => {
                 if part.to_str().is_some_and(is_reserved_name) {
                     return Err(linux_error(LINUX_EPERM));
                 }
                 cursor.push(part);
-                let metadata = std::fs::symlink_metadata(&cursor).map_err(host_error)?;
-                reject_reparse_metadata(&metadata)?;
+                if Some(index) != last {
+                    reject_reparse_metadata(&host_symlink_metadata(&cursor)?)?;
+                }
             }
             Component::CurDir => {}
             _ => return Err(linux_error(LINUX_EACCES)),
         }
     }
 
+    let file = open_host_object(&cursor, access)?;
+    let attrs = host_attrs(&file)?;
+    reject_reparse_metadata(&attrs.metadata)?;
+    Ok((file, attrs))
+}
+
+fn safe_attrs_under_root(root: &Path, path: &Path) -> io::Result<HostAttrs> {
+    safe_open_under_root(root, path, FILE_READ_ATTRIBUTES).map(|(_, attrs)| attrs)
+}
+
+fn safe_metadata_under_root(root: &Path, path: &Path) -> io::Result<std::fs::Metadata> {
+    safe_attrs_under_root(root, path).map(|attrs| attrs.metadata)
+}
+
+/// Open the object at `path` itself (never a reparse target) for attribute reads.
+fn open_host_object(path: &Path, access: u32) -> io::Result<File> {
+    count_host_open();
+    StdOpenOptions::new()
+        .access_mode(access)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(host_error)
+}
+
+fn host_symlink_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+    count_host_open();
     std::fs::symlink_metadata(path).map_err(host_error)
+}
+
+fn host_attrs(file: &File) -> io::Result<HostAttrs> {
+    let metadata = file.metadata().map_err(host_error)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // The borrowed File keeps the handle live for the query; the API fills only
+    // this initialized information struct.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(host_error(io::Error::last_os_error()));
+    }
+    Ok(HostAttrs {
+        metadata,
+        identity: (
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ),
+        links: info.nNumberOfLinks,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOST_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HOST_ENUMERATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LISTING_IDS_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Count Host opens made by the lookup, getattr and readdir paths (tests only).
+fn count_host_open() {
+    #[cfg(test)]
+    HOST_OPENS.with(|opens| opens.set(opens.get() + 1));
+}
+
+/// Tests take the non-NTFS path of readdir (identity read per child) on NTFS.
+fn listing_ids_disabled() -> bool {
+    #[cfg(test)]
+    return LISTING_IDS_DISABLED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
+/// Count bulk directory enumeration calls (tests only).
+fn count_host_enumeration() {
+    #[cfg(test)]
+    HOST_ENUMERATIONS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(test)]
+fn host_enumerations() -> u64 {
+    HOST_ENUMERATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn host_opens() -> u64 {
+    HOST_OPENS.with(std::cell::Cell::get)
 }
 
 fn reject_reparse_metadata(metadata: &std::fs::Metadata) -> io::Result<()> {
@@ -558,6 +662,7 @@ fn mirror_eligible_type(file_type: u32) -> bool {
 }
 
 fn read_override_stream(path: &Path) -> io::Result<OverrideStat> {
+    count_host_open();
     let mut file = StdOpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
@@ -582,6 +687,7 @@ fn write_override_stream(path: &Path, override_stat: OverrideStat) -> io::Result
 }
 
 fn read_override_sidecar_file(path: &Path) -> io::Result<OverrideStat> {
+    count_host_open();
     let bytes = std::fs::read(path).map_err(host_error)?;
     OverrideStat::from_bytes(&bytes)
 }

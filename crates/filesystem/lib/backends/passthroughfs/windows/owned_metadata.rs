@@ -14,15 +14,21 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 impl PassthroughFs {
     /// Report the host link count, including zero for an unlinked retained file.
-    pub(super) fn stat_link_count(&self, mut stat: stat64, data: &InodeData) -> io::Result<stat64> {
+    /// `links`, when given, was read from the object at the inode's path with the
+    /// metadata in `stat`; a retained file always reports its own count.
+    pub(super) fn stat_link_count(
+        &self,
+        mut stat: stat64,
+        data: &InodeData,
+        links: Option<u32>,
+    ) -> io::Result<stat64> {
         let file = if let Some(file) = data.retained.lock().unwrap().as_ref() {
             file.try_clone().map_err(host_error)?
+        } else if let Some(links) = links {
+            stat.st_nlink = links.into();
+            return Ok(stat);
         } else {
-            StdOpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-                .open(data.path())
-                .map_err(host_error)?
+            open_host_object(&data.path(), FILE_READ_ATTRIBUTES)?
         };
         let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
