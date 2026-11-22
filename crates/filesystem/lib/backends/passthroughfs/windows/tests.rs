@@ -3704,9 +3704,9 @@ fn open_file_survives_unlink() {
 /// Pinning an open file before its name goes away is best effort on a mount
 /// without an owned checkpoint: a host-corrupted metadata stream fails the
 /// pin's stat read, yet the unlink or rename-over goes ahead and the guest's
-/// handle keeps working through the fallback pin. The fallback reads the
-/// override by path after the host operation; with `corrupt_replacement` the
-/// replacing file's override is unreadable too, and the pin still holds.
+/// handle keeps working through the fallback pin. The fallback keeps the
+/// inode's own metadata, not the replacing file's; with `corrupt_replacement`
+/// the replacing file's override is unreadable too, and the pin still holds.
 fn unreadable_metadata_does_not_block_name_loss(replace: bool, corrupt_replacement: bool) {
     let temp = TempDir::new();
     let fs = fs_for(&temp.path);
@@ -3738,6 +3738,7 @@ fn unreadable_metadata_does_not_block_name_loss(replace: bool, corrupt_replaceme
         let (st, _) = fs.getattr(context(), inode, fh).unwrap();
         assert_eq!(st.st_ino, inode);
         assert_eq!(st.st_size, 12);
+        assert_eq!(st.st_mode, S_IFREG | 0o640);
     }
     assert_eq!(read_all(&fs, inode, handle).unwrap(), b"old contents");
     let mut reader = SourceReader {
@@ -4226,6 +4227,50 @@ fn a_host_replace_gives_the_name_a_new_inode() {
         fs.release(context(), entry.inode, 0, new_handle, false, false, None)
             .unwrap();
         fs.release(context(), old, 0, handle, false, false, None)
+            .unwrap();
+    }
+}
+
+/// The old inode of a name the host replaced keeps reporting its own owner
+/// and mode through the guest's handle, not the replacing file's.
+#[test]
+fn a_host_replace_keeps_the_old_inode_metadata() {
+    for delete_first in [true, false] {
+        let temp = TempDir::new();
+        let fs = fs_for(&temp.path);
+        assert_ads_store(&fs);
+        let owner = Context {
+            uid: 111,
+            gid: 222,
+            pid: 0,
+        };
+        let other = Context {
+            uid: 333,
+            gid: 444,
+            pid: 0,
+        };
+        let (old, handle) = create_with(&fs, owner, c"config", 0o640, b"old contents");
+        let (staged, staged_handle) = create_with(&fs, other, c"config.new", 0o600, b"new");
+        fs.release(other, staged, 0, staged_handle, false, false, None)
+            .unwrap();
+
+        let path = temp.path.join("config");
+        if delete_first {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::rename(temp.path.join("config.new"), &path).unwrap();
+        let entry = fs.lookup(context(), ROOT_INODE, c"config").unwrap();
+
+        assert_ne!(entry.inode, old, "delete first: {delete_first}");
+        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (333, 444));
+        let (st, _) = fs.getattr(owner, old, Some(handle)).unwrap();
+        assert_eq!(
+            (st.st_uid, st.st_gid, st.st_mode),
+            (111, 222, S_IFREG | 0o640),
+            "delete first: {delete_first}"
+        );
+
+        fs.release(owner, old, 0, handle, false, false, None)
             .unwrap();
     }
 }
