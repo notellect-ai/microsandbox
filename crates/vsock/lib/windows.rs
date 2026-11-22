@@ -750,6 +750,7 @@ fn pump(read: &mut PendingIo, write: &mut PendingIo, shared: &SharedState) {
                     waits.incoming_at_room_wait = incoming;
                 });
             }
+
             if let Err(error) = wait_for_wake(&shared.wake_worker) {
                 shared.fail(error);
                 return;
@@ -943,6 +944,7 @@ mod tests {
         /// of their own, so each test sees only its own workers.
         pub(super) fn for_pipe(path: &Path) -> Arc<Self> {
             let probes = PROBES.get_or_init(Default::default);
+
             Arc::clone(
                 probes
                     .lock()
@@ -961,6 +963,7 @@ mod tests {
         fn wait_until(&self, what: &str, ready: impl Fn(&WorkerWaits) -> bool) -> WorkerWaits {
             let deadline = Instant::now() + DEADLINE;
             let mut waits = self.waits.lock().unwrap();
+
             while !ready(&waits) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -970,8 +973,10 @@ mod tests {
                     drop(waits);
                     panic!("timed out waiting until {what}: {seen:?}");
                 }
+
                 waits = self.changed.wait_timeout(waits, left).unwrap().0;
             }
+
             *waits
         }
 
@@ -1484,6 +1489,7 @@ mod tests {
             )
         };
         assert_ne!(server, INVALID_HANDLE_VALUE);
+
         Arc::new(SharedPipe(PipeHandle(server)))
     }
 
@@ -1495,6 +1501,7 @@ mod tests {
         let event = Event::new(true)?;
         let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
         overlapped.hEvent = event.0;
+
         if start(pipe.raw(), &mut overlapped) == 0 {
             let error = io::Error::last_os_error();
             match error.raw_os_error() {
@@ -1504,10 +1511,12 @@ mod tests {
                 _ => return Err(error),
             }
         }
+
         let mut transferred = 0;
         if unsafe { GetOverlappedResult(pipe.raw(), &overlapped, &mut transferred, 1) } == 0 {
             return Err(io::Error::last_os_error());
         }
+
         Ok(transferred as usize)
     }
 
@@ -1521,6 +1530,7 @@ mod tests {
     fn duplex_read_exact(pipe: &SharedPipe, count: usize) -> Vec<u8> {
         let mut out = vec![0; count];
         let mut filled = 0;
+
         while filled < count {
             let rest = &mut out[filled..];
             let read = host_overlapped(pipe, |handle, overlapped| unsafe {
@@ -1536,6 +1546,7 @@ mod tests {
             assert!(read > 0);
             filled += read;
         }
+
         out
     }
 
@@ -1567,16 +1578,19 @@ mod tests {
                 Err(error) => panic!("guest write failed: {error}"),
             }
         }
+
         accepted
     }
 
     #[test]
     fn a_host_flood_stops_at_the_guest_buffer_and_then_arrives_whole() {
+        const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
+
         let name = pipe_name("floodin");
         let server = host_pipe(&name);
-        const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
         let sent = Arc::new(AtomicUsize::new(0));
         let host_sent = Arc::clone(&sent);
+
         let host = thread::spawn(move || {
             host_accept(&server);
             let flood = pattern(LENGTH, 7);
@@ -1586,18 +1600,22 @@ mod tests {
             }
             server
         });
+
         let probe = WorkerProbe::for_pipe(Path::new(&name));
         let endpoint = guest_connect(&name);
+
         // The guest reads nothing: the relay must take exactly a full buffer
         // from the Host and then stop reading. It starts no read without
         // room, and starts none again until the guest reads.
         let waits = probe.wait_until("the relay stops reading for lack of room", |waits| {
             waits.room_waits > 0
         });
+
         assert_eq!(
             waits.incoming_at_room_wait, MAX_BUFFERED_BYTES,
             "the relay stopped reading with a buffer other than full"
         );
+
         // So the Host's writes stall: the relay has no read in flight, so the
         // Host completed no more than the buffer plus what the pipe holds.
         let sent_now = sent.load(Ordering::SeqCst);
@@ -1605,17 +1623,21 @@ mod tests {
             sent_now <= MAX_BUFFERED_BYTES + PIPE_QUOTA,
             "the Host wrote {sent_now} bytes the guest has not read"
         );
+
         assert_eq!(guest_read_up_to(&*endpoint, LENGTH), pattern(LENGTH, 7));
         drop(join_in_time(host));
     }
 
     #[test]
     fn guest_writes_stop_at_the_buffer_while_the_host_reads_nothing_and_then_arrive_whole() {
+        const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
+
         let name = pipe_name("floodout");
         let server = host_pipe(&name);
-        const LENGTH: usize = 3 * MAX_BUFFERED_BYTES;
+
         let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
         let (read_tx, read_rx) = mpsc::channel::<()>();
+
         let host = thread::spawn(move || {
             host_accept(&server);
             accepted_tx.send(()).unwrap();
@@ -1624,54 +1646,68 @@ mod tests {
                 .expect("Host waiting until the guest is refused");
             host_read_exact(&server, LENGTH)
         });
+
         let probe = WorkerProbe::for_pipe(Path::new(&name));
         let endpoint = guest_connect(&name);
         accepted_rx
             .recv_timeout(DEADLINE)
             .expect("Host accepting the guest");
+
         let flood = pattern(LENGTH, 8);
         let mut accepted = guest_write_until_refused(&*endpoint, &flood);
+
         // Once the relay is blocked in a pipe write the Host never reads, it
         // takes no more bytes from the queue, so a second fill is final.
         probe.wait_for_blocked_write();
         accepted += guest_write_until_refused(&*endpoint, &flood[accepted..]);
+
         // write() refuses only once MAX_BUFFERED_BYTES are queued, so the
         // guest got at least that far.
         assert!(
             (MAX_BUFFERED_BYTES..=MAX_BUFFERED_BYTES + RELAY_SLACK).contains(&accepted),
             "the relay accepted {accepted} bytes the Host has not read"
         );
+
         read_tx.send(()).unwrap();
         guest_write_all(&*endpoint, &flood[accepted..]);
+
         assert_eq!(join_in_time(host), flood);
     }
 
     #[test]
     fn large_streams_both_ways_at_once_arrive_whole() {
+        const LENGTH: usize = 2 * MAX_BUFFERED_BYTES + 12_345;
+
         let name = pipe_name("bothways");
         let server = host_pipe_duplex(&name);
-        const LENGTH: usize = 2 * MAX_BUFFERED_BYTES + 12_345;
+
         let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
         let pipe = Arc::clone(&server);
+
         let host_writer = thread::spawn(move || {
             duplex_accept(&pipe);
             accepted_tx.send(()).unwrap();
             duplex_write_all(&pipe, &pattern(LENGTH, 9));
         });
+
         let endpoint = guest_connect(&name);
         accepted_rx
             .recv_timeout(DEADLINE)
             .expect("Host accepting the guest");
+
         let pipe = Arc::clone(&server);
         let host_reader = thread::spawn(move || duplex_read_exact(&pipe, LENGTH));
+
         // The guest writes and reads together on one thread, as the muxer
         // does: neither direction may wait for the other to finish.
         let outgoing = pattern(LENGTH, 10);
         let mut sent = 0;
         let mut received = Vec::with_capacity(LENGTH);
         let mut chunk = vec![0; 70_000];
+
         // DEADLINE limits a stall, not the whole transfer.
         let mut deadline = Instant::now() + DEADLINE;
+
         while sent < LENGTH || received.len() < LENGTH {
             let mut progressed = false;
             if sent < LENGTH {
@@ -1684,6 +1720,7 @@ mod tests {
                     Err(error) => panic!("guest write failed after {sent} bytes: {error}"),
                 }
             }
+
             if received.len() < LENGTH {
                 match endpoint.read(&mut chunk) {
                     Ok(0) => panic!("stream ended after {} bytes", received.len()),
@@ -1695,6 +1732,7 @@ mod tests {
                     Err(error) => panic!("guest read failed: {error}"),
                 }
             }
+
             if progressed {
                 deadline = Instant::now() + DEADLINE;
             } else {
@@ -1706,6 +1744,7 @@ mod tests {
                 thread::yield_now();
             }
         }
+
         assert_eq!(received, pattern(LENGTH, 9));
         join_in_time(host_writer);
         assert_eq!(join_in_time(host_reader), outgoing);
@@ -1714,11 +1753,14 @@ mod tests {
 
     #[test]
     fn a_guest_write_shutdown_mid_stream_still_delivers_what_was_queued() {
+        const LENGTH: usize = 1 << 20;
+
         let name = pipe_name("shutwrite");
         let server = host_pipe(&name);
-        const LENGTH: usize = 1 << 20;
+
         let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
         let (shut_tx, shut_rx) = mpsc::channel::<()>();
+
         let host = thread::spawn(move || {
             host_accept(&server);
             accepted_tx.send(()).unwrap();
@@ -1729,23 +1771,29 @@ mod tests {
             host_write_all(&server, b"reply after shutdown");
             (server, received)
         });
+
         let endpoint = guest_connect(&name);
         accepted_rx
             .recv_timeout(DEADLINE)
             .expect("Host accepting the guest");
+
         // Queued while the Host reads nothing, so most of it is still in the
         // relay when the guest shuts its write side.
         guest_write_all(&*endpoint, &pattern(LENGTH, 11));
         endpoint.shutdown(VsockShutdown::Write).unwrap();
         assert!(endpoint.write(b"late").is_err());
+
         shut_tx.send(()).unwrap();
         let (server, received) = join_in_time(host);
+
         assert_eq!(received, pattern(LENGTH, 11));
+
         // The read side stays open.
         assert_eq!(
             guest_read_up_to(&*endpoint, 20),
             b"reply after shutdown".to_vec()
         );
+
         drop(server);
     }
 
@@ -1753,16 +1801,20 @@ mod tests {
     fn a_guest_full_shutdown_mid_write_releases_the_pipe() {
         let name = pipe_name("shutboth");
         let server = host_pipe(&name);
+
         let host = thread::spawn(move || {
             host_accept(&server);
             server
         });
+
         let probe = WorkerProbe::for_pipe(Path::new(&name));
         let endpoint = guest_connect(&name);
         let server = join_in_time(host);
+
         guest_write_all(&*endpoint, &pattern(1 << 20, 12));
         probe.wait_for_blocked_write();
         endpoint.shutdown(VsockShutdown::Both).unwrap();
+
         let (drained, error) = within_deadline(move || {
             let mut buf = vec![0_u8; 65_536];
             let mut total = 0;
@@ -1773,6 +1825,7 @@ mod tests {
                 }
             }
         });
+
         assert!(
             drained < 1 << 20,
             "the whole write went through: {drained} bytes, then {error}"
@@ -1783,8 +1836,10 @@ mod tests {
     fn a_host_disconnect_mid_write_ends_the_guest_stream() {
         let name = pipe_name("disconnect");
         let server = host_pipe(&name);
+
         let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<()>();
+
         let host = thread::spawn(move || {
             host_accept(&server);
             accepted_tx.send(()).unwrap();
@@ -1795,15 +1850,19 @@ mod tests {
             assert_ne!(unsafe { DisconnectNamedPipe(server.raw()) }, 0);
             server
         });
+
         let probe = WorkerProbe::for_pipe(Path::new(&name));
         let endpoint = guest_connect(&name);
         accepted_rx
             .recv_timeout(DEADLINE)
             .expect("Host accepting the guest");
+
         guest_write_all(&*endpoint, &pattern(1 << 20, 13));
         probe.wait_for_blocked_write();
         disconnect_tx.send(()).unwrap();
+
         let server = join_in_time(host);
+
         // Writes fail and reads end within the deadline; neither keeps
         // reporting WouldBlock.
         let deadline = Instant::now() + DEADLINE;
@@ -1819,6 +1878,7 @@ mod tests {
             );
             thread::yield_now();
         }
+
         loop {
             match endpoint.read(&mut [0_u8; 16]) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -1831,6 +1891,7 @@ mod tests {
             );
             thread::yield_now();
         }
+
         drop(server);
     }
 
