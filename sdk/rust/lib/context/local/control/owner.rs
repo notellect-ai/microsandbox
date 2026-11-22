@@ -158,9 +158,7 @@ impl PipeDenial {
     /// [`Self::setup_error`].
     fn refused(&self, error: io::Error) -> ClientError {
         let client = ClientError::new(ErrorKind::Io(error.kind()));
-        if elevation_share::is_elevated_sandbox_denial(&error) {
-            *self.0.lock().unwrap() = Some(error);
-        }
+        let _ = elevation_share::is_elevated_sandbox_denial(&error);
         client
     }
 
