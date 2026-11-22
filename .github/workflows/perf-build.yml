@@ -1,7 +1,7 @@
-name: perf instrumented build msb (Windows x86_64)
+name: perf measurement build msb (Windows x86_64)
 on:
   push:
-    branches: ["perf/**"]
+    branches: ["perf/build-**"]
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
@@ -56,10 +56,10 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\msb.exe dist\msb-windows-x86_64.exe -Force
           dist\msb-windows-x86_64.exe --version
-          "${{ github.sha }} (perf/m1-instr scratch build)" | Out-File dist\source-commit.txt
+          "${{ github.sha }} (${{ github.ref_name }} measurement build)" | Out-File dist\source-commit.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: msb-windows-x86_64-perf-m1
+          name: msb-windows-x86_64-perf
           path: dist/*
           if-no-files-found: error
           compression-level: 0
