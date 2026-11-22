@@ -6,6 +6,7 @@ pub mod elevation_share;
 pub mod extent;
 pub mod format;
 pub mod log_text;
+pub mod perf_mark;
 pub mod private_file;
 pub mod process;
 pub mod process_lock;
@@ -13,7 +14,6 @@ pub mod secret;
 pub mod size;
 pub mod ttl_reverse_index;
 pub mod wake_pipe;
-pub mod perf_mark;
 pub use perf_mark::perf_mark;
 
 //--------------------------------------------------------------------------------------------------

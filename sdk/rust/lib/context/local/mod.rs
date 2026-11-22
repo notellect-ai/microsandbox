@@ -181,6 +181,7 @@ impl LocalContext {
                     &self.config().snapshots_dir(),
                 )
                 .await?;
+                microsandbox_utils::perf_mark("db:connected");
                 let identity = Arc::new(
                     DatabaseIdentity::capture(db_dir.join(microsandbox_utils::DB_FILENAME))
                         .await
@@ -191,6 +192,7 @@ impl LocalContext {
                     .bind_database(identity.clone())
                     .map_err(MicrosandboxError::ControlClient)?;
                 self.inner.metrics_lookup.bind_database(identity)?;
+                microsandbox_utils::perf_mark("db:bound");
                 Ok(pools)
             })
             .await
@@ -561,9 +563,12 @@ async fn connect_catalog(
     database: &DatabaseConfig,
     snapshots_dir: &Path,
 ) -> MicrosandboxResult<DbPools> {
+    microsandbox_utils::perf_mark("db:begin");
     microsandbox_db::pool::ensure_private_database_directory(db_dir)?;
+    microsandbox_utils::perf_mark("db:private_dir");
     let _migration_lock = acquire_migration_lock(db_dir).await?;
     refuse_incomplete_self_downgrade(db_dir)?;
+    microsandbox_utils::perf_mark("db:migration_lock");
 
     let db_path = db_dir.join(microsandbox_utils::DB_FILENAME);
     let pools = DbPools::open(
@@ -575,12 +580,14 @@ async fn connect_catalog(
     .await
     .map_err(|e| MicrosandboxError::Custom(format!("connect to {}: {e}", db_path.display())))?;
 
+    microsandbox_utils::perf_mark("db:pools_open");
     // Durable downgrade recovery takes precedence over dead-owner reclamation.
     // The migration file lock above excludes another catalog opener doing this.
     database::recover_abandoned_lease(&pools).await?;
     microsandbox_runtime::maintenance::refuse_if_install_exclusive_held(pools.write())
         .await
         .map_err(|err| MicrosandboxError::Runtime(err.to_string()))?;
+    microsandbox_utils::perf_mark("db:lease_checks");
     let initialize = database::requires_initialization(pools.write()).await?;
     if !initialize {
         if !database::is_current(pools.write()).await? {
@@ -593,6 +600,7 @@ async fn connect_catalog(
         Migrator::up(pools.write().inner(), None).await?;
     }
 
+    microsandbox_utils::perf_mark("db:schema_checked");
     // Descriptor translation mutates the same installation state as schema
     // migration. Keep both gates held until every discovered artifact is
     // either canonical or durably journaled as blocked.
@@ -609,6 +617,7 @@ async fn connect_catalog(
     .map_err(|err| MicrosandboxError::Runtime(err.to_string()));
     reconcile_result?;
     clear_result?;
+    microsandbox_utils::perf_mark("db:reconciled");
 
     Ok(pools)
 }

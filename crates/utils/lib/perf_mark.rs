@@ -15,7 +15,11 @@ pub fn perf_mark(label: &str) {
         .map(|d| d.as_micros())
         .unwrap_or(0);
     let path = std::path::Path::new(&dir).join("marks.txt");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{us} {} {label}", std::process::id());
     }
 }

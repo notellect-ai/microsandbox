@@ -354,7 +354,10 @@ fn normalize_sandbox_bools(argv: &mut Vec<OsString>) {
 }
 
 fn main() {
-    microsandbox_utils::perf_mark(&format!("cli:main {}", std::env::args().nth(1).unwrap_or_default()));
+    microsandbox_utils::perf_mark(&format!(
+        "cli:main {}",
+        std::env::args().nth(1).unwrap_or_default()
+    ));
     // Ensure terminal echo is restored even if a panic aborts the process
     // (release profile sets `panic = "abort"`, so Drop impls don't run).
     microsandbox_cli::ui::install_panic_hook();
@@ -490,6 +493,7 @@ fn main() {
         }
     };
 
+    microsandbox_utils::perf_mark("cli:exit");
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -835,7 +839,9 @@ fn run_async_command_anyhow(
         builder.worker_threads(worker_threads);
         builder
     };
+    microsandbox_utils::perf_mark("cli:rt_build");
     let runtime = builder.enable_all().build()?;
+    microsandbox_utils::perf_mark("cli:rt_built");
 
     runtime.block_on(async move {
         let mut cleanup_backend = None;
@@ -847,15 +853,18 @@ fn run_async_command_anyhow(
             // Resolve once before dispatch so an invalid selection fails before any
             // command can touch a local catalog or contact a remote provider.
             let backend = microsandbox::context::resolve_cli_context(selected)?;
+            microsandbox_utils::perf_mark("cli:context_resolved");
             if requires_current_catalog(&command)
                 && let Some(local) = backend.as_local()
             {
                 local.prepare_cli_catalog().await?;
+                microsandbox_utils::perf_mark("cli:catalog_ready");
             }
             cleanup_backend = Some(backend.clone());
             microsandbox_cli::commands::common::set_cli_context(backend)?;
         }
 
+        microsandbox_utils::perf_mark("cli:dispatch");
         let result = match command {
             Commands::Machine(_) | Commands::LaunchProtocol | Commands::SnapshotEditor { .. } => {
                 unreachable!("handled before Tokio starts")
