@@ -1,0 +1,65 @@
+name: perf instrumented build msb (Windows x86_64)
+on:
+  push:
+    branches: ["perf/**"]
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUST_TOOLCHAIN: "1.100.0"
+jobs:
+  agentd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and musl
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Build agentd
+        run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentd-x86_64
+          path: target/x86_64-unknown-linux-musl/release/agentd
+          if-no-files-found: error
+          compression-level: 0
+  msb:
+    needs: agentd
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}/agentd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentd-x86_64
+          path: agentd
+      - name: Checkout libkrunfw sources (MSVC helpers)
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+      - name: Build msb
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli --bin msb --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\msb.exe dist\msb-windows-x86_64.exe -Force
+          dist\msb-windows-x86_64.exe --version
+          "${{ github.sha }} (perf/m1-instr scratch build)" | Out-File dist\source-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msb-windows-x86_64-perf-m1
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0

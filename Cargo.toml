@@ -238,3 +238,5 @@ msb_krun_utils = { git = "https://github.com/superradcompany/libkrun", rev = "77
 # vendor/msb_krun_devices/src/virtio/vsock/muxer_rxq.rs).
 [patch."https://github.com/superradcompany/libkrun"]
 msb_krun_devices = { path = "vendor/msb_krun_devices" }
+# perf/m1-instr scratch: vCPU exit timing.
+msb_krun_vmm = { path = "vendor/msb_krun_vmm" }

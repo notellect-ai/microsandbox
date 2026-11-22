@@ -4863,7 +4863,6 @@ dependencies = [
 [[package]]
 name = "msb_krun_vmm"
 version = "0.1.46"
-source = "git+https://github.com/superradcompany/libkrun?rev=77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3#77cad8a1b7d3c519fe12fd1e1e8dc6b2c5d383a3"
 dependencies = [
  "bincode",
  "bzip2",

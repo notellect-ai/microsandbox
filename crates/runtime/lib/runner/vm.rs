@@ -685,6 +685,7 @@ impl Drop for TrampolineRootfsGuard {
 /// relay, heartbeat, idle timeout), configures the VMM, writes a startup
 /// JSON to stdout, and calls `Vm::enter()` which takes over the process.
 pub fn enter(config: Config) -> ! {
+    microsandbox_utils::perf_mark("rt:enter");
     // Capture log_dir before moving config into run() — we need it after
     // a failure to write boot-error.json, regardless of how far run() got.
     let log_dir = config.log_dir.clone();
@@ -747,6 +748,7 @@ fn run(
         .transpose()?;
     setup_log_capture(&config.log_dir, config.forward_output)?;
 
+    microsandbox_utils::perf_mark("rt:sandbox_starting");
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
     // Before any pipe exists: an elevated runtime keeps the UAC boundary unless the launch
@@ -1066,6 +1068,7 @@ fn run(
     let mut trampoline_rootfs = TrampolineRootfsGuard {
         rootfs_dirs: Vec::new(),
     };
+    microsandbox_utils::perf_mark("rt:build_vm");
     let build_result = build_vm(
         &mut config,
         console_backends,
@@ -1773,6 +1776,7 @@ fn run(
 
     // Enter the VM (never returns).
     tracing::info!(sandbox = %config.sandbox_name, "entering VM");
+    microsandbox_utils::perf_mark("rt:vm_enter");
     match vm.enter() {
         Ok(infallible) => match infallible {},
         Err(e) => {
@@ -4133,6 +4137,12 @@ fn agent_kernel_cmdline(
     if transport.offers_dual_port() {
         cmdline.push(' ');
         cmdline.push_str(microsandbox_protocol::AGENT_TRANSPORT_DUAL_PORT_CMDLINE);
+    }
+    // perf/m1-instr scratch: guest boot timeline in kernel.log (console output itself costs
+    // exits, so it is a separate opt-in from MSB_PERF_DIR).
+    if let Some(extra) = std::env::var_os("MSB_PERF_KCMDLINE") {
+        cmdline.push(' ');
+        cmdline.push_str(&extra.to_string_lossy());
     }
     cmdline
 }

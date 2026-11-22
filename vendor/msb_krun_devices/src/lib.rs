@@ -20,6 +20,7 @@ mod bus;
 ))]
 pub mod fdt;
 pub mod legacy;
+pub mod perf;
 pub mod virtio;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;

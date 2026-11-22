@@ -718,7 +718,15 @@ impl BusDevice for MmioTransport {
                         // Queue notification - write to the eventfd for the specified queue.
                         if let Some(eventfd) = self.queue_evts.get(v as usize) {
                             log::debug!("virtio-mmio queue notify: queue={v}");
+                            let perf_on = crate::perf::enabled();
+                            let perf_t0 = if perf_on { crate::perf::now_ns() } else { 0 };
+                            if perf_on {
+                                crate::perf::kick(crate::perf::event_key(eventfd));
+                            }
                             eventfd.write(1).unwrap();
+                            if perf_on {
+                                crate::perf::FS_KICK_WRITE.add(crate::perf::now_ns() - perf_t0);
+                            }
                         } else {
                             warn!("invalid queue index for notification: {v}");
                         }

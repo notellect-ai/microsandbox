@@ -75,6 +75,12 @@ impl<'a> ConnectionTiming<'a> {
 #[cfg(feature = "local")]
 impl Drop for StageTiming<'_> {
     fn drop(&mut self) {
+        microsandbox_utils::perf_mark(&format!(
+            "sdk:stage {} {}us {}",
+            self.stage,
+            self.started.elapsed().as_micros(),
+            self.outcome
+        ));
         tracing::trace!(target: TARGET,
             sandbox_name = self.sandbox_name,
             stage = self.stage,

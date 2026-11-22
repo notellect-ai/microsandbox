@@ -35,6 +35,7 @@ pub async fn run(
     mut args: CreateArgs,
     log_level: Option<microsandbox::LogLevel>,
 ) -> anyhow::Result<()> {
+    microsandbox_utils::perf_mark("cli:create_run");
     let is_named = args.sandbox.name.is_some();
     let name = args.sandbox.name.clone().unwrap_or_else(ui::generate_name);
 
@@ -56,6 +57,7 @@ pub async fn run(
         apply_sandbox_opts(builder, &args.sandbox)?
     };
 
+    microsandbox_utils::perf_mark("cli:create_built");
     let (mut progress, task) = builder.detached(true).create_detached_with_progress()?;
     let mut display = if args.sandbox.quiet {
         ui::PullProgressDisplay::quiet(&display_label)
@@ -67,6 +69,7 @@ pub async fn run(
         display.handle_creation_event(event);
     }
 
+    microsandbox_utils::perf_mark("cli:progress_end");
     match task.await {
         Ok(Ok(sandbox)) => {
             display.finish();
