@@ -791,6 +791,15 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     if config.spec.resources.nested_virt == Some(true) {
         return Err(unsupported("nested_virt (local-only)"));
     }
+    if config.spec.mounts.iter().any(|mount| match mount {
+        VolumeMount::Bind { options, .. }
+        | VolumeMount::Named { options, .. }
+        | VolumeMount::Owned { options, .. }
+        | VolumeMount::Tmpfs { options, .. }
+        | VolumeMount::DiskImage { options, .. } => options.cache,
+    }) {
+        return Err(unsupported("mount cache (local-only)"));
+    }
     if config.spec.resources.max_cpus != config.spec.resources.cpus {
         return Err(unsupported("max_cpus"));
     }
@@ -2180,6 +2189,24 @@ mod tests {
         let mut config = base_cloud_config();
         config.restore_resources.allow_missing = true;
         assert_unsupported_config_field(config, "allow_missing_resources");
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_local_mount_cache() {
+        let mut config = base_cloud_config();
+        config.spec.mounts.push(VolumeMount::Bind {
+            host: "/host/data".into(),
+            guest: "/data".into(),
+            options: MountOptions {
+                cache: true,
+                ..MountOptions::default()
+            },
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
+            quota_mib: None,
+        });
+        assert_unsupported_config_field(config, "mount cache (local-only)");
     }
 
     #[test]

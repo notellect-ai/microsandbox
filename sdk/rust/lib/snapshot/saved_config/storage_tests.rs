@@ -391,6 +391,49 @@ fn full_mounts_reject_obvious_layout_and_flag_changes_without_claiming_backing_i
 }
 
 #[test]
+fn full_resume_may_change_only_the_host_reply_cache() {
+    // `cache` is the Host's reply-caching policy: the guest keeps no state from
+    // it, so a full resume may turn it on or off. Guest-visible flags stay fixed.
+    let cached = |on: bool| {
+        let mut mount = destination("/data");
+        let VolumeMount::Bind { options, .. } = &mut mount else {
+            panic!("bind")
+        };
+        options.cache = on;
+        mount
+    };
+    let mut saved_cached = bind("/data", "data");
+    let SavedMount::Bind { options, .. } = &mut saved_cached else {
+        panic!("bind")
+    };
+    options.cache = true;
+    for (saved, mount) in [
+        (source(vec![bind("/data", "data")], vec![]), cached(true)),
+        (source(vec![saved_cached.clone()], vec![]), cached(false)),
+        (source(vec![saved_cached], vec![]), cached(true)),
+    ] {
+        let selected = select(&saved, &patch(vec![mount], vec![]), true);
+        assert!(selected.requires_full_identity);
+    }
+
+    let mut readonly_cached = cached(true);
+    let VolumeMount::Bind { options, .. } = &mut readonly_cached else {
+        panic!("bind")
+    };
+    options.readonly = true;
+    let error = select_storage_inputs(
+        &source(vec![bind("/data", "data")], vec![]),
+        &manifest(true),
+        &patch(vec![readonly_cached], vec![]),
+        SnapshotConfigMode::Fresh,
+        true,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("SCFG_FULL_STATE"));
+}
+
+#[test]
 fn tmpfs_full_layout_is_retained_and_disk_additions_are_ordered_parent_first() {
     let saved = source(
         vec![SavedMount::Tmpfs {

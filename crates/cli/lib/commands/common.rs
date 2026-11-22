@@ -5035,6 +5035,9 @@ mod tests {
         let spec = format!("{}:/proj:cache=on,cache=on", dir.display());
         let err = validate_mount_dir_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("`cache` specified more than once"), "{err}");
+        let spec = format!("{}:/proj:cache=on,cache=off", dir.display());
+        let err = validate_mount_dir_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("`cache` specified more than once"), "{err}");
         let spec = format!("{}:/proj:cache=yes", dir.display());
         let err = validate_mount_dir_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("invalid cache"), "{err}");

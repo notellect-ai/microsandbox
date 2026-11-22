@@ -971,9 +971,15 @@ pub(crate) async fn validate_mount_cache(
     if !config.spec.mounts.iter().any(mount_requests_cache) {
         return Ok(());
     }
-    let supported = capabilities(path).await.ok().is_some_and(|capabilities| {
-        capabilities.protocols.contains(&2) && capabilities.directory_mount_cache
-    });
+    // An advertisement that does not decode comes from a runtime that predates
+    // this contract; a runtime that cannot be probed at all is reported as is.
+    let supported = match capabilities(path).await {
+        Ok(capabilities) => {
+            capabilities.protocols.contains(&2) && capabilities.directory_mount_cache
+        }
+        Err(MicrosandboxError::Json(_)) => false,
+        Err(error) => return Err(error),
+    };
     if !supported {
         return Err(MicrosandboxError::unsupported(
             crate::error::Operation::SandboxStart,
@@ -2080,8 +2086,22 @@ mod tests {
             .await
             .unwrap();
         config.spec.mounts.push(cache_bind(true));
+        // A runtime that cannot be probed is reported as such, not as an upgrade.
+        let broken = script(dir.path(), "broken-cache", "exit 1");
+        let error = validate_mount_cache(&broken, &config).await.unwrap_err();
+        assert!(
+            !matches!(error, MicrosandboxError::Unsupported { .. }),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("mount option cache"), "{error}");
+        let error = validate_mount_cache(&dir.path().join("missing"), &config)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(error, MicrosandboxError::Unsupported { .. }),
+            "{error}"
+        );
         for response in [
-            "exit 1",
             r#"printf '%s' '{"protocols":[2,1],"guest_clock":true}'"#,
             r#"printf '%s' '{"protocols":[2,1],"directory_mount_cache":false}'"#,
             r#"printf '%s' '{"protocols":[2,1],"directory_mount_cache":"true"}'"#,

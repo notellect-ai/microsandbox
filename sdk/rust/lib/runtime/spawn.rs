@@ -2105,7 +2105,9 @@ fn push_file_mount_arg(
         false,
         options.override_uid,
         options.override_gid,
-        options.cache,
+        // SingleFileFs always replies with zero timeouts; `cache` applies to
+        // directory exports only.
+        false,
     );
     opts.push(format!("quota={quota_mib}"));
     append_option_block(&mut arg, opts);
@@ -4938,6 +4940,41 @@ mod tests {
         ));
         // MSB_DIR_MOUNTS should NOT contain the file mount.
         assert!(!rendered.iter().any(|a| a.starts_with("MSB_DIR_MOUNTS=")));
+    }
+
+    #[tokio::test]
+    async fn test_machine_cli_args_file_mount_never_renders_cache() {
+        // SingleFileFs always replies with zero timeouts, so `cache` is a
+        // directory-export policy and stays off the `--file-mount` argument.
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/guest/config.txt", |m| {
+                m.bind("/host/config.txt").readonly().cache(true)
+            })
+            .build()
+            .await
+            .unwrap();
+        let mut file_mounts = HashMap::new();
+        file_mounts.insert(
+            "/guest/config.txt".to_string(),
+            ("config.txt".to_string(), "fm_aabbccdd".to_string()),
+        );
+        let rendered = render_args_with_file_mounts(&config, &file_mounts);
+        assert!(
+            rendered.windows(2).any(|pair| pair[0] == "--file-mount"
+                && pair[1]
+                    == format!(
+                        "fm_aabbccdd:/host/config.txt:ro,quota={}",
+                        crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB
+                    )),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|arg| arg.starts_with("MSB_FILE_MOUNTS=") && arg.contains("cache")),
+            "{rendered:?}"
+        );
     }
 
     #[tokio::test]
