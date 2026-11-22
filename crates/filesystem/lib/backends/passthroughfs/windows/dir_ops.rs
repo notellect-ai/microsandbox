@@ -216,7 +216,9 @@ fn listing_ids_match_handles(directory: &File) -> bool {
     if String::from_utf16_lossy(&name[..len]) != "NTFS" {
         return false;
     }
-    // Remote protocol information exists only for a file on a share.
+    // Remote protocol information exists only for a file on a share; a local
+    // volume refuses the class with ERROR_INVALID_PARAMETER. Any other answer
+    // is doubt.
     // SAFETY: a plain C struct of integers; all zeroes is a valid value.
     let mut remote: FILE_REMOTE_PROTOCOL_INFO = unsafe { std::mem::zeroed() };
     // The API writes at most size_of::<FILE_REMOTE_PROTOCOL_INFO>() bytes.
@@ -229,6 +231,7 @@ fn listing_ids_match_handles(directory: &File) -> bool {
         )
     };
     remote_ok == 0
+        && io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)
 }
 
 /// Enumerate an open directory in batches: one call returns as many entries as
