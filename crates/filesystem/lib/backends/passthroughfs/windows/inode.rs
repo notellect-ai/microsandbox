@@ -337,15 +337,6 @@ impl PassthroughFs {
                 .range(old.clone()..)
                 .find(|(key, _)| **key != old)
                 .is_some_and(|(key, _)| key.starts_with(&old));
-            if has_descendants {
-                pending.extend(Self::follow_host_rename_descendants(
-                    inodes,
-                    &data,
-                    &old,
-                    &path,
-                    &|p: &Path| self.path_identity(p),
-                ));
-            }
         }
     }
 
