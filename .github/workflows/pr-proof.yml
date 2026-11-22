@@ -1,0 +1,273 @@
+# Proof-only workflow for an upstream PR draft. It lives ONLY on the fork's
+# notellect/pr-proof/<name>[-unfixed-*] branches (one extra commit on top of the
+# PR branch); the PR branch itself never carries it.
+name: PR proof
+
+on:
+  push:
+    branches: ["notellect/pr-proof/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # microsandbox embeds agentd; check.yml's Windows jobs embed the one for their
+  # architecture.
+  agentd:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup toolchain install stable --profile minimal --target ${{ matrix.arch }}-unknown-linux-musl
+          rustup default stable
+      - run: cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.arch }}-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with: { name: "agentd-${{ matrix.arch }}", path: "target/${{ matrix.arch }}-unknown-linux-musl/release/agentd", if-no-files-found: error, compression-level: 0 }
+
+  # check.yml's rust-quality Clippy step, verbatim, with stand-in runtime files.
+  linux-clippy:
+    needs: agentd
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}/embed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/download-artifact@v4
+        with: { name: agentd-x86_64, path: embed }
+      - name: Stand-in runtime files
+        run: |
+          version=$(sed -n 's/^pub const LIBKRUNFW_VERSION: &str = "\(.*\)";/\1/p' crates/utils/lib/lib.rs)
+          test -n "$version"
+          touch embed/msb "embed/libkrunfw.so.$version"
+          ls -l embed
+      - name: Install build deps
+        run: scripts/ci/install-apt-packages.sh musl-tools libcap-ng-dev
+      - name: Extract the check.yml step verbatim
+        run: |
+          cat > "$RUNNER_TEMP/extract.py" <<'PY'
+          # Print one step's `run` script from check.yml, verbatim, with only the
+          # matrix expressions filled in for this runner.
+          import os, sys
+          job, name = sys.argv[1], sys.argv[2]
+          lines = open('.github/workflows/check.yml', encoding='utf-8').read().splitlines()
+          job_start = lines.index(f'  {job}:')
+          start = next(i for i in range(job_start, len(lines)) if lines[i].strip() == f'- name: {name}')
+          run = next(i for i in range(start, len(lines)) if lines[i].strip().startswith('run:'))
+          if lines[run].strip() == 'run: |':
+              indent = len(lines[run]) - len(lines[run].lstrip())
+              body = []
+              for l in lines[run + 1:]:
+                  if l.strip() and len(l) - len(l.lstrip()) <= indent:
+                      break
+                  body.append(l)
+              pad = min(len(l) - len(l.lstrip()) for l in body if l.strip())
+              script = '\n'.join(l[pad:] for l in body).rstrip() + '\n'
+          else:
+              script = lines[run].strip()[len('run:'):].strip() + '\n'
+          for key, env in {
+              '$' '{{ matrix.rust_target }}': 'RUST_TARGET',
+              '$' '{{ matrix.vs_arch }}': 'VS_ARCH',
+              '$' '{{ matrix.vs_host_arch }}': 'VS_HOST_ARCH',
+          }.items():
+              if key in script:
+                  script = script.replace(key, os.environ[env])
+          assert '$' '{{' not in script, script
+          if len(sys.argv) > 3 and sys.argv[3] == 'pwsh':
+              # What the Actions pwsh shell appends to every run script.
+              script += 'if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n'
+          sys.stdout.write(script)
+          PY
+          python3 "$RUNNER_TEMP/extract.py" rust-quality Clippy > clippy-step.sh
+          cat clippy-step.sh
+      - name: "Run check.yml step verbatim: rust-quality Clippy"
+        run: bash -e clippy-step.sh
+
+  windows:
+    needs: agentd
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            arch: x86_64
+            vs_arch: amd64
+            vs_host_arch: amd64
+          - runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            arch: aarch64
+            vs_arch: arm64
+            vs_host_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}\embed
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The PR's two commits and their base, to find the lines the PR changes.
+          fetch-depth: 4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.rust_target }}
+      - uses: actions/download-artifact@v4
+        with: { name: "agentd-${{ matrix.arch }}", path: embed }
+      - shell: pwsh
+        run: New-Item -ItemType File -Force -Path embed\msb.exe, embed\libkrunfw.dll | Out-Null
+      - name: Show runner elevation
+        shell: cmd
+        run: whoami /user /groups
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check out libkrunfw (for msvc-env.ps1)
+        if: always()
+        shell: bash
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+      - name: Extract the check.yml steps verbatim
+        if: always()
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          VS_ARCH: ${{ matrix.vs_arch }}
+          VS_HOST_ARCH: ${{ matrix.vs_host_arch }}
+        run: |
+          cat > "$RUNNER_TEMP/extract.py" <<'PY'
+          # Print one step's `run` script from check.yml, verbatim, with only the
+          # matrix expressions filled in for this runner.
+          import os, sys
+          job, name = sys.argv[1], sys.argv[2]
+          lines = open('.github/workflows/check.yml', encoding='utf-8').read().splitlines()
+          job_start = lines.index(f'  {job}:')
+          start = next(i for i in range(job_start, len(lines)) if lines[i].strip() == f'- name: {name}')
+          run = next(i for i in range(start, len(lines)) if lines[i].strip().startswith('run:'))
+          if lines[run].strip() == 'run: |':
+              indent = len(lines[run]) - len(lines[run].lstrip())
+              body = []
+              for l in lines[run + 1:]:
+                  if l.strip() and len(l) - len(l.lstrip()) <= indent:
+                      break
+                  body.append(l)
+              pad = min(len(l) - len(l.lstrip()) for l in body if l.strip())
+              script = '\n'.join(l[pad:] for l in body).rstrip() + '\n'
+          else:
+              script = lines[run].strip()[len('run:'):].strip() + '\n'
+          for key, env in {
+              '$' '{{ matrix.rust_target }}': 'RUST_TARGET',
+              '$' '{{ matrix.vs_arch }}': 'VS_ARCH',
+              '$' '{{ matrix.vs_host_arch }}': 'VS_HOST_ARCH',
+          }.items():
+              if key in script:
+                  script = script.replace(key, os.environ[env])
+          assert '$' '{{' not in script, script
+          if len(sys.argv) > 3 and sys.argv[3] == 'pwsh':
+              # What the Actions pwsh shell appends to every run script.
+              script += 'if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n'
+          sys.stdout.write(script)
+          PY
+          python "$RUNNER_TEMP/extract.py" windows-quality "Clippy msb" pwsh > clippy-step.ps1
+          python "$RUNNER_TEMP/extract.py" windows-quality "Test elevated object sharing" pwsh > check-step.ps1
+          cat clippy-step.ps1 check-step.ps1
+      - name: "Run check.yml step verbatim: Clippy msb"
+        if: always()
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -NonInteractive -File clippy-step.ps1
+          exit $LASTEXITCODE
+      - name: Clippy the Windows test modules of utils, runtime and SDK
+        # check.yml's Windows Clippy covers only the CLI's targets, so the
+        # cfg(windows) test modules of its dependencies are linted here. Upstream
+        # main already has lints in these targets on Windows (code this PR does not
+        # touch), so the step lists every diagnostic and fails on any that points at
+        # a line the PR adds or changes, or if a run fails without a diagnostic.
+        if: always()
+        shell: bash
+        run: |
+          base=$(git rev-parse HEAD~3)
+          git log --oneline -4
+          : > clippy-tests.txt
+          # The shell runs with -e -o pipefail; a failing run must not end the step.
+          set +e
+          run() {
+            cargo clippy --locked --keep-going "$@" --target ${{ matrix.rust_target }} --all-targets --message-format=short -- -D warnings 2>&1 | tee -a clippy-tests.txt
+            status=${PIPESTATUS[0]}
+            echo "clippy $* exited $status"
+            echo "EXIT $status" >> clippy-tests.txt
+          }
+          run -p microsandbox-utils
+          run --no-default-features --features net,runner -p microsandbox-runtime
+          run --no-default-features --features local,net,cloud -p microsandbox
+          git diff -U0 "$base" HEAD~1 > pr.diff
+          cat > "$RUNNER_TEMP/pr_lints.py" <<'PY'
+          # Split the clippy diagnostics into those on lines the PR adds or
+          # changes and those elsewhere (already on the base).
+          import re, sys
+          changed, path = {}, None
+          for line in open('pr.diff', encoding='utf-8'):
+              if line.startswith('+++ '):
+                  path = None if line.startswith('+++ /dev/null') else line[6:].rstrip('\n')
+              elif line.startswith('@@') and path:
+                  m = re.match(r'@@ -\S+ \+(\d+)(?:,(\d+))? @@', line)
+                  start, count = int(m.group(1)), int(m.group(2) or 1)
+                  changed.setdefault(path, set()).update(range(start, start + count))
+          on_pr, elsewhere, failed_runs, run_diags = [], set(), 0, 0
+          for line in open('clippy-tests.txt', encoding='utf-8', errors='replace'):
+              line = re.sub(r'\x1b\[[0-9;]*m', '', line)  # CARGO_TERM_COLOR is always
+              m = re.match(r'^(\S+?):(\d+):\d+: (error|warning)(\[\w+\])?: ', line)
+              if m:
+                  file = m.group(1).replace('\\', '/')
+                  run_diags += 1
+                  if int(m.group(2)) in changed.get(file, ()):
+                      on_pr.append(line.rstrip())
+                  else:
+                      elsewhere.add(line.rstrip())
+              elif line.startswith('EXIT '):
+                  if line.split()[1] != '0' and run_diags == 0:
+                      failed_runs += 1
+                  run_diags = 0
+          print(f'{len(elsewhere)} diagnostics on lines this PR does not change:')
+          print('\n'.join(sorted(elsewhere)))
+          print(f'{len(on_pr)} diagnostics on lines this PR adds or changes:')
+          print('\n'.join(on_pr))
+          if failed_runs:
+              print(f'{failed_runs} clippy runs failed without a diagnostic')
+          sys.exit(1 if on_pr or failed_runs else 0)
+          PY
+          set -e
+          python "$RUNNER_TEMP/pr_lints.py"
+      - name: "Run check.yml step verbatim: Test elevated object sharing"
+        if: always()
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -NonInteractive -File check-step.ps1
+          exit $LASTEXITCODE
+      - name: Launch and SDK tests
+        if: always()
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --features net,runner -p microsandbox-runtime --lib -- launch || rc=1
+          cargo test --locked --no-default-features --features local,net,cloud -p microsandbox --lib -- elevated || rc=1
+          exit $rc
