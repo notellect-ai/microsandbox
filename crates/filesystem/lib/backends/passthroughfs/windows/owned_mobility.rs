@@ -13,10 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Component;
 
-use super::super::{
-    HandleData, InodeData,
-    inode::{UnsavedMetadata, VirtualMetadata},
-};
+use super::super::{HandleData, InodeData, inode::VirtualMetadata};
 use super::{
     FileHandleState, PassthroughFs, PassthroughState, PreparedState, capture_linked, invalid_state,
     mobility, open_options_from_flags, rebuild, validate_quota, validate_shape,
@@ -244,7 +241,6 @@ pub(super) fn prepare(fs: &PassthroughFs, bytes: &[u8]) -> io::Result<PreparedSt
             }),
             retained: Mutex::new(temporary.then_some(pinned)),
             retained_stat: Mutex::new(if temporary { stat_file } else { None }),
-            unsaved_metadata: Mutex::new(UnsavedMetadata::default()),
             lookups: AtomicU64::new(0),
         });
         if let Some(identity) = data.identity
