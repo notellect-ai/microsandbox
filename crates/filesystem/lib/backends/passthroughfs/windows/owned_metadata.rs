@@ -7,7 +7,7 @@ use std::os::windows::{
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
     FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_DISPOSITION, NtCreateFile,
 };
 use windows_sys::Win32::Foundation::{
@@ -40,8 +40,6 @@ impl PassthroughFs {
     pub(super) fn stat_link_count(&self, mut stat: stat64, data: &InodeData) -> io::Result<stat64> {
         let file = if let Some(file) = data.retained.lock().unwrap().as_ref() {
             file.try_clone().map_err(host_error)?
-        } else if let Some(file) = self.own_file(data, false)? {
-            file
         } else {
             StdOpenOptions::new()
                 .access_mode(FILE_READ_ATTRIBUTES)
@@ -75,29 +73,40 @@ impl PassthroughFs {
             return Ok(None);
         }
 
+        // A handle opened through a name the host has since replaced can no
+        // longer open the file's streams (they report delete pending), so
+        // they are opened through a handle reopened by file ID, which no name
+        // holds. Where that reopen is not available, such as a share without
+        // open by ID, the checked handle itself is used; it then reports
+        // delete pending only if the host replaced its name.
+        let reopened = reopen_by_id(file).ok();
+        let file = reopened.as_ref().unwrap_or(file);
         let access = if self.cfg.readonly {
             FILE_GENERIC_READ
         } else {
             FILE_GENERIC_READ | FILE_GENERIC_WRITE
         };
-        match open_own_stream(file, access, FILE_OPEN) {
-            Ok(Some((stream, _))) => {
+        match open_override_stream_at(file, access, FILE_OPEN) {
+            Ok((stream, _)) => {
                 let stat = read_stat_file(&stream)?;
                 return Ok(Some((stream, stat)));
             }
             // The file has no name left: its metadata stays in memory.
-            Ok(None) => return Ok(None),
+            Err(error) if is_delete_pending(&error) => return Ok(None),
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 return Err(host_error(error));
             }
             Err(_) => {}
         }
 
-        let Some((stream, created)) =
-            open_own_stream(file, FILE_GENERIC_READ | FILE_GENERIC_WRITE, FILE_OPEN_IF)
-                .map_err(host_error)?
-        else {
-            return Ok(None);
+        let (stream, created) = match open_override_stream_at(
+            file,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            FILE_OPEN_IF,
+        ) {
+            Ok(opened) => opened,
+            Err(error) if is_delete_pending(&error) => return Ok(None),
+            Err(error) => return Err(host_error(error)),
         };
         let stat = if created {
             write_stat_file(&stream, initial)?;
@@ -107,9 +116,11 @@ impl PassthroughFs {
             read_stat_file(&stream)?
         };
         if self.cfg.readonly {
-            return Ok(open_own_stream(file, FILE_GENERIC_READ, FILE_OPEN)
-                .map_err(host_error)?
-                .map(|(stream, _)| (stream, stat)));
+            return match open_override_stream_at(file, FILE_GENERIC_READ, FILE_OPEN) {
+                Ok((stream, _)) => Ok(Some((stream, stat))),
+                Err(error) if is_delete_pending(&error) => Ok(None),
+                Err(error) => Err(host_error(error)),
+            };
         }
 
         Ok(Some((stream, stat)))
@@ -178,79 +189,6 @@ pub(super) fn write_retained_stat(data: &InodeData, stat: OverrideStat) -> io::R
 
     write_stat_file(file, stat)?;
     Ok(true)
-}
-
-/// Read the metadata stream of the file `file` holds, opened relative to
-/// that handle, never by path. `Ok(Some(None))` when the file has no stream;
-/// `Ok(None)` when it has no name left, so its metadata is only in memory.
-pub(super) fn read_stat_at(file: &File) -> io::Result<Option<Option<OverrideStat>>> {
-    match open_own_stream(file, FILE_GENERIC_READ, FILE_OPEN) {
-        Ok(Some((stream, _))) => read_stat_file(&stream).map(|stat| Some(Some(stat))),
-        Ok(None) => Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(None)),
-        Err(error) => Err(host_error(error)),
-    }
-}
-
-/// Write `stat` to the metadata stream of the file `file` holds, opened
-/// relative to that handle, never by path, creating the stream if needed.
-/// Writes nothing when the file has no name left: its metadata is then only
-/// in memory.
-pub(super) fn write_stat_at(file: &File, stat: OverrideStat) -> io::Result<()> {
-    let Some((stream, _)) =
-        open_own_stream(file, FILE_GENERIC_WRITE, FILE_OVERWRITE_IF).map_err(host_error)?
-    else {
-        return Ok(());
-    };
-    write_stat_file(&stream, stat)?;
-    stream.sync_data().map_err(host_error)
-}
-
-/// Reopen the file `file` holds by its file ID, with `access`. Unlike
-/// `file`, the new handle was not opened through a name, so the host
-/// replacing that name leaves it usable. Fails once the file has no name
-/// left, and where the filesystem cannot open files by ID. Errors are the
-/// host's, not yet mapped to Linux.
-pub(super) fn reopen_by_id(file: &File, access: u32) -> io::Result<File> {
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: file owns a live handle and info is a FILE_ID_INFO of the size passed.
-    let read = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileIdInfo,
-            (&mut info as *mut FILE_ID_INFO).cast(),
-            std::mem::size_of::<FILE_ID_INFO>() as u32,
-        )
-    };
-    if read == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let id = FILE_ID_DESCRIPTOR {
-        dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
-        Type: ExtendedFileIdType,
-        Anonymous: FILE_ID_DESCRIPTOR_0 {
-            ExtendedFileId: info.FileId,
-        },
-    };
-    // SAFETY: file is a live handle on the volume that holds the file, and id
-    // is a complete descriptor; the call only reads both.
-    let handle = unsafe {
-        OpenFileById(
-            file.as_raw_handle(),
-            &id,
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: OpenFileById succeeded, so handle is a new handle we now own.
-    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 pub(in crate::backends::passthroughfs) fn owned_component(name: &str) -> io::Result<OsString> {
@@ -434,29 +372,50 @@ fn open_override_stream_at(
     Ok((stream, status_block.Information == FILE_CREATED))
 }
 
-/// Open the metadata stream of the file `file` holds, as
-/// `open_override_stream_at` does. A handle opened through a name the host
-/// has since replaced can no longer open the file's streams (they report
-/// delete pending), so the stream is then opened through a handle reopened
-/// by file ID, which no name holds. `Ok(None)` when that reopen fails too:
-/// the file has no name left, or the filesystem cannot open files by ID.
-/// Errors are the host's, not yet mapped to Linux.
-fn open_own_stream(
-    file: &File,
-    access: u32,
-    disposition: NTCREATEFILE_CREATE_DISPOSITION,
-) -> io::Result<Option<(File, bool)>> {
-    match open_override_stream_at(file, access, disposition) {
-        Err(error) if is_delete_pending(&error) => {}
-        opened => return opened.map(Some),
-    }
-    let Ok(reopened) = reopen_by_id(file, FILE_READ_ATTRIBUTES) else {
-        return Ok(None);
+/// Reopen the file `file` holds by its file ID. Unlike `file`, the new handle
+/// was not opened through a name, so the host replacing that name leaves it
+/// usable. Fails once the file has no name left, and where the filesystem
+/// cannot open files by ID.
+fn reopen_by_id(file: &File) -> io::Result<File> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: file owns a live handle and info is a FILE_ID_INFO of the size passed.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
     };
-    match open_override_stream_at(&reopened, access, disposition) {
-        Err(error) if is_delete_pending(&error) => Ok(None),
-        opened => opened.map(Some),
+    if read == 0 {
+        return Err(io::Error::last_os_error());
     }
+
+    let id = FILE_ID_DESCRIPTOR {
+        dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: ExtendedFileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 {
+            ExtendedFileId: info.FileId,
+        },
+    };
+    // SAFETY: file is a live handle on the volume that holds the file, and id
+    // is a complete descriptor; the call only reads both.
+    let handle = unsafe {
+        OpenFileById(
+            file.as_raw_handle(),
+            &id,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: OpenFileById succeeded, so handle is a new handle we now own.
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 fn is_delete_pending(error: &io::Error) -> bool {

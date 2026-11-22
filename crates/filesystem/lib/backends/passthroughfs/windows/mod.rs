@@ -553,12 +553,6 @@ fn apply_host_permissions(path: &Path, mode: u32) -> io::Result<()> {
     std::fs::set_permissions(path, permissions).map_err(host_error)
 }
 
-fn apply_file_permissions(file: &File, mode: u32) -> io::Result<()> {
-    let mut permissions = file.metadata().map_err(host_error)?.permissions();
-    permissions.set_readonly(mode & 0o222 == 0);
-    file.set_permissions(permissions).map_err(host_error)
-}
-
 fn mirror_eligible_type(file_type: u32) -> bool {
     file_type == S_IFREG || file_type == S_IFDIR
 }
