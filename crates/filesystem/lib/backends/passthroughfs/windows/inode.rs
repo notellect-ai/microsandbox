@@ -266,15 +266,9 @@ impl PassthroughFs {
     }
 
     /// A name a moved descendant took from a stale cached entry: that inode
-    /// lost it as in an unlink. An inode the guest still has open stays
-    /// tracked, as it did before the name was taken: its handles keep
-    /// working, and a lookup of the name the host moved the file to finds it
-    /// again by its identity.
+    /// lost it as in an unlink.
     fn finish_displaced(&self, inodes: &mut InodeTable, displaced: Vec<Arc<InodeData>>) {
         for data in displaced {
-            if self.has_open_handle(data.inode) {
-                continue;
-            }
             self.finish_removed_alias(inodes, &data);
         }
     }
@@ -362,14 +356,6 @@ impl PassthroughFs {
 
         let path = self.child_path(parent, name)?;
         self.entry_for_path(path)
-    }
-
-    pub(super) fn has_open_handle(&self, inode: u64) -> bool {
-        self.handles
-            .read()
-            .unwrap()
-            .values()
-            .any(|handle| handle.inode == inode)
     }
 
     pub(super) fn handle(&self, inode: u64, handle: u64) -> io::Result<Arc<HandleData>> {
