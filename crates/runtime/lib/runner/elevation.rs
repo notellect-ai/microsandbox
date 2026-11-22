@@ -65,7 +65,7 @@ fn share_with_non_elevated_as(
     }
 
     let share = match elevation() {
-        Ok(elevation) => elevation_share::shares_with_non_elevated(opt_in, elevation),
+        Ok(elevation) => elevation_share::shares_with_non_elevated(false, elevation),
         Err(error) => {
             tracing::warn!(%error, "could not read this runtime's token elevation type");
             false
