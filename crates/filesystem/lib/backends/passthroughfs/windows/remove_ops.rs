@@ -277,7 +277,6 @@ impl PassthroughFs {
             mode: Some(stat.mode),
             rdev: u64::from(stat.rdev),
         };
-        data.unsaved_metadata.store(false, Ordering::Release);
         *data.retained.lock().unwrap() = Some(file);
         *data.retained_stat.lock().unwrap() = stat_file;
         Some(data)

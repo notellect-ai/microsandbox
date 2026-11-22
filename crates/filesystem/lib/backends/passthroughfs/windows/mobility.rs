@@ -11,10 +11,7 @@ use std::{
         io::AsRawHandle,
     },
     path::{Component, PathBuf},
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, RwLock, atomic::Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -899,8 +896,7 @@ fn rebuild(
             }),
             retained: Mutex::new(None),
             retained_stat: Mutex::new(None),
-            unsaved_metadata: AtomicBool::new(false),
-            lookups: AtomicU64::new(0),
+            lookups: std::sync::atomic::AtomicU64::new(0),
         });
         if let Some(identity) = data.identity {
             // Older external snapshots assigned separate inode IDs to hardlinks.
