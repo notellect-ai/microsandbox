@@ -74,36 +74,22 @@ impl PassthroughFs {
                 reopened.set_len(0).map_err(host_error)?;
             }
             Ok(reopened)
-        } else if let Some(identity) = data.identity {
+        } else if let Some(identity) = data.identity
+            && flags & LINUX_O_TRUNC as u32 != 0
+        {
             // An open by path reaches whatever holds the name now, which after
             // a host replace is not the inode's object (`insert_handle`
-            // refuses it). Truncate, or let a caller such as setattr resize,
-            // only once the file is known to be the inode's own.
-            let path = data.path();
+            // refuses it). Truncate only once the file is known to be the
+            // inode's own.
             let mut options = open_options_from_flags(flags, false)?;
-            let file = match options.truncate(false).open(&path) {
-                Ok(file) => file,
-                // Another file at the name (say a read-only one) can refuse
-                // the open: the inode is stale all the same.
-                Err(error) => {
-                    if self
-                        .path_identity(&path)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|found| found != identity)
-                    {
-                        return Err(linux_error(LINUX_ESTALE));
-                    }
-                    return Err(host_error(error));
-                }
-            };
+            let file = options
+                .truncate(false)
+                .open(data.path())
+                .map_err(host_error)?;
             if mobility::file_identity(&file)? != identity {
                 return Err(linux_error(LINUX_ESTALE));
             }
-            metadata::after_own_check();
-            if flags & LINUX_O_TRUNC as u32 != 0 {
-                file.set_len(0).map_err(host_error)?;
-            }
+            file.set_len(0).map_err(host_error)?;
             Ok(file)
         } else {
             open_options_from_flags(flags, false)?

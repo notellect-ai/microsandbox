@@ -567,7 +567,7 @@ impl PassthroughFs {
 
 /// Hold `stat` as the inode's metadata, which it reports once no name of its
 /// file can be read.
-pub(super) fn keep_in_memory(data: &InodeData, stat: OverrideStat) {
+fn keep_in_memory(data: &InodeData, stat: OverrideStat) {
     *data.virtual_meta.write().unwrap() = inode::VirtualMetadata {
         uid: stat.uid,
         gid: stat.gid,
