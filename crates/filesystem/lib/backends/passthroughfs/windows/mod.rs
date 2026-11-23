@@ -11,16 +11,18 @@ use std::fs::{File, FileTimes, OpenOptions as StdOpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO,
-    FileRemoteProtocolInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, VOLUME_NAME_NT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRemoteProtocolInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    GetVolumeInformationByHandleW, ReOpenFile, VOLUME_NAME_NT,
 };
 
 use crate::agentd::agentd_bytes;
@@ -479,16 +481,25 @@ fn open_by_final_path(
     if access == FILE_READ_ATTRIBUTES {
         return Ok(Some((file, attrs)));
     }
-    drop(file);
-    let Ok(file) = open_host_object(&target, access) else {
-        return Ok(None);
+    // Reopen the proven object through its handle, not its path, so nothing
+    // swapped in since is opened with more than attribute access.
+    count_host_open();
+    // The proven handle stays live for the call; on success the result is a
+    // new handle this function owns.
+    let reopened = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
     };
-    if opened_name(&file).as_deref() != Some(&expected[..]) {
+    if reopened.is_null() || reopened == INVALID_HANDLE_VALUE {
         return Ok(None);
     }
-    let attrs = host_attrs(&file)?;
-    reject_reparse_metadata(&attrs.metadata)?;
-    Ok(Some((file, attrs)))
+    // SAFETY: a valid handle just returned to us and owned by nothing else.
+    let reopened = unsafe { File::from_raw_handle(reopened) };
+    Ok(Some((reopened, attrs)))
 }
 
 /// The NT name (`\Device\HarddiskVolumeN\...`) a handle was opened by, as
@@ -512,6 +523,11 @@ fn opened_name(file: &File) -> Option<Vec<u16>> {
         }
         if len < buffer.len() {
             buffer.truncate(len);
+            // Only a volume root's name ends in a separator; drop it so the
+            // root and the names below it compare alike.
+            if buffer.last() == Some(&u16::from(b'\\')) {
+                buffer.pop();
+            }
             return Some(buffer);
         }
         buffer.resize(len + 1, 0);
@@ -519,14 +535,13 @@ fn opened_name(file: &File) -> Option<Vec<u16>> {
     None
 }
 
-/// The opened name of a mount root, read once per root path, without a
-/// trailing separator (a volume root's name ends in one). It depends only on
+/// The opened name of a mount root, read once per root path. It depends only on
 /// the root's ancestors, which the mount trusts (see
 /// [`resolve_root_no_reparse`]): with the last name opened as itself, a root
 /// the Host later replaces with a reparse point keeps this name, while every
 /// path through that reparse point is reissued under its target's name and no
 /// longer matches. `None` (always walk) for a root not on a local NTFS or ReFS
-/// volume: a network redirector reports the client's name for an open the
+/// disk volume: a network redirector reports the client's name for an open the
 /// server sent through a junction. One entry per distinct mount root.
 fn root_opened_name(root: &Path) -> Option<Vec<u16>> {
     type Names = Mutex<std::collections::HashMap<PathBuf, Option<Vec<u16>>>>;
@@ -536,15 +551,8 @@ fn root_opened_name(root: &Path) -> Option<Vec<u16>> {
         return name.clone();
     }
     let file = open_host_object(root, FILE_READ_ATTRIBUTES).ok()?;
-    let mut name = opened_name(&file)?;
-    let name = if on_local_ntfs_or_refs(&file, &name) {
-        if name.last() == Some(&u16::from(b'\\')) {
-            name.pop();
-        }
-        Some(name)
-    } else {
-        None
-    };
+    let name = opened_name(&file)?;
+    let name = on_local_ntfs_or_refs(&file, &name).then_some(name);
     names
         .lock()
         .unwrap()
@@ -553,11 +561,21 @@ fn root_opened_name(root: &Path) -> Option<Vec<u16>> {
 }
 
 /// Whether `file` (opened by the NT name `name`) is on a local NTFS or ReFS
-/// volume: not under the multiple UNC provider or a redirector, with no remote
-/// protocol information, and with one of those file systems.
-fn on_local_ntfs_or_refs(file: &File, name: &[u16]) -> bool {
+/// disk volume. An allowlist: the name is on a `\Device\HarddiskVolumeN`
+/// device (fixed disks, VHDs, Storage Spaces and Dev Drives all are; every
+/// network, RDP and user-mode redirector is not), the handle has no remote
+/// protocol information, and the file system is NTFS or ReFS.
+/// Whether an NT name is on a `\Device\HarddiskVolumeN` device.
+fn nt_name_on_disk_volume(name: &[u16]) -> bool {
+    const PREFIX: &str = r"\device\harddiskvolume";
     let lower = String::from_utf16_lossy(name).to_ascii_lowercase();
-    if lower.starts_with(r"\device\mup\") || lower.contains("redirector") {
+    lower
+        .strip_prefix(PREFIX)
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+fn on_local_ntfs_or_refs(file: &File, name: &[u16]) -> bool {
+    if !nt_name_on_disk_volume(name) {
         return false;
     }
     // Succeeds only for a file a network redirector serves.

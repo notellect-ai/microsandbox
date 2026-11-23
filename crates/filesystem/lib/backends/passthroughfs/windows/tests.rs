@@ -5541,3 +5541,36 @@ fn readdir_lists_every_batch_and_the_fallback_agrees() {
     };
     assert_eq!(key(&fallback), key(&batched));
 }
+
+/// Only names on a local disk volume take the one-open path; every network,
+/// RDP or user-mode redirector walks.
+#[test]
+fn one_open_path_is_for_disk_volumes_only() {
+    let wide = |name: &str| name.encode_utf16().collect::<Vec<_>>();
+    for local in [
+        r"\Device\HarddiskVolume3\Users\me\root",
+        r"\device\harddiskvolume12\r",
+    ] {
+        assert!(nt_name_on_disk_volume(&wide(local)), "{local}");
+    }
+    for other in [
+        r"\Device\Mup\server\share\root",
+        r"\Device\LanmanRedirector\;Z:0000000000012345\server\share",
+        r"\Device\RdpDr\;C:1\tsclient\C\root",
+        r"\Device\WebDavRedirector\host\root",
+        r"\Device\VBoxMiniRdr\;E:\vboxsvr\share",
+        r"\Device\HarddiskVolume",
+        r"\Device\HarddiskVolumeShadowCopy1\root",
+        r"\Device\Dokan_1\root",
+        r"\Device\Volume{x}\root",
+        "",
+    ] {
+        assert!(!nt_name_on_disk_volume(&wide(other)), "{other}");
+    }
+    let temp = TempDir::new();
+    let root = std::fs::canonicalize(&temp.path).unwrap();
+    assert!(
+        root_opened_name(&root).is_some(),
+        "a temporary directory on the system disk takes the one-open path"
+    );
+}
