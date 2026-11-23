@@ -5358,8 +5358,8 @@ fn host_junction_in_place_of_the_mount_root_is_never_followed() {
     assert!(fs.getattr(context(), d.inode, None).is_err());
 }
 
-/// A guest name in another case opens the same object as the walk does, in
-/// one open (plus the stat override).
+/// A guest name in another case gets the walk's answer (the opened name keeps
+/// the Host's case, so it does not match and the walk answers).
 #[test]
 fn other_spellings_of_a_host_name_get_the_walks_answer() {
     let temp = TempDir::new();
@@ -5369,12 +5369,9 @@ fn other_spellings_of_a_host_name_get_the_walks_answer() {
     let exact = fs
         .lookup(context(), ROOT_INODE, c"LongDirectoryName")
         .unwrap();
-    let opens = host_opens();
     let other_case = fs
         .lookup(context(), ROOT_INODE, c"longdirectoryname")
         .unwrap();
-    // The opened name keeps the caller's spelling, so no walk is needed.
-    assert_eq!(host_opens() - opens, 2, "lookup in another case");
     assert_eq!(exact.attr.st_ino, other_case.attr.st_ino);
     let child = fs.lookup(context(), other_case.inode, c"file.txt").unwrap();
     assert_eq!(child.attr.st_size, 1);
@@ -5571,6 +5568,6 @@ fn one_open_path_is_for_disk_volumes_only() {
     let root = std::fs::canonicalize(&temp.path).unwrap();
     assert!(
         root_opened_name(&root).is_some(),
-        "a temporary directory on the system disk takes the one-open path"
+        "TEMP is not on a local NTFS or ReFS disk volume; this and the open budgets need one"
     );
 }

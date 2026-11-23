@@ -11,18 +11,16 @@ use std::fs::{File, FileTimes, OpenOptions as StdOpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRemoteProtocolInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    GetVolumeInformationByHandleW, ReOpenFile, VOLUME_NAME_NT,
+    FileRemoteProtocolInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, VOLUME_NAME_NT,
 };
 
 use crate::agentd::agentd_bytes;
@@ -427,8 +425,8 @@ fn safe_open_under_root(root: &Path, path: &Path, access: u32) -> io::Result<(Fi
 ///
 /// Only attribute reads open the object before its name is checked. Other
 /// access (a directory listing) is first proven with an attribute open, then
-/// opened again and checked again, so an object outside the mount is never
-/// opened for more than its attributes.
+/// opened again and checked again, so an object outside the mount is opened
+/// for more than its attributes only by a swap racing the two opens.
 fn open_by_final_path(
     root: &Path,
     components: &[Component<'_>],
@@ -481,25 +479,21 @@ fn open_by_final_path(
     if access == FILE_READ_ATTRIBUTES {
         return Ok(Some((file, attrs)));
     }
-    // Reopen the proven object through its handle, not its path, so nothing
-    // swapped in since is opened with more than attribute access.
-    count_host_open();
-    // The proven handle stays live for the call; on success the result is a
-    // new handle this function owns.
-    let reopened = unsafe {
-        ReOpenFile(
-            file.as_raw_handle(),
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-        )
+    // Open again for the access asked for and check the name again. Only a
+    // junction swapped in between the two opens is opened with that access,
+    // and the second check still refuses it. (ReOpenFile, which would close
+    // that window, does not reopen an attribute-only directory handle for
+    // listing.)
+    drop(file);
+    let Ok(file) = open_host_object(&target, access) else {
+        return Ok(None);
     };
-    if reopened.is_null() || reopened == INVALID_HANDLE_VALUE {
+    if opened_name(&file).as_deref() != Some(&expected[..]) {
         return Ok(None);
     }
-    // SAFETY: a valid handle just returned to us and owned by nothing else.
-    let reopened = unsafe { File::from_raw_handle(reopened) };
-    Ok(Some((reopened, attrs)))
+    let attrs = host_attrs(&file)?;
+    reject_reparse_metadata(&attrs.metadata)?;
+    Ok(Some((file, attrs)))
 }
 
 /// The NT name (`\Device\HarddiskVolumeN\...`) a handle was opened by, as
@@ -560,11 +554,6 @@ fn root_opened_name(root: &Path) -> Option<Vec<u16>> {
     name
 }
 
-/// Whether `file` (opened by the NT name `name`) is on a local NTFS or ReFS
-/// disk volume. An allowlist: the name is on a `\Device\HarddiskVolumeN`
-/// device (fixed disks, VHDs, Storage Spaces and Dev Drives all are; every
-/// network, RDP and user-mode redirector is not), the handle has no remote
-/// protocol information, and the file system is NTFS or ReFS.
 /// Whether an NT name is on a `\Device\HarddiskVolumeN` device.
 fn nt_name_on_disk_volume(name: &[u16]) -> bool {
     const PREFIX: &str = r"\device\harddiskvolume";
@@ -574,6 +563,11 @@ fn nt_name_on_disk_volume(name: &[u16]) -> bool {
         .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
+/// Whether `file` (opened by the NT name `name`) is on a local NTFS or ReFS
+/// disk volume. An allowlist: the name is on a `\Device\HarddiskVolumeN`
+/// device (fixed disks, VHDs, Storage Spaces and Dev Drives all are; every
+/// network, RDP and user-mode redirector is not), the handle has no remote
+/// protocol information, and the file system is NTFS or ReFS.
 fn on_local_ntfs_or_refs(file: &File, name: &[u16]) -> bool {
     if !nt_name_on_disk_volume(name) {
         return false;
