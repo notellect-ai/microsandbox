@@ -100,8 +100,15 @@ Known and left as they are (from a review of the v0.8.1 commits):
   a guest shutdown(SHUT_WR) never reaches it (both upstream behaviour); a
   Host that closes with DisconnectNamedPipe without flushing can lose its
   reply; a worker that panics on a poisoned lock leaves the stream connected.
-- Directory mounts without entry and attribute caching look every path
-  component up on the Host each time; not yet measured (perf work later).
+- Directory mounts without entry and attribute caching still send every
+  path component to the Host as its own lookup. On Windows each lookup now
+  opens the object once by its full path and checks the opened name instead
+  of opening every ancestor (local NTFS/ReFS roots only; other roots, names
+  in another case and filter-served reparse points take the old walk).
+  Measured in a guest on a Windows 10 19045 handheld, 2000 ops each, 3
+  rounds: stat 0.95 -> 0.88 ms, six levels deep stat 4.72 -> 3.45 ms and
+  stat of a missing name 4.31 -> 2.88 ms; create, pread unchanged. What is
+  left is mostly one guest-to-Host round trip per component.
 - A detached spawn that hits ERROR_ACCESS_DENIED for another reason (an exe
   ACL, antivirus) also retries inside the job, with the same warning.
 
