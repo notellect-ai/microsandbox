@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
+    GetFinalPathNameByHandleW, VOLUME_NAME_NT,
 };
 
 use crate::agentd::agentd_bytes;
@@ -369,6 +370,9 @@ fn safe_open_under_root(root: &Path, path: &Path, access: u32) -> io::Result<(Fi
         .strip_prefix(root)
         .map_err(|_| linux_error(LINUX_EACCES))?;
     let components = relative.components().collect::<Vec<_>>();
+    if let Some(found) = open_by_final_path(root, &components, access)? {
+        return Ok(found);
+    }
     let mut cursor = root.to_path_buf();
     let last = components
         .iter()
@@ -397,6 +401,117 @@ fn safe_open_under_root(root: &Path, path: &Path, access: u32) -> io::Result<(Fi
     let attrs = host_attrs(&file)?;
     reject_reparse_metadata(&attrs.metadata)?;
     Ok((file, attrs))
+}
+
+/// The fast path of [`safe_open_under_root`]: open the object by its full path
+/// in one call (never following a reparse point at the last name) and read back
+/// the path the handle was opened by. Windows reissues an open that crosses a
+/// symlink, junction or mount point with the target's path, so the handle's
+/// opened name equals the mount root's own name plus the requested components
+/// only when no component below the root was a reparse point. Anything else
+/// (a mismatch, an error the walk would word differently) returns `None` and
+/// the caller walks component by component as before; the answer is never
+/// wider than the walk's. Saves one Host open per path component per lookup,
+/// getattr and open, which a mount with no attribute cache makes per guest
+/// path operation.
+fn open_by_final_path(
+    root: &Path,
+    components: &[Component<'_>],
+    access: u32,
+) -> io::Result<Option<(File, HostAttrs)>> {
+    let mut expected = match root_opened_name(root) {
+        Some(name) => name,
+        None => return Ok(None),
+    };
+    let mut target = root.to_path_buf();
+    let mut parent = None;
+    for component in components {
+        match component {
+            Component::Normal(part) => {
+                if part.to_str().is_some_and(is_reserved_name) {
+                    return Err(linux_error(LINUX_EPERM));
+                }
+                parent = Some((target.clone(), expected.len()));
+                target.push(part);
+                expected.push(u16::from(b'\\'));
+                expected.extend(part.encode_wide());
+            }
+            Component::CurDir => {}
+            _ => return Err(linux_error(LINUX_EACCES)),
+        }
+    }
+    let file = match open_host_object(&target, access) {
+        Ok(file) => file,
+        // The name is missing: prove its directory is the one the walk would
+        // reach, so a miss costs two opens rather than one per component.
+        Err(error) if error.raw_os_error() == Some(LINUX_ENOENT) => {
+            if let Some((parent, len)) = parent
+                && let Ok(dir) = open_host_object(&parent, FILE_READ_ATTRIBUTES)
+                && opened_name(&dir).as_deref() == Some(&expected[..len])
+                && host_attrs(&dir).is_ok_and(|attrs| {
+                    attrs.metadata.is_dir() && reject_reparse_metadata(&attrs.metadata).is_ok()
+                })
+            {
+                return Err(error);
+            }
+            return Ok(None);
+        }
+        Err(_) => return Ok(None),
+    };
+    if opened_name(&file).as_deref() != Some(&expected[..]) {
+        return Ok(None);
+    }
+    let attrs = host_attrs(&file)?;
+    reject_reparse_metadata(&attrs.metadata)?;
+    Ok(Some((file, attrs)))
+}
+
+/// The NT name (`\Device\HarddiskVolumeN\...`) a handle was opened by, as
+/// given, without normalizing case or short names.
+fn opened_name(file: &File) -> Option<Vec<u16>> {
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // The handle stays live for the call; the API writes at most
+        // `buffer.len()` units and returns the length it needs otherwise.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_OPENED | VOLUME_NAME_NT,
+            )
+        } as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < buffer.len() {
+            buffer.truncate(len);
+            return Some(buffer);
+        }
+        buffer.resize(len + 1, 0);
+    }
+}
+
+/// The opened name of a mount root, read once per root path. It depends only
+/// on the root's ancestors, which the mount trusts (see
+/// [`resolve_root_no_reparse`]): with the last name opened as itself, a root
+/// the Host later replaces with a reparse point keeps this name, while every
+/// path through that reparse point is reissued under its target's name and no
+/// longer matches.
+fn root_opened_name(root: &Path) -> Option<Vec<u16>> {
+    static NAMES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, Vec<u16>>>> =
+        std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(Default::default);
+    if let Some(name) = names.lock().unwrap().get(root) {
+        return Some(name.clone());
+    }
+    let file = open_host_object(root, FILE_READ_ATTRIBUTES).ok()?;
+    let name = opened_name(&file)?;
+    names
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), name.clone());
+    Some(name)
 }
 
 fn safe_attrs_under_root(root: &Path, path: &Path) -> io::Result<HostAttrs> {

@@ -160,6 +160,9 @@ impl PassthroughFs {
             }
             root
         };
+        // Read the root's opened name now, so lookups take the one-open path
+        // from the first call (see `open_by_final_path`).
+        let _ = root_opened_name(&root);
         let probe_path = probe_name
             .map(|name| std::str::from_utf8(name.to_bytes()).map(|name| root.join(name)))
             .transpose()

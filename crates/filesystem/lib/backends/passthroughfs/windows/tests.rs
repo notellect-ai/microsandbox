@@ -5137,9 +5137,10 @@ fn matrix_guest_directory_rename_races() {
 }
 
 /// Host opens per operation: lookup and getattr read the object through one
-/// handle (plus the mount root's reparse check and the stat override), and
+/// handle opened by its full path (plus the stat override), at any depth, and
 /// readdir lists a directory in batches through its own handle, so its opens do
 /// not grow with the number of children except for each child's stat override.
+/// A missing name costs its failed open and one open of its directory.
 #[test]
 fn host_open_budget_for_lookup_getattr_and_readdir() {
     const CHILDREN: u64 = 300;
@@ -5155,11 +5156,11 @@ fn host_open_budget_for_lookup_getattr_and_readdir() {
     ] {
         let opens = host_opens();
         let dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap();
-        assert_eq!(host_opens() - opens, 2 + override_reads, "lookup");
+        assert_eq!(host_opens() - opens, 1 + override_reads, "lookup");
 
         let opens = host_opens();
         fs.getattr(context(), dir.inode, None).unwrap();
-        assert_eq!(host_opens() - opens, 2 + override_reads, "getattr");
+        assert_eq!(host_opens() - opens, 1 + override_reads, "getattr");
 
         let opens = host_opens();
         let enumerations = host_enumerations();
@@ -5167,7 +5168,7 @@ fn host_open_budget_for_lookup_getattr_and_readdir() {
         assert_eq!(entries.len() as u64, CHILDREN + 2);
         assert_eq!(
             host_opens() - opens,
-            2 + override_reads * CHILDREN,
+            1 + override_reads * CHILDREN,
             "readdir"
         );
         // 300 short names fit in one 64 KiB batch; the next call ends the listing.
@@ -5175,7 +5176,7 @@ fn host_open_budget_for_lookup_getattr_and_readdir() {
 
         let opens = host_opens();
         let child = fs.lookup(context(), dir.inode, c"f007.txt").unwrap();
-        assert_eq!(host_opens() - opens, 3 + override_reads, "nested lookup");
+        assert_eq!(host_opens() - opens, 1 + override_reads, "nested lookup");
         let ino = entries
             .iter()
             .find(|entry| entry.name == b"f007.txt")
@@ -5195,12 +5196,138 @@ fn host_open_budget_for_lookup_getattr_and_readdir() {
             .unwrap();
         assert_eq!(
             host_opens() - opens,
-            3 + override_reads,
+            1 + override_reads,
             "readdirplus child"
         );
         assert_eq!(attributes.attr.st_nlink, 1);
         assert_eq!(attributes.attr.st_size, 1);
+
+        let opens = host_opens();
+        expect_errno(fs.lookup(context(), dir.inode, c"missing"), LINUX_ENOENT);
+        assert_eq!(host_opens() - opens, 2, "missing name");
     }
+
+    // Depth does not add opens.
+    let mut deep = temp.path.join("dir");
+    for level in 0..6 {
+        deep.push(format!("l{level}"));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("leaf.txt"), b"x").unwrap();
+    let fs = fs_for(&temp.path);
+    let mut inode = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
+    for level in 0..6 {
+        let name = std::ffi::CString::new(format!("l{level}")).unwrap();
+        inode = fs.lookup(context(), inode, &name).unwrap().inode;
+    }
+    let opens = host_opens();
+    let leaf = fs.lookup(context(), inode, c"leaf.txt").unwrap();
+    assert_eq!(host_opens() - opens, 2, "lookup seven levels down");
+    let opens = host_opens();
+    fs.getattr(context(), leaf.inode, None).unwrap();
+    assert_eq!(host_opens() - opens, 2, "getattr seven levels down");
+}
+
+fn make_junction(link: &Path, target: &Path) {
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mklink failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The one-open path never reaches through a reparse point the Host puts in
+/// place of a directory the guest already looked up, of the mount root, or of
+/// a deeper ancestor: existing names, missing names, getattr of an inode cached
+/// below it and opens all fail as the component walk makes them fail, and a
+/// directory put back answers again.
+#[test]
+fn host_junctions_swapped_in_after_lookup_are_never_followed() {
+    let temp = TempDir::new();
+    let root = temp.path.join("root");
+    let outside = temp.path.join("outside");
+    let parked = temp.path.join("parked");
+    std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+    std::fs::write(root.join("a").join("b").join("in.txt"), b"in").unwrap();
+    std::fs::create_dir_all(outside.join("b")).unwrap();
+    std::fs::write(outside.join("b").join("in.txt"), b"outside").unwrap();
+    std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+    let fs = fs_for(&root);
+    let a = fs.lookup(context(), ROOT_INODE, c"a").unwrap();
+    let b = fs.lookup(context(), a.inode, c"b").unwrap();
+    let file = fs.lookup(context(), b.inode, c"in.txt").unwrap();
+
+    // The parent of a looked-up name becomes a junction.
+    std::fs::rename(root.join("a"), &parked).unwrap();
+    make_junction(&root.join("a"), &outside);
+    expect_errno(fs.lookup(context(), a.inode, c"secret.txt"), LINUX_ELOOP);
+    expect_errno(fs.lookup(context(), a.inode, c"nothing"), LINUX_ELOOP);
+    // A grandparent: the cached path a\b\in.txt now runs through it.
+    assert!(fs.lookup(context(), b.inode, c"in.txt").is_err());
+    assert!(fs.lookup(context(), b.inode, c"nothing").is_err());
+    assert!(fs.getattr(context(), file.inode, None).is_err());
+    assert!(fs.open(context(), file.inode, false, 0).is_err());
+    // A junction pointing back inside the mount is refused too.
+    std::fs::remove_dir(root.join("a")).unwrap();
+    std::fs::create_dir(root.join("inside")).unwrap();
+    std::fs::write(root.join("inside").join("secret.txt"), b"x").unwrap();
+    make_junction(&root.join("a"), &root.join("inside"));
+    expect_errno(fs.lookup(context(), a.inode, c"secret.txt"), LINUX_ELOOP);
+
+    // Put back, the names answer again.
+    std::fs::remove_dir(root.join("a")).unwrap();
+    std::fs::rename(&parked, root.join("a")).unwrap();
+    let again = fs.lookup(context(), b.inode, c"in.txt").unwrap();
+    assert_eq!(again.inode, file.inode);
+    let (handle, _) = fs.open(context(), file.inode, false, 0).unwrap();
+    assert_eq!(owned_read(&fs, file.inode, handle.unwrap()), b"in");
+}
+
+/// The mount root replaced by a junction after the mount: nothing below it is
+/// reached, existing or missing, although the root's own name is unchanged.
+#[test]
+fn host_junction_in_place_of_the_mount_root_is_never_followed() {
+    let temp = TempDir::new();
+    let root = temp.path.join("root");
+    let outside = temp.path.join("outside");
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    std::fs::create_dir_all(outside.join("d")).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+    let fs = fs_for(&root);
+    let d = fs.lookup(context(), ROOT_INODE, c"d").unwrap();
+    std::fs::rename(&root, temp.path.join("parked")).unwrap();
+    make_junction(&root, &outside);
+    expect_errno(fs.lookup(context(), ROOT_INODE, c"secret.txt"), LINUX_ELOOP);
+    expect_errno(fs.lookup(context(), ROOT_INODE, c"nothing"), LINUX_ELOOP);
+    expect_errno(fs.lookup(context(), ROOT_INODE, c"d"), LINUX_ELOOP);
+    assert!(fs.getattr(context(), d.inode, None).is_err());
+}
+
+/// A guest name in another case or the 8.3 short form of a Host name opens the
+/// same object (the walk accepts both); the one-open path either accepts it
+/// with the same answer or leaves it to the walk.
+#[test]
+fn other_spellings_of_a_host_name_get_the_walks_answer() {
+    let temp = TempDir::new();
+    std::fs::create_dir(temp.path.join("LongDirectoryName")).unwrap();
+    std::fs::write(temp.path.join("LongDirectoryName").join("file.txt"), b"x").unwrap();
+    let fs = fs_for(&temp.path);
+    let exact = fs
+        .lookup(context(), ROOT_INODE, c"LongDirectoryName")
+        .unwrap();
+    let other_case = fs
+        .lookup(context(), ROOT_INODE, c"longdirectoryname")
+        .unwrap();
+    assert_eq!(exact.attr.st_ino, other_case.attr.st_ino);
+    let child = fs.lookup(context(), other_case.inode, c"file.txt").unwrap();
+    assert_eq!(child.attr.st_size, 1);
 }
 
 /// Readdir and lookup give a Host object one inode in either order, hard links
