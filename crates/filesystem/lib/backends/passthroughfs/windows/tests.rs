@@ -5138,8 +5138,9 @@ fn matrix_guest_directory_rename_races() {
 
 /// Host opens per operation: lookup and getattr read the object through one
 /// handle opened by its full path (plus the stat override), at any depth, and
-/// readdir lists a directory in batches through its own handle, so its opens do
-/// not grow with the number of children except for each child's stat override.
+/// readdir lists a directory in batches through its own handle (opened after an
+/// attribute open proves its name), so its opens do not grow with the number of
+/// children except for each child's stat override.
 /// A missing name costs its failed open and one open of its directory.
 #[test]
 fn host_open_budget_for_lookup_getattr_and_readdir() {
@@ -5168,7 +5169,7 @@ fn host_open_budget_for_lookup_getattr_and_readdir() {
         assert_eq!(entries.len() as u64, CHILDREN + 2);
         assert_eq!(
             host_opens() - opens,
-            1 + override_reads * CHILDREN,
+            2 + override_reads * CHILDREN,
             "readdir"
         );
         // 300 short names fit in one 64 KiB batch; the next call ends the listing.
@@ -5226,6 +5227,50 @@ fn host_open_budget_for_lookup_getattr_and_readdir() {
     let opens = host_opens();
     fs.getattr(context(), leaf.inode, None).unwrap();
     assert_eq!(host_opens() - opens, 2, "getattr seven levels down");
+
+    // A path longer than the first name buffer (512 units) takes the same path.
+    let mut long = temp.path.join("dir");
+    let mut names = Vec::new();
+    for level in 0..5 {
+        let name = format!("{level}{}", "n".repeat(110));
+        long.push(&name);
+        names.push(std::ffi::CString::new(name).unwrap());
+    }
+    std::fs::create_dir_all(&long).unwrap();
+    std::fs::write(long.join("leaf.txt"), b"x").unwrap();
+    let mut inode = fs.lookup(context(), ROOT_INODE, c"dir").unwrap().inode;
+    for name in &names {
+        inode = fs.lookup(context(), inode, name).unwrap().inode;
+    }
+    let opens = host_opens();
+    fs.lookup(context(), inode, c"leaf.txt").unwrap();
+    assert_eq!(host_opens() - opens, 2, "lookup on a long path");
+
+    // A root resolved without trusting any component (the form the runtime
+    // mounts with) takes the same path.
+    let fs = build_no_symlink(temp.path.clone()).unwrap();
+    let opens = host_opens();
+    let dir = fs.lookup(context(), ROOT_INODE, c"dir").unwrap();
+    assert_eq!(
+        host_opens() - opens,
+        1,
+        "lookup, root resolved from the volume"
+    );
+    let opens = host_opens();
+    fs.lookup(context(), dir.inode, c"f007.txt").unwrap();
+    assert_eq!(
+        host_opens() - opens,
+        1,
+        "nested lookup, root resolved from the volume"
+    );
+    let opens = host_opens();
+    let listed = fs.dir_entries(dir.inode).unwrap();
+    assert_eq!(listed.len() as u64, CHILDREN + 2 + 2);
+    assert_eq!(
+        host_opens() - opens,
+        2,
+        "readdir, root resolved from the volume"
+    );
 }
 
 fn make_junction(link: &Path, target: &Path) {
@@ -5274,6 +5319,9 @@ fn host_junctions_swapped_in_after_lookup_are_never_followed() {
     assert!(fs.lookup(context(), b.inode, c"nothing").is_err());
     assert!(fs.getattr(context(), file.inode, None).is_err());
     assert!(fs.open(context(), file.inode, false, 0).is_err());
+    // Listing the swapped directory or one below it is refused as well.
+    assert!(fs.dir_entries(a.inode).is_err());
+    assert!(fs.dir_entries(b.inode).is_err());
     // A junction pointing back inside the mount is refused too.
     std::fs::remove_dir(root.join("a")).unwrap();
     std::fs::create_dir(root.join("inside")).unwrap();
@@ -5310,9 +5358,8 @@ fn host_junction_in_place_of_the_mount_root_is_never_followed() {
     assert!(fs.getattr(context(), d.inode, None).is_err());
 }
 
-/// A guest name in another case or the 8.3 short form of a Host name opens the
-/// same object (the walk accepts both); the one-open path either accepts it
-/// with the same answer or leaves it to the walk.
+/// A guest name in another case opens the same object as the walk does, in
+/// one open (plus the stat override).
 #[test]
 fn other_spellings_of_a_host_name_get_the_walks_answer() {
     let temp = TempDir::new();
@@ -5322,9 +5369,12 @@ fn other_spellings_of_a_host_name_get_the_walks_answer() {
     let exact = fs
         .lookup(context(), ROOT_INODE, c"LongDirectoryName")
         .unwrap();
+    let opens = host_opens();
     let other_case = fs
         .lookup(context(), ROOT_INODE, c"longdirectoryname")
         .unwrap();
+    // The opened name keeps the caller's spelling, so no walk is needed.
+    assert_eq!(host_opens() - opens, 2, "lookup in another case");
     assert_eq!(exact.attr.st_ino, other_case.attr.st_ino);
     let child = fs.lookup(context(), other_case.inode, c"file.txt").unwrap();
     assert_eq!(child.attr.st_size, 1);

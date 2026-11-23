@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, VOLUME_NAME_NT,
+    BY_HANDLE_FILE_INFORMATION, FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO,
+    FileRemoteProtocolInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, VOLUME_NAME_NT,
 };
 
 use crate::agentd::agentd_bytes;
@@ -405,15 +406,27 @@ fn safe_open_under_root(root: &Path, path: &Path, access: u32) -> io::Result<(Fi
 
 /// The fast path of [`safe_open_under_root`]: open the object by its full path
 /// in one call (never following a reparse point at the last name) and read back
-/// the path the handle was opened by. Windows reissues an open that crosses a
-/// symlink, junction or mount point with the target's path, so the handle's
+/// the name the handle was opened by. Windows reissues an open that crosses a
+/// symlink, junction or mount point under the target's name, so the handle's
 /// opened name equals the mount root's own name plus the requested components
-/// only when no component below the root was a reparse point. Anything else
-/// (a mismatch, an error the walk would word differently) returns `None` and
-/// the caller walks component by component as before; the answer is never
-/// wider than the walk's. Saves one Host open per path component per lookup,
-/// getattr and open, which a mount with no attribute cache makes per guest
-/// path operation.
+/// only when no component below the root redirected the open elsewhere.
+/// Anything else (a mismatch, an error the walk would word differently) returns
+/// `None` and the caller walks component by component as before. Saves one Host
+/// open per path component per lookup and getattr, which a mount with no
+/// attribute cache makes for every guest path operation.
+///
+/// What this proves differs from the walk in one respect: a directory carrying
+/// a reparse tag a filter driver serves in place (cloud files, ProjFS) keeps
+/// its name, so an object below it is reached where the walk would refuse it.
+/// Such a tag never moves the open off the mount's own names, which is what the
+/// walk's reparse check protects. Remote roots never take this path: an SMB
+/// server follows junctions on its side and the client's name does not change
+/// (see [`root_opened_name`]).
+///
+/// Only attribute reads open the object before its name is checked. Other
+/// access (a directory listing) is first proven with an attribute open, then
+/// opened again and checked again, so an object outside the mount is never
+/// opened for more than its attributes.
 fn open_by_final_path(
     root: &Path,
     components: &[Component<'_>],
@@ -440,7 +453,7 @@ fn open_by_final_path(
             _ => return Err(linux_error(LINUX_EACCES)),
         }
     }
-    let file = match open_host_object(&target, access) {
+    let file = match open_host_object(&target, FILE_READ_ATTRIBUTES) {
         Ok(file) => file,
         // The name is missing: prove its directory is the one the walk would
         // reach, so a miss costs two opens rather than one per component.
@@ -463,6 +476,18 @@ fn open_by_final_path(
     }
     let attrs = host_attrs(&file)?;
     reject_reparse_metadata(&attrs.metadata)?;
+    if access == FILE_READ_ATTRIBUTES {
+        return Ok(Some((file, attrs)));
+    }
+    drop(file);
+    let Ok(file) = open_host_object(&target, access) else {
+        return Ok(None);
+    };
+    if opened_name(&file).as_deref() != Some(&expected[..]) {
+        return Ok(None);
+    }
+    let attrs = host_attrs(&file)?;
+    reject_reparse_metadata(&attrs.metadata)?;
     Ok(Some((file, attrs)))
 }
 
@@ -470,7 +495,8 @@ fn open_by_final_path(
 /// given, without normalizing case or short names.
 fn opened_name(file: &File) -> Option<Vec<u16>> {
     let mut buffer = vec![0u16; 512];
-    loop {
+    // The needed length grows only if the name changes between calls.
+    for _ in 0..4 {
         // The handle stays live for the call; the API writes at most
         // `buffer.len()` units and returns the length it needs otherwise.
         let len = unsafe {
@@ -490,28 +516,87 @@ fn opened_name(file: &File) -> Option<Vec<u16>> {
         }
         buffer.resize(len + 1, 0);
     }
+    None
 }
 
-/// The opened name of a mount root, read once per root path. It depends only
-/// on the root's ancestors, which the mount trusts (see
+/// The opened name of a mount root, read once per root path, without a
+/// trailing separator (a volume root's name ends in one). It depends only on
+/// the root's ancestors, which the mount trusts (see
 /// [`resolve_root_no_reparse`]): with the last name opened as itself, a root
 /// the Host later replaces with a reparse point keeps this name, while every
 /// path through that reparse point is reissued under its target's name and no
-/// longer matches.
+/// longer matches. `None` (always walk) for a root not on a local NTFS or ReFS
+/// volume: a network redirector reports the client's name for an open the
+/// server sent through a junction. One entry per distinct mount root.
 fn root_opened_name(root: &Path) -> Option<Vec<u16>> {
-    static NAMES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, Vec<u16>>>> =
-        std::sync::OnceLock::new();
+    type Names = Mutex<std::collections::HashMap<PathBuf, Option<Vec<u16>>>>;
+    static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(Default::default);
     if let Some(name) = names.lock().unwrap().get(root) {
-        return Some(name.clone());
+        return name.clone();
     }
     let file = open_host_object(root, FILE_READ_ATTRIBUTES).ok()?;
-    let name = opened_name(&file)?;
+    let mut name = opened_name(&file)?;
+    let name = if on_local_ntfs_or_refs(&file, &name) {
+        if name.last() == Some(&u16::from(b'\\')) {
+            name.pop();
+        }
+        Some(name)
+    } else {
+        None
+    };
     names
         .lock()
         .unwrap()
         .insert(root.to_path_buf(), name.clone());
-    Some(name)
+    name
+}
+
+/// Whether `file` (opened by the NT name `name`) is on a local NTFS or ReFS
+/// volume: not under the multiple UNC provider or a redirector, with no remote
+/// protocol information, and with one of those file systems.
+fn on_local_ntfs_or_refs(file: &File, name: &[u16]) -> bool {
+    let lower = String::from_utf16_lossy(name).to_ascii_lowercase();
+    if lower.starts_with(r"\device\mup\") || lower.contains("redirector") {
+        return false;
+    }
+    // Succeeds only for a file a network redirector serves.
+    // SAFETY: a plain-data struct; all zeroes is a valid value.
+    let mut remote: FILE_REMOTE_PROTOCOL_INFO = unsafe { std::mem::zeroed() };
+    // The handle stays live; the API writes at most the struct's size.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileRemoteProtocolInfo,
+            (&mut remote as *mut FILE_REMOTE_PROTOCOL_INFO).cast(),
+            std::mem::size_of::<FILE_REMOTE_PROTOCOL_INFO>() as u32,
+        )
+    } != 0
+    {
+        return false;
+    }
+    let mut file_system = [0u16; 32];
+    // The handle stays live; the API writes at most `file_system.len()` units.
+    if unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            file_system.as_mut_ptr(),
+            file_system.len() as u32,
+        )
+    } == 0
+    {
+        return false;
+    }
+    let end = file_system.iter().position(|unit| *unit == 0).unwrap_or(0);
+    matches!(
+        String::from_utf16_lossy(&file_system[..end]).as_str(),
+        "NTFS" | "ReFS"
+    )
 }
 
 fn safe_attrs_under_root(root: &Path, path: &Path) -> io::Result<HostAttrs> {
