@@ -730,7 +730,7 @@ pub(crate) async fn validate_runtime_config(
     };
     require_protected_guest_state(&runtime.msb_path).await?;
     if needs_guard {
-        let advertisement = capabilities(&runtime.msb_path).await?;
+        let advertisement = uncached(&runtime.msb_path).await?;
         require_restore_guard(
             &advertisement,
             config.retained_exec_limits().is_some(),
@@ -841,7 +841,7 @@ pub(crate) async fn select_http_deny_response(
     if !config.spec.network.enabled || !config.spec.network.http.deny_response {
         return Ok(http);
     }
-    let capabilities = capabilities(path).await.ok();
+    let capabilities = uncached(path).await.ok();
     let supported =
         capabilities
             .as_ref()
@@ -955,7 +955,7 @@ pub(crate) async fn validate_guest_clock(
     {
         return Ok(());
     }
-    let supported = capabilities(path)
+    let supported = uncached(path)
         .await
         .ok()
         .is_some_and(|capabilities| capabilities.guest_clock);
@@ -990,7 +990,7 @@ pub(crate) async fn validate_multi_tenant_config(
         ));
     }
 
-    let supported = capabilities(path).await.ok().is_some_and(|capabilities| {
+    let supported = uncached(path).await.ok().is_some_and(|capabilities| {
         capabilities.protocols.contains(&2) && capabilities.multi_tenant
     });
     if !supported {
@@ -1011,7 +1011,7 @@ pub(crate) async fn validate_fs_state_limit(
     if global.fs_state_limit_override().is_none() {
         return Ok(());
     }
-    let supported = capabilities(path).await.ok().is_some_and(|capabilities| {
+    let supported = uncached(path).await.ok().is_some_and(|capabilities| {
         capabilities.protocols.contains(&2) && capabilities.fs_state_limit
     });
     if !supported {
@@ -1028,7 +1028,7 @@ pub(crate) async fn validate_fs_state_limit(
 /// Optional evidence support never gates an otherwise-supported operation on an older runtime.
 /// Read the existing side-effect-free probe before dispatch; a failed/old probe means no handoff.
 pub(crate) async fn supports_configuration_retention(path: &Path) -> bool {
-    capabilities(path).await.ok().is_some_and(|capabilities| {
+    uncached(path).await.ok().is_some_and(|capabilities| {
         capabilities.protocols.contains(&2) && capabilities.configuration_retention
     })
 }
@@ -1059,7 +1059,7 @@ async fn require_tcp_accept_queue_size(path: &Path) -> MicrosandboxResult<()> {
 /// This is a security prerequisite for every start, rather than an optional feature.
 /// Probe failures are refusals too: older executables may not recognize the probe command.
 pub(crate) async fn require_protected_guest_state(path: &Path) -> MicrosandboxResult<()> {
-    let result = capabilities(path).await;
+    let result = uncached(path).await;
     let supported = result.as_ref().is_ok_and(|capabilities| {
         capabilities.protocols.contains(&2) && capabilities.protected_guest_state
     });
@@ -1100,6 +1100,12 @@ pub(crate) async fn require_storage_reader(path: &Path) -> MicrosandboxResult<()
     .await
 }
 
+async fn uncached(path: &Path) -> MicrosandboxResult<Arc<LaunchCapabilities>> {
+    Ok(Arc::new(serde_json::from_slice::<LaunchCapabilities>(
+        &bounded_probe(path, "__launch-protocol").await?,
+    )?))
+}
+
 // Cache successful discovery for unchanged native executables. Wrappers can
 // switch their target without changing identity.
 async fn capabilities(path: &Path) -> MicrosandboxResult<Arc<LaunchCapabilities>> {
@@ -1121,7 +1127,7 @@ async fn capabilities(path: &Path) -> MicrosandboxResult<Arc<LaunchCapabilities>
     }
     let capabilities = if let Some(own) = OWN_RUNTIME
         .get()
-        .filter(|own| own.path == path && own.identity == identity)
+        .filter(|own| own.path == path && own.identity == identity && false)
     {
         // Bounded like a probe: the advertisement asks the host hypervisor.
         let advertisement =
