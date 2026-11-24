@@ -7,18 +7,19 @@ release tags `vX.Y.Z-notellect.N`. Pushing such a tag builds `msb` (with agentd
 embedded) and `libkrunfw` for macOS, Linux and Windows from this source, as
 upstream's release does, and publishes them with `checksums.sha256`.
 
-For v0.8.1 the branch is `notellect/v0.8.1-ci8`. `notellect/v0.8.1`,
-`notellect/v0.8.1-ci`, `notellect/v0.8.1-ci2` to `notellect/v0.8.1-ci7` are
-earlier pushes of the same work, left as they were: the CI commit, the Windows
-vsock and Windows unlink commits (Windows-only clippy 1.100 lints), the Windows
-vsock commit again (read room measured after a write), the fixes from a review
-(below), and then the Windows check workflow, the test timeout rule and the
-fault-injection tests (with the fixes they found) were reworked after them,
-and the namespace race matrix (with the fixes it and a review found) after
-those.
-`v0.8.1-notellect.1` was cut from `notellect/v0.8.1-ci3`,
-`v0.8.1-notellect.2` from `notellect/v0.8.1-ci4`; later v0.8.1 tags are cut
-from `notellect/v0.8.1-ci8`.
+For v0.8.1 the current branch is `notellect/windows-lookup-final-path`:
+`notellect/v0.8.1-ci15` plus the Windows one-open lookup commits. The next
+tag, `v0.8.1-notellect.6`, is meant to be cut from it. The earlier branches
+(`notellect/v0.8.1`, `-ci`, `-ci2` to `-ci15`, some `-wip`) are earlier
+pushes of the same work, left as they were.
+
+| Tag | Cut from |
+|---|---|
+| `v0.8.1-notellect.1` | `notellect/v0.8.1-ci3` |
+| `v0.8.1-notellect.2` | `notellect/v0.8.1-ci4` |
+| `v0.8.1-notellect.3` | `notellect/v0.8.1-ci8` |
+| `v0.8.1-notellect.4` | `notellect/v0.8.1-ci9` (late filesystem read credit) |
+| `v0.8.1-notellect.5` | `notellect/v0.8.1-ci15` (performance work and the root inode guard) |
 
 Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
 `snapshot restore` mount flags were dropped because 0.8 boots snapshots with
@@ -75,6 +76,33 @@ Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
   `vendor/msb_krun_devices` (libkrun `src/devices` at the rev the workspace
   pins, patched in for that git source); the vendoring and the fix are
   separate commits. Re-vendor from the new rev when upstream moves libkrun.
+
+- Directory mounts take `cache=on|off`. The default stays off (zero entry
+  and attribute timeouts, above); a Host tree that does not change while it
+  is mounted can opt in to the passthrough default (5 s) with `cache=on`.
+- On Windows the mount root's inode is never given to another name, and it
+  keeps its inode when the Host replaces the root directory.
+- `msb` answers its own launch-protocol checks in process, and the SDK
+  answers every launch check from one cached runtime advertisement, instead
+  of spawning a probe per check.
+- Windows passthroughfs opens the Host fewer times per lookup, getattr and
+  readdir (readdir trusts listing file IDs only on local NTFS). A lookup on
+  a local NTFS or ReFS root opens the object once by its full path and checks
+  the opened name, instead of opening every ancestor.
+- On Windows x86_64 the VMM presets the guest kernel's lpj from the Host TSC
+  frequency for the bundled kernel, so the guest skips delay-loop
+  calibration on every vCPU (under WHP the secondary CPUs' calibration
+  failed and fell back to the slow path).
+
+Upstream status (open PRs from this fork, 2026-11-24): microsandbox #2128
+(vsock pipe wait), #2131 (late read credit), #2132 (job breakaway), #2133
+(snapshot cache SID), #2134 (open files after unlink), #2135 (rename window
+lookup), #2136 (Host directory move), #2137 (directory mount coherence),
+#2138 (mount path separators), #2139 (elevated sandbox sharing, default off),
+#2141 (in-process launch checks), #2142 (root inode guard), #2153
+(inaccessible recorded runtime pid); libkrun #191 (reset receive credit).
+Not yet proposed upstream: the lpj preset, the passthroughfs open reductions
+and the one-open lookup.
 
 Known and left as they are (from a review of the v0.8.1 commits):
 
