@@ -170,6 +170,9 @@ pub fn select_gateway_inputs(
     // This explicit flag chooses destination host trust policy. It supplies neither a
     // recorded certificate's identity nor authority to read the original host's files.
     plan.destination.trust_host_cas = explicit.trust_host_cas;
+    // Bypass rules describe the destination host's network, like its proxy; the
+    // snapshot records none.
+    plan.destination.outbound_proxy_bypass = explicit.outbound_proxy_bypass.clone();
     observe(
         saved.outbound_proxy.as_ref(),
         explicit.outbound_proxy.is_some(),

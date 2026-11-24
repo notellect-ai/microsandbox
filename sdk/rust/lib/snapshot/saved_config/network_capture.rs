@@ -87,6 +87,9 @@ impl RuntimeCaptureSource<'_> {
             trust_host_cas,
             http,
             outbound_proxy,
+            // Like the proxy endpoint, bypass rules describe the host's network, not the
+            // sandbox; whoever restores the snapshot supplies them with the proxy.
+            outbound_proxy_bypass: _,
         } = &self.config.spec.network;
         let NetworkCaptureBindings {
             resolvers,

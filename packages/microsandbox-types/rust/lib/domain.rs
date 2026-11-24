@@ -716,6 +716,12 @@ pub struct NetworkSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[config_patch(nullable)]
     pub outbound_proxy: Option<OutboundProxy>,
+
+    /// Destinations reached directly instead of through `outbound_proxy`:
+    /// host names (matching the name and its subdomains), IP addresses and
+    /// CIDR ranges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound_proxy_bypass: Vec<String>,
 }
 
 /// Proxy configuration for outbound sandbox connections.
@@ -2010,6 +2016,7 @@ impl Default for NetworkSpec {
             nat64_prefixes: default_nat64_prefixes(),
             trust_host_cas: false,
             outbound_proxy: None,
+            outbound_proxy_bypass: Vec::new(),
             http: HttpConfig::default(),
         }
     }

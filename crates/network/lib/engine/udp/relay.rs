@@ -395,6 +395,7 @@ impl UdpRelay {
             &self.outbound_proxy,
             guest_dst,
             host_dst,
+            &self.shared,
         ) {
             None => Some(UdpUpstream::Direct),
             Some(proxy) => match proxy.as_ref() {

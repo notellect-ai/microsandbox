@@ -558,6 +558,7 @@ impl CloudSandboxSpec {
             trust_host_cas: false,
             http: Default::default(),
             outbound_proxy: None,
+            outbound_proxy_bypass: Vec::new(),
         };
         let runtime = SandboxRuntimeOptions {
             workdir: self.runtime.workdir,

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use super::address::{ProxyAddress, ProxyAddressParseError};
 use super::http_connect::HttpConnectCredentials;
 use super::socks::Socks5Credentials;
+#[cfg(feature = "engine")]
+use crate::netstack::shared::SharedState;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -204,17 +206,22 @@ pub trait OutboundProxyConfig {
 #[cfg(feature = "engine")]
 impl ResolvedOutboundProxy {
     /// Selects the configured proxy unless the host-side destination was
-    /// rewritten for a host-local connection.
+    /// rewritten for a host-local connection or the destination matches the
+    /// proxy bypass rules.
     pub(crate) fn select_for_destination(
         configured: &Option<Arc<Self>>,
         guest_dst: SocketAddr,
         host_dst: SocketAddr,
+        shared: &SharedState,
     ) -> Option<Arc<Self>> {
-        if guest_dst == host_dst {
-            configured.clone()
-        } else {
-            None
+        if guest_dst != host_dst {
+            return None;
         }
+        let configured = configured.as_ref()?;
+        if shared.bypasses_outbound_proxy(guest_dst.ip()) {
+            return None;
+        }
+        Some(configured.clone())
     }
 }
 

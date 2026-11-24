@@ -537,6 +537,7 @@ pub fn smoltcp_poll_loop(
                 &outbound_proxy,
                 dst,
                 target.primary(),
+                &shared,
             );
             let pending = PendingConnect::start(target, proxy, shared.clone(), &tokio_handle);
             conn_tracker.track_connect(handle, pending);
@@ -598,6 +599,7 @@ pub fn smoltcp_poll_loop(
                     &outbound_proxy,
                     conn.dst,
                     connect_target.primary(),
+                    &shared,
                 );
                 let proxy = TlsProxy::new(
                     conn.upstream,
@@ -672,6 +674,7 @@ pub fn smoltcp_poll_loop(
                 &outbound_proxy,
                 conn.dst,
                 connect_target.primary(),
+                &shared,
             );
             let proxy = TcpProxy::new(
                 conn.upstream,
@@ -1790,9 +1793,55 @@ mod tests {
                 &proxy,
                 guest_dst,
                 connect_target.primary(),
+                &SharedState::new(4),
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn outbound_proxy_is_skipped_for_bypassed_destinations() {
+        use std::time::Duration;
+
+        use crate::netstack::shared::ResolvedHostnameFamily;
+        use crate::proxy::ProxyBypass;
+
+        let proxy = Some(Arc::new(ResolvedOutboundProxy::HttpConnect {
+            address: "proxy.corp.example:8080".parse().unwrap(),
+            credentials: None,
+        }));
+        let shared = SharedState::new(4);
+        shared.set_proxy_bypass(
+            ProxyBypass::parse(["corp.example", "10.0.0.0/8", "198.51.100.20"]).unwrap(),
+        );
+        for (name, ip) in [
+            ("git.corp.example", "203.0.113.5"),
+            ("api.public.example", "203.0.113.6"),
+            ("www.corp.example.attacker.test", "203.0.113.7"),
+        ] {
+            shared.cache_resolved_hostname(
+                name,
+                ResolvedHostnameFamily::Ipv4,
+                [ip.parse().unwrap()],
+                Duration::from_secs(60),
+            );
+        }
+        let select = |dst: &str| {
+            let dst: SocketAddr = dst.parse().unwrap();
+            ResolvedOutboundProxy::select_for_destination(&proxy, dst, dst, &shared).is_some()
+        };
+        // Bypassed: a CIDR, an exact IP, and an address a bypassed name resolved to.
+        assert!(!select("10.20.30.40:443"));
+        assert!(!select("198.51.100.20:22"));
+        assert!(!select("203.0.113.5:443"));
+        assert!(!select("[::ffff:10.1.1.1]:443"));
+        // Proxied: other names, look-alike names, and addresses no rule covers.
+        assert!(select("203.0.113.6:443"));
+        assert!(select("203.0.113.7:443"));
+        assert!(select("198.51.100.21:443"));
+        // No proxy configured stays no proxy.
+        let dst: SocketAddr = "198.51.100.21:443".parse().unwrap();
+        assert!(ResolvedOutboundProxy::select_for_destination(&None, dst, dst, &shared).is_none());
     }
 
     #[test]
@@ -1810,6 +1859,7 @@ mod tests {
                 &proxy,
                 guest_dst,
                 connect_target.primary(),
+                &SharedState::new(4),
             )
             .is_some()
         );

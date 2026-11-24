@@ -24,6 +24,7 @@ use crate::engine::http_deny::{
     DEFAULT_HTTP_DENY_MESSAGE, http_forbidden_response, json_http_forbidden_response,
     render_http_deny_message,
 };
+use crate::proxy::ProxyBypass;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -105,6 +106,7 @@ pub struct SharedState {
 
     /// HTTP denial settings installed before the network starts.
     http: OnceLock<HttpConfig>,
+    proxy_bypass: OnceLock<ProxyBypass>,
 }
 
 /// Aggregate network counters shared with the runtime metrics sampler.
@@ -157,6 +159,7 @@ impl SharedState {
             nat64_prefixes: OnceLock::new(),
             metrics: NetworkMetrics::default(),
             http: OnceLock::new(),
+            proxy_bypass: OnceLock::new(),
         }
     }
 
@@ -220,6 +223,22 @@ impl SharedState {
     /// Install HTTP denial settings. The first call wins.
     pub fn set_http_config(&self, config: HttpConfig) {
         let _ = self.http.set(config);
+    }
+
+    /// Install the outbound proxy bypass rules. The first call wins.
+    pub fn set_proxy_bypass(&self, bypass: ProxyBypass) {
+        let _ = self.proxy_bypass.set(bypass);
+    }
+
+    /// Whether a connection to `addr` skips the outbound proxy: the address
+    /// matches an address rule, or a live DNS answer through this sandbox's
+    /// resolver named it with a host name that matches a name rule.
+    pub(crate) fn bypasses_outbound_proxy(&self, addr: IpAddr) -> bool {
+        let Some(bypass) = self.proxy_bypass.get().filter(|bypass| !bypass.is_empty()) else {
+            return false;
+        };
+        bypass.matches_ip(addr)
+            || self.any_resolved_hostname(addr, |name| bypass.matches_name(name))
     }
 
     /// Whether readable denial responses were explicitly enabled.

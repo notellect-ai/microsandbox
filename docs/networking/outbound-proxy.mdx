@@ -283,6 +283,24 @@ When the guest looked up the destination through microsandbox's DNS forwarder, H
 - SOCKS4 always sends the IP address.
 - Network policy is still evaluated against the address the guest dialed. If the proxy resolves the name to a different address, the connection reaches that address.
 
+## Bypass rules
+
+Bypass rules list destinations that the sandbox reaches directly even though a proxy is configured, like `NO_PROXY`. Each rule is one of:
+
+- `*`: every destination.
+- An IP address, such as `10.1.2.3` or `2001:db8::1`.
+- A CIDR range, such as `10.0.0.0/8` or `fd00::/8`.
+- A host name, such as `corp.example`, which matches that name and every subdomain. `.corp.example` and `*.corp.example` mean the same.
+
+Rules have no ports. A host name rule matches a connection when a live DNS answer through microsandbox's DNS forwarder returned the dialed address for a matching name; an address the guest reached without such a lookup is matched by IP and CIDR rules only. When several names share an address, a match on any of them bypasses the proxy for that address. Bypass rules apply to TCP and to SOCKS5 UDP, and network policy still applies to bypassed connections.
+
+```bash
+msb run alpine --proxy http://proxy.corp.example:8080 \
+  --proxy-bypass corp.example,10.0.0.0/8 --proxy-bypass localhost
+```
+
+In the Rust SDK, call `.proxy_bypass(["corp.example", "10.0.0.0/8"])` on the sandbox or restore builder. Snapshots do not record bypass rules; pass them again with the proxy when restoring.
+
 ## Behavior and limits
 
 - Network policy is evaluated against the sandbox's actual destination before the proxy connection is opened.

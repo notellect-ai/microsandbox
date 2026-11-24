@@ -144,6 +144,15 @@ pub struct RestoreControlArgs {
     #[cfg(feature = "net")]
     #[arg(long, value_name = "http://HOST:PORT|socks[4|5]://HOST:PORT")]
     pub proxy: Option<String>,
+    /// Reach these destinations directly instead of through --proxy, as with create/run.
+    #[cfg(feature = "net")]
+    #[arg(
+        long,
+        value_name = "HOST|IP|CIDR",
+        value_delimiter = ',',
+        requires = "proxy"
+    )]
+    pub proxy_bypass: Vec<String>,
     /// Optional user ID for a SOCKS4 proxy.
     #[cfg(feature = "net")]
     #[arg(long, value_name = "USER_ID", requires = "proxy")]
@@ -215,6 +224,10 @@ impl RestoreControlArgs {
             }
             if let Some(proxy) = self.outbound_proxy()? {
                 builder = builder.proxy(|_| proxy);
+            }
+            if !self.proxy_bypass.is_empty() {
+                microsandbox_network::proxy::ProxyBypass::parse(&self.proxy_bypass)?;
+                builder = builder.proxy_bypass(&self.proxy_bypass);
             }
         }
         Ok(builder)
@@ -686,6 +699,45 @@ mod tests {
 
         let defaults = TestCli::try_parse_from(["restore", "ready", "--name", "child"]).unwrap();
         assert!(defaults.args.controls.outbound_proxy().unwrap().is_none());
+        assert!(defaults.args.controls.proxy_bypass.is_empty());
+
+        // Bypass rules repeat or split on commas, need --proxy, and bad rules fail in apply.
+        let bypass = |rules: &[&str]| {
+            let mut args = vec![
+                "restore",
+                "ready",
+                "--name",
+                "child",
+                "--proxy",
+                "http://proxy.corp.example:8080",
+            ];
+            args.extend_from_slice(rules);
+            TestCli::try_parse_from(args).unwrap()
+        };
+        let cli = bypass(&[
+            "--proxy-bypass",
+            "corp.example,10.0.0.0/8",
+            "--proxy-bypass",
+            "localhost",
+        ]);
+        assert_eq!(
+            cli.args.controls.proxy_bypass,
+            ["corp.example", "10.0.0.0/8", "localhost"]
+        );
+        assert!(cli.args.controls.apply(Sandbox::restore("ready")).is_ok());
+        let cli = bypass(&["--proxy-bypass", "corp.example:443"]);
+        assert!(cli.args.controls.apply(Sandbox::restore("ready")).is_err());
+        assert!(
+            TestCli::try_parse_from([
+                "restore",
+                "ready",
+                "--name",
+                "child",
+                "--proxy-bypass",
+                "corp.example"
+            ])
+            .is_err()
+        );
 
         // Authentication without a proxy is a parse error, as for create/run.
         assert!(

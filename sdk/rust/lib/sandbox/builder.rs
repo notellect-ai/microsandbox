@@ -1128,6 +1128,47 @@ impl SandboxBuilder {
         self
     }
 
+    /// Reach these destinations directly instead of through the outbound proxy:
+    /// host names (each matching itself and its subdomains), IP addresses,
+    /// CIDR ranges, or `*`. See [`microsandbox_network::proxy::ProxyBypass`].
+    #[cfg(feature = "net")]
+    pub fn proxy_bypass<I, S>(mut self, rules: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        use microsandbox_network::policy::BuildError::InvalidOutboundProxy;
+
+        let bypass = match microsandbox_network::proxy::ProxyBypass::parse(rules) {
+            Ok(bypass) => bypass,
+            Err(error) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(MicrosandboxError::from(InvalidOutboundProxy {
+                        reason: error.to_string(),
+                    }));
+                }
+                return self;
+            }
+        };
+
+        match self.local_network_config() {
+            Ok(mut network) => {
+                network.outbound_proxy_bypass = bypass;
+                if let Err(err) = self.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+            }
+        }
+        self
+    }
+
     /// Prepend explicit rules while preserving a configured policy's defaults and existing rules.
     #[cfg(feature = "net")]
     #[doc(hidden)]

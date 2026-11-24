@@ -103,6 +103,7 @@ Common flags:
 | `--net-nat64-prefix` | Add a NAT64 `/96` prefix for network policy classification |
 | `--net-strict[=BOOL]` | Enabled by default; use `--net-strict false` to opt out. Require hostname-based network allows to use inspectable request authority. Non-intercepted HTTPS fails closed when only a hostname rule allows it |
 | `--proxy` | Route eligible outbound traffic through an `http://HOST:PORT`, `socks4://HOST:PORT`, or `socks5://HOST:PORT` proxy; `HOST` is an IP address or a host name. Local-only. See [Proxies](#outbound-proxy) |
+| `--proxy-bypass` | Reach a destination directly instead of through `--proxy`: a host name (also matching its subdomains), an IP address, a CIDR range, or `*`. Repeat the flag or separate rules with commas. Requires `--proxy`. See [Bypass rules](/networking/outbound-proxy#bypass-rules) |
 | `--socks4-user-id` | Optional SOCKS4 user ID. Requires a `socks4://` proxy |
 | `--socks5-username`, `--socks5-password-env` | SOCKS5 username and the host environment variable containing its password. Both flags are required together |
 | `--http-connect-username`, `--http-connect-password-env` | HTTP CONNECT username and the host environment variable containing its password. Both flags are required together and require an `http://` proxy |
@@ -264,7 +265,7 @@ msb run alpine --proxy socks5://127.0.0.1:1080 \
 ```
 </CodeGroup>
 
-HTTP CONNECT and SOCKS4 support TCP; SOCKS5 also supports non-DNS UDP. HTTP CONNECT and SOCKS5 authentication each require both flags and read the password from the host environment at startup. Pass `--http-connect-username ""` when the proxy authenticates with a token and no username. Proxy URLs cannot contain credentials, paths, queries, or fragments. See [Proxies](/networking/outbound-proxy).
+HTTP CONNECT and SOCKS4 support TCP; SOCKS5 also supports non-DNS UDP. HTTP CONNECT and SOCKS5 authentication each require both flags and read the password from the host environment at startup. Pass `--http-connect-username ""` when the proxy authenticates with a token and no username. Proxy URLs cannot contain credentials, paths, queries, or fragments. Use `--proxy-bypass` for destinations that must not go through the proxy, for example `--proxy-bypass corp.example,10.0.0.0/8`. See [Proxies](/networking/outbound-proxy).
 
 ### Network rule syntax
 
@@ -379,7 +380,7 @@ msb snap restore ./saved.msb --name disk-copy --disk-only
 | `--max-tcp-connections` | Concurrent TCP limit; zero explicitly means unlimited |
 | `--max-udp-connections` | Concurrent UDP session limit; zero explicitly means unlimited |
 | `--max-connections` | Deprecated TCP-only alias; cannot be combined with `--max-tcp-connections` |
-| `--proxy` and its authentication flags | Destination outbound proxy, with the same grammar as [create/run](#outbound-proxy); replaces a proxy recorded in the snapshot |
+| `--proxy`, `--proxy-bypass` and the authentication flags | Destination outbound proxy and its bypass rules, with the same grammar as [create/run](#outbound-proxy); replaces a proxy recorded in the snapshot. Snapshots record no bypass rules |
 | `--max-duration` | Destination sandbox lifetime bound, e.g. `10m` |
 | `--idle-timeout` | Destination inactivity bound, e.g. `2m` |
 | `-q`, `--quiet` | Hide progress, but not unavailable-resource warnings |

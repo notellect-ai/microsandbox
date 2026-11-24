@@ -263,3 +263,20 @@ fn source_secret_shape_errors_stay_redacted_and_destination_lists_are_bounded() 
             .contains("SCFG_LIMIT")
     );
 }
+
+#[test]
+fn explicit_proxy_bypass_reaches_the_destination_with_the_proxy() {
+    let mut explicit = NetworkSpecPatch::new();
+    explicit.outbound_proxy = Some(Some(proxy()));
+    explicit.outbound_proxy_bypass = Some(vec!["corp.example".into(), "10.0.0.0/8".into()]);
+    let plan = select_gateway_inputs(&source(), &explicit, false).unwrap();
+    assert_eq!(
+        plan.destination.outbound_proxy_bypass,
+        Some(vec!["corp.example".to_string(), "10.0.0.0/8".to_string()])
+    );
+    assert!(plan.destination.outbound_proxy.is_some());
+
+    // Nothing explicit selects nothing; the snapshot records no bypass rules.
+    let plan = select_gateway_inputs(&source(), &NetworkSpecPatch::new(), false).unwrap();
+    assert_eq!(plan.destination.outbound_proxy_bypass, None);
+}

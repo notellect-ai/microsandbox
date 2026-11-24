@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
 use crate::policy::NetworkPolicy;
-use crate::proxy::{OutboundProxy, ResolvedOutboundProxy};
+use crate::proxy::{OutboundProxy, ProxyBypass, ResolvedOutboundProxy};
 use crate::secrets::config::SecretsConfig;
 
 //--------------------------------------------------------------------------------------------------
@@ -135,6 +135,10 @@ pub struct NetworkConfig {
     /// relays non-DNS UDP; SOCKS4 and HTTP CONNECT block it.
     #[serde(default)]
     pub outbound_proxy: Option<OutboundProxy>,
+
+    /// Destinations reached directly instead of through `outbound_proxy`.
+    #[serde(default, skip_serializing_if = "ProxyBypass::is_empty")]
+    pub outbound_proxy_bypass: ProxyBypass,
 }
 
 /// Operator-owned settings enforced for multi-tenant sandboxes.
@@ -354,6 +358,7 @@ impl Default for NetworkConfig {
             trust_host_cas: false,
             http: HttpConfig::default(),
             outbound_proxy: None,
+            outbound_proxy_bypass: ProxyBypass::default(),
         }
     }
 }
@@ -425,7 +430,7 @@ mod tests {
     use crate::config::NetworkBuilder;
     use crate::dns::Nameserver;
     use crate::policy::{Destination, NetworkPolicy, Rule};
-    use crate::proxy::OutboundProxy;
+    use crate::proxy::{OutboundProxy, ProxyBypass};
 
     #[test]
     fn strict_defaults_and_explicit_opt_out_survive_wire_round_trips() {
@@ -732,6 +737,46 @@ mod tests {
                 .contains_key("outbound_proxy"),
             "skip_serializing_if should omit an unset outbound_proxy from the wire form"
         );
+    }
+
+    #[test]
+    fn outbound_proxy_bypass_round_trips_through_wire_network_spec() {
+        let config = NetworkConfig {
+            outbound_proxy_bypass: ProxyBypass::parse(["*.Corp.example", "10.0.0.0/8"]).unwrap(),
+            ..NetworkConfig::default()
+        };
+        let wire: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(wire.outbound_proxy_bypass, ["corp.example", "10.0.0.0/8"]);
+        let round_tripped: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap();
+        assert_eq!(
+            round_tripped.outbound_proxy_bypass,
+            config.outbound_proxy_bypass
+        );
+
+        // Unset is omitted on both sides, and older configs without the field read as empty.
+        let empty = serde_json::to_value(NetworkConfig::default()).unwrap();
+        assert!(
+            !empty
+                .as_object()
+                .unwrap()
+                .contains_key("outbound_proxy_bypass")
+        );
+        let wire: microsandbox_types::NetworkSpec = serde_json::from_value(empty).unwrap();
+        assert!(wire.outbound_proxy_bypass.is_empty());
+        assert!(
+            !serde_json::to_value(&wire)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("outbound_proxy_bypass")
+        );
+
+        // A malformed rule from the wire is refused rather than ignored.
+        let mut bad = serde_json::to_value(NetworkConfig::default()).unwrap();
+        bad["outbound_proxy_bypass"] = serde_json::json!(["corp.example:443"]);
+        assert!(serde_json::from_value::<NetworkConfig>(bad).is_err());
     }
 
     /// A config persisted before rate limiters existed must keep

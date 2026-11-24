@@ -392,6 +392,7 @@ impl SmoltcpNetwork {
         );
 
         shared.set_http_config(config.http.clone());
+        shared.set_proxy_bypass(config.outbound_proxy_bypass.clone());
         if let Some(prefix) = config
             .nat64_prefixes
             .iter()

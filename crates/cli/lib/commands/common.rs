@@ -606,6 +606,18 @@ pub struct SandboxOpts {
     #[arg(long, value_name = "http://HOST:PORT|socks[4|5]://HOST:PORT")]
     pub proxy: Option<String>,
 
+    /// Reach these destinations directly instead of through --proxy: a host
+    /// name (also matching its subdomains), an IP address, a CIDR range, or
+    /// `*`. Repeat the flag or separate rules with commas.
+    #[cfg(feature = "net")]
+    #[arg(
+        long,
+        value_name = "HOST|IP|CIDR",
+        value_delimiter = ',',
+        requires = "proxy"
+    )]
+    pub proxy_bypass: Vec<String>,
+
     /// Optional user ID for a SOCKS4 proxy.
     #[cfg(feature = "net")]
     #[arg(long, value_name = "USER_ID", requires = "proxy")]
@@ -2919,6 +2931,10 @@ fn apply_network_opts(
     if let Some(proxy) = proxy {
         builder = builder.proxy(|_| proxy);
     }
+    if !opts.proxy_bypass.is_empty() {
+        microsandbox_network::proxy::ProxyBypass::parse(&opts.proxy_bypass)?;
+        builder = builder.proxy_bypass(&opts.proxy_bypass);
+    }
 
     Ok(builder)
 }
@@ -4340,6 +4356,35 @@ mod tests {
         let proxy = opts.build_outbound_proxy().unwrap().unwrap();
         let json = serde_json::to_value(proxy).unwrap();
         assert!(json.get("credentials").is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn proxy_bypass_reaches_the_network_spec() {
+        let opts = SandboxOpts {
+            proxy: Some("http://proxy.corp.example:8080".into()),
+            proxy_bypass: vec!["*.Corp.example".into(), "10.0.0.0/8".into()],
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            config.spec.network.outbound_proxy_bypass,
+            ["corp.example", "10.0.0.0/8"]
+        );
+
+        let opts = SandboxOpts {
+            proxy: Some("http://proxy.corp.example:8080".into()),
+            proxy_bypass: vec!["corp.example:443".into()],
+            ..Default::default()
+        };
+        let error = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .err()
+            .expect("a rule with a port was accepted");
+        assert!(error.to_string().contains("corp.example:443"), "{error}");
     }
 
     #[cfg(feature = "net")]

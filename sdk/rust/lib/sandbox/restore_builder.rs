@@ -305,6 +305,18 @@ impl RestoreBuilder {
         self
     }
 
+    /// Reach these destinations directly instead of through the destination proxy.
+    /// The snapshot records no bypass rules; see [`SandboxBuilder::proxy_bypass`].
+    #[cfg(feature = "net")]
+    pub fn proxy_bypass<I, S>(mut self, rules: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.inner = self.inner.proxy_bypass(rules);
+        self
+    }
+
     /// Set the destination host's concurrent TCP connection limit; zero explicitly means unlimited.
     /// The limit is applied before disk boot or full-restore network activation.
     #[cfg(feature = "net")]
@@ -545,6 +557,28 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[cfg(all(feature = "local", feature = "net"))]
+    #[test]
+    fn destination_proxy_bypass_is_parsed_and_carried() {
+        let builder = Sandbox::restore("saved")
+            .proxy(|proxy| proxy.http_connect("proxy.corp.example:8080"))
+            .proxy_bypass(["*.Corp.example", "10.0.0.0/8"]);
+        assert!(builder.inner.build_error.is_none());
+        let network = config(&builder).local_network_config().unwrap();
+        assert_eq!(
+            serde_json::to_value(&network.outbound_proxy_bypass).unwrap(),
+            serde_json::json!(["corp.example", "10.0.0.0/8"])
+        );
+
+        let builder = Sandbox::restore("saved").proxy_bypass(["corp.example:443"]);
+        let error = builder
+            .inner
+            .build_error
+            .as_ref()
+            .expect("bad rule accepted");
+        assert!(error.to_string().contains("corp.example:443"), "{error}");
     }
 
     #[cfg(all(feature = "local", feature = "net"))]
