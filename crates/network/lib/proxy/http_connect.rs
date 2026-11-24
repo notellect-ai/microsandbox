@@ -1,7 +1,6 @@
 //! HTTP CONNECT outbound proxy builders and transport.
 
 use std::fmt;
-use std::net::AddrParseError;
 #[cfg(feature = "engine")]
 use std::{io, net::SocketAddr, time::Duration};
 
@@ -17,6 +16,9 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(feature = "engine")]
+use super::address::ProxyAddress;
+use super::address::ProxyAddressParseError;
 use super::types::{
     OutboundProxy, OutboundProxyBuildError, OutboundProxyConfig, OutboundProxyProtocol,
 };
@@ -147,11 +149,11 @@ impl ResolvedHttpConnectCredentials {
 impl HttpConnectProtocol {
     /// Opens a TCP tunnel through the configured HTTP proxy.
     pub(super) async fn connect(
-        address: SocketAddr,
+        address: ProxyAddress,
         destination: SocketAddr,
         credentials: Option<&ResolvedHttpConnectCredentials>,
     ) -> io::Result<TcpStream> {
-        let mut stream = TcpStream::connect(address).await?;
+        let mut stream = address.connect().await?;
         let authority = destination.to_string();
         let request = Self::build_connect_request(&authority, credentials);
 
@@ -343,13 +345,16 @@ impl HttpConnectProtocol {
 
 impl OutboundProxyConfig for HttpConnectProxyBuilder {
     fn build(self) -> Result<OutboundProxy, OutboundProxyBuildError> {
-        let address = self.address.parse().map_err(|source: AddrParseError| {
-            OutboundProxyBuildError::InvalidAddress {
-                protocol: OutboundProxyProtocol::HttpConnect,
-                address: self.address,
-                source,
-            }
-        })?;
+        let address = self
+            .address
+            .parse()
+            .map_err(
+                |source: ProxyAddressParseError| OutboundProxyBuildError::InvalidAddress {
+                    protocol: OutboundProxyProtocol::HttpConnect,
+                    address: self.address,
+                    source,
+                },
+            )?;
 
         if let Some(credentials) = &self.credentials {
             credentials.validate()?;
@@ -409,7 +414,7 @@ mod tests {
     };
 
     use super::{
-        CONNECT_RESPONSE_HEADER_LIMIT, CONNECT_RESPONSE_TIMEOUT, HttpConnectProtocol,
+        CONNECT_RESPONSE_HEADER_LIMIT, CONNECT_RESPONSE_TIMEOUT, HttpConnectProtocol, ProxyAddress,
         ResolvedHttpConnectCredentials,
     };
     use crate::proxy::{
@@ -864,6 +869,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_reaches_a_proxy_named_by_host() {
+        let (address, request_rx, task) =
+            spawn_mock_proxy(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
+        let named: ProxyAddress = format!("localhost:{}", address.port()).parse().unwrap();
+        assert!(matches!(named, ProxyAddress::Host { .. }));
+        let stream = bounded(HttpConnectProtocol::connect(named, destination(), None))
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
+        let request = bounded(request_rx).await.expect("request capture stalled");
+        join_proxy(task).await;
+        assert_eq!(request, expected_request(destination()));
+    }
+
+    #[tokio::test]
     async fn connect_enforces_response_header_limit() {
         assert_eq!(CONNECT_RESPONSE_HEADER_LIMIT, 8192);
         for len in [8191, 8192] {
@@ -948,7 +968,12 @@ mod tests {
             bounded(release_rx).await.unwrap();
         });
 
-        let result = bounded(HttpConnectProtocol::connect(address, destination(), None)).await;
+        let result = bounded(HttpConnectProtocol::connect(
+            address.into(),
+            destination(),
+            None,
+        ))
+        .await;
 
         let request = bounded(request_rx).await.unwrap();
         release_tx.send(()).unwrap();
@@ -977,9 +1002,13 @@ mod tests {
             bounded(stream.write_all(b"pong")).await.unwrap();
         });
 
-        let mut stream = bounded(HttpConnectProtocol::connect(address, destination(), None))
-            .await
-            .unwrap();
+        let mut stream = bounded(HttpConnectProtocol::connect(
+            address.into(),
+            destination(),
+            None,
+        ))
+        .await
+        .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), address);
         assert_eq!(
             bounded(request_rx).await.unwrap(),
@@ -1039,8 +1068,11 @@ mod tests {
                 }
             });
 
-            let mut handshake =
-                Box::pin(HttpConnectProtocol::connect(address, destination(), None));
+            let mut handshake = Box::pin(HttpConnectProtocol::connect(
+                address.into(),
+                destination(),
+                None,
+            ));
 
             let request = tokio::select! {
                 biased;
@@ -1080,8 +1112,11 @@ mod tests {
             let (address, request_rx, written_rx, task) =
                 spawn_stalled_proxy(response.to_vec()).await;
             let started = Instant::now();
-            let mut handshake =
-                Box::pin(HttpConnectProtocol::connect(address, destination(), None));
+            let mut handshake = Box::pin(HttpConnectProtocol::connect(
+                address.into(),
+                destination(),
+                None,
+            ));
 
             let request = tokio::select! {
                 biased;
@@ -1117,7 +1152,11 @@ mod tests {
     #[tokio::test]
     async fn cancelling_connect_closes_proxy_socket() {
         let (address, request_rx, written_rx, task) = spawn_stalled_proxy(Vec::new()).await;
-        let handshake = tokio::spawn(HttpConnectProtocol::connect(address, destination(), None));
+        let handshake = tokio::spawn(HttpConnectProtocol::connect(
+            address.into(),
+            destination(),
+            None,
+        ));
 
         let request = bounded(request_rx).await.unwrap();
         assert_eq!(request, expected_request(destination()));
@@ -1389,7 +1428,12 @@ mod tests {
         destination: SocketAddr,
     ) -> (io::Result<TcpStream>, Vec<u8>) {
         let (address, request_rx, task) = spawn_mock_proxy(response).await;
-        let result = bounded(HttpConnectProtocol::connect(address, destination, None)).await;
+        let result = bounded(HttpConnectProtocol::connect(
+            address.into(),
+            destination,
+            None,
+        ))
+        .await;
 
         let request = bounded(request_rx).await.expect("request capture stalled");
         join_proxy(task).await;
@@ -1406,7 +1450,7 @@ mod tests {
     ) -> (io::Result<TcpStream>, Vec<u8>) {
         let (address, request_rx, task) = spawn_mock_proxy(response).await;
         let result = bounded(HttpConnectProtocol::connect(
-            address,
+            address.into(),
             destination,
             Some(credentials),
         ))

@@ -603,7 +603,7 @@ pub struct SandboxOpts {
     /// Dial all outbound sandbox connections through this proxy.
     /// Supports http://, socks4://, and socks5:// protocols.
     #[cfg(feature = "net")]
-    #[arg(long, value_name = "http://IP:PORT|socks[4|5]://IP:PORT")]
+    #[arg(long, value_name = "http://HOST:PORT|socks[4|5]://HOST:PORT")]
     pub proxy: Option<String>,
 
     /// Optional user ID for a SOCKS4 proxy.
@@ -4340,6 +4340,41 @@ mod tests {
         let proxy = opts.build_outbound_proxy().unwrap().unwrap();
         let json = serde_json::to_value(proxy).unwrap();
         assert!(json.get("credentials").is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_accepts_host_names() {
+        for (raw, address) in [
+            ("http://Proxy.Corp.example:3128", "proxy.corp.example:3128"),
+            (
+                "socks4://proxy.corp.example:1080",
+                "proxy.corp.example:1080",
+            ),
+            ("socks5://localhost:1080", "localhost:1080"),
+        ] {
+            let opts = SandboxOpts {
+                proxy: Some(raw.into()),
+                ..Default::default()
+            };
+            let proxy = opts.build_outbound_proxy().unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(proxy).unwrap()["address"],
+                address,
+                "{raw}"
+            );
+        }
+        for raw in [
+            "http://proxy.corp.example",
+            "http://proxy_corp.example:3128",
+            "socks5://proxy.corp.example:0",
+        ] {
+            let opts = SandboxOpts {
+                proxy: Some(raw.into()),
+                ..Default::default()
+            };
+            assert!(opts.build_outbound_proxy().is_err(), "{raw}");
+        }
     }
 
     #[cfg(feature = "net")]

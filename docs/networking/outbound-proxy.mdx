@@ -77,11 +77,11 @@ msb create python --name proxied --proxy socks5://127.0.0.1:1080
 ```
 </CodeGroup>
 
-SDK addresses use `IP:port`. The `msb run` and `msb create` commands accept `--proxy http://IP:port`, `socks4://IP:port`, or `socks5://IP:port`. Proxy URIs reject user information, paths, query parameters, and fragments; SOCKS authentication uses separate CLI flags.
+SDK addresses use `IP:port`, `[IPv6]:port`, or `host:port`. The `msb run` and `msb create` commands accept `--proxy http://HOST:port`, `socks4://HOST:port`, or `socks5://HOST:port`, where `HOST` is an IP address or a host name. A host name is looked up with the host's resolver each time the runtime opens a connection to the proxy, and its addresses are tried in order. Proxy URIs reject user information, paths, query parameters, and fragments; SOCKS authentication uses separate CLI flags.
 
 ## HTTP CONNECT
 
-HTTP CONNECT opens a TCP tunnel through an HTTP proxy. It supports optional HTTP Basic authentication and TCP only; UDP is unsupported. microsandbox resolves and checks the destination using its normal DNS and egress policy before sending the destination IP and port in the CONNECT request. The proxy address itself must be an IP address with a port.
+HTTP CONNECT opens a TCP tunnel through an HTTP proxy. It supports optional HTTP Basic authentication and TCP only; UDP is unsupported. microsandbox resolves and checks the destination using its normal DNS and egress policy before sending the destination IP and port in the CONNECT request.
 
 The selected `msb` runtime must support HTTP CONNECT. When using an older runtime, the SDK requests an upgrade before creating or replacing a sandbox.
 

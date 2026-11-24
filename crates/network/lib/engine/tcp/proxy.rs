@@ -1456,7 +1456,7 @@ mod tests {
         let http_proxy_addr: SocketAddr = "93.184.216.34:3128".parse().unwrap();
         let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let outbound_proxy = ResolvedOutboundProxy::Socks5 {
-            address: socks_listener.local_addr().unwrap(),
+            address: socks_listener.local_addr().unwrap().into(),
             credentials: None,
         };
         let socks_task = tokio::spawn(async move {

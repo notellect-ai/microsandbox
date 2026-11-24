@@ -102,7 +102,7 @@ Common flags:
 | `--net-rule` | Add a network policy rule |
 | `--net-nat64-prefix` | Add a NAT64 `/96` prefix for network policy classification |
 | `--net-strict[=BOOL]` | Enabled by default; use `--net-strict false` to opt out. Require hostname-based network allows to use inspectable request authority. Non-intercepted HTTPS fails closed when only a hostname rule allows it |
-| `--proxy` | Route eligible outbound traffic through an `http://IP:PORT`, `socks4://IP:PORT`, or `socks5://IP:PORT` proxy. Local-only. See [Proxies](#outbound-proxy) |
+| `--proxy` | Route eligible outbound traffic through an `http://HOST:PORT`, `socks4://HOST:PORT`, or `socks5://HOST:PORT` proxy; `HOST` is an IP address or a host name. Local-only. See [Proxies](#outbound-proxy) |
 | `--socks4-user-id` | Optional SOCKS4 user ID. Requires a `socks4://` proxy |
 | `--socks5-username`, `--socks5-password-env` | SOCKS5 username and the host environment variable containing its password. Both flags are required together |
 | `--http-connect-username`, `--http-connect-password-env` | HTTP CONNECT username and the host environment variable containing its password. Both flags are required together and require an `http://` proxy |

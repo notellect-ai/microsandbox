@@ -132,7 +132,7 @@ impl ResolvedOutboundProxy {
                     }
                 };
                 Ok(Some(Self::HttpConnect {
-                    address: *address,
+                    address: address.clone(),
                     credentials,
                 }))
             }
@@ -143,7 +143,7 @@ impl ResolvedOutboundProxy {
                     });
                 }
                 Ok(Some(Self::Socks4 {
-                    address: *address,
+                    address: address.clone(),
                     user_id: user_id.clone(),
                 }))
             }
@@ -179,7 +179,7 @@ impl ResolvedOutboundProxy {
                     }
                 };
                 Ok(Some(Self::Socks5 {
-                    address: *address,
+                    address: address.clone(),
                     credentials,
                 }))
             }
@@ -193,20 +193,27 @@ impl ResolvedOutboundProxy {
             Self::HttpConnect {
                 address,
                 credentials,
-            } => HttpConnectProtocol::connect(*address, destination, credentials.as_ref()).await,
-            Self::Socks4 { address, user_id } => match user_id {
-                Some(user_id) => {
-                    Socks4Stream::connect_with_userid(*address, destination, user_id).await
-                }
-                None => Socks4Stream::connect(*address, destination).await,
+            } => {
+                HttpConnectProtocol::connect(address.clone(), destination, credentials.as_ref())
+                    .await
             }
-            .map(|stream| stream.into_inner())
-            .map_err(io::Error::other),
+            Self::Socks4 { address, user_id } => {
+                let socket = address.connect().await?;
+                match user_id {
+                    Some(user_id) => {
+                        Socks4Stream::connect_with_userid_and_socket(socket, destination, user_id)
+                            .await
+                    }
+                    None => Socks4Stream::connect_with_socket(socket, destination).await,
+                }
+                .map(|stream| stream.into_inner())
+                .map_err(io::Error::other)
+            }
             Self::Socks5 {
                 address,
                 credentials,
             } => {
-                let mut stream = TcpStream::connect(*address).await?;
+                let mut stream = address.connect().await?;
                 Socks5Protocol::negotiate(&mut stream, credentials.as_ref()).await?;
                 // The bound address is informational for CONNECT. Parse it to
                 // validate the reply, but do not resolve proxy-supplied domains.
@@ -233,7 +240,7 @@ impl ResolvedOutboundProxy {
             ));
         };
 
-        let mut control = TcpStream::connect(*address).await?;
+        let mut control = address.connect().await?;
         Socks5Protocol::negotiate(&mut control, credentials.as_ref()).await?;
 
         let control_local = control.local_addr()?;
@@ -820,6 +827,7 @@ mod tests {
     use crate::engine::dns::forwarder::DnsForwarder;
     use crate::netstack::poll::GatewayIps;
     use crate::netstack::shared::SharedState;
+    use crate::proxy::ProxyAddress;
 
     async fn responding_dns(relay_ipv6: Ipv6Addr, source_ipv4: Ipv4Addr) -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -867,7 +875,7 @@ mod tests {
 
     #[test]
     fn builder_creates_socks4_proxy_with_optional_user_id() {
-        let address = "127.0.0.1:1080".parse().unwrap();
+        let address: ProxyAddress = "127.0.0.1:1080".parse().unwrap();
         let without_user_id = OutboundProxyBuilder::new()
             .socks4("127.0.0.1:1080")
             .build()
@@ -881,7 +889,7 @@ mod tests {
         assert_eq!(
             without_user_id,
             OutboundProxy::Socks4 {
-                address,
+                address: address.clone(),
                 user_id: None,
             }
         );
@@ -1147,7 +1155,7 @@ mod tests {
         });
 
         let mut stream = ResolvedOutboundProxy::Socks4 {
-            address: proxy_addr,
+            address: proxy_addr.into(),
             user_id: Some("sandbox".to_string()),
         }
         .connect(target)
@@ -1193,7 +1201,7 @@ mod tests {
         });
 
         let mut stream = ResolvedOutboundProxy::Socks5 {
-            address: proxy_addr,
+            address: proxy_addr.into(),
             credentials: None,
         }
         .connect(target)
@@ -1233,7 +1241,7 @@ mod tests {
         });
 
         let mut stream = ResolvedOutboundProxy::Socks5 {
-            address: proxy_addr,
+            address: proxy_addr.into(),
             credentials: None,
         }
         .connect(target)
@@ -1385,7 +1393,7 @@ mod tests {
         });
 
         let proxy = ResolvedOutboundProxy::Socks5 {
-            address: proxy_addr,
+            address: proxy_addr.into(),
             credentials: None,
         };
         let forwarder = DnsForwarder::for_proxy_test(

@@ -1,13 +1,15 @@
 //! Outbound proxy configuration types and parsing.
 
 use std::fmt;
-use std::net::{AddrParseError, SocketAddr};
+#[cfg(feature = "engine")]
+use std::net::SocketAddr;
 use std::str::FromStr;
 #[cfg(feature = "engine")]
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use super::address::{ProxyAddress, ProxyAddressParseError};
 use super::http_connect::HttpConnectCredentials;
 use super::socks::Socks5Credentials;
 
@@ -23,8 +25,8 @@ pub enum OutboundProxy {
     /// An HTTP proxy that opens TCP tunnels with CONNECT.
     #[serde(rename = "http_connect")]
     HttpConnect {
-        /// Proxy socket address.
-        address: SocketAddr,
+        /// Proxy address (`IP:PORT` or `HOST:PORT`).
+        address: ProxyAddress,
         /// Optional durable username/password authentication configuration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials: Option<HttpConnectCredentials>,
@@ -32,8 +34,8 @@ pub enum OutboundProxy {
 
     /// A SOCKS4 proxy at the given address.
     Socks4 {
-        /// Proxy socket address.
-        address: SocketAddr,
+        /// Proxy address (`IP:PORT` or `HOST:PORT`).
+        address: ProxyAddress,
         /// Optional user ID sent during the SOCKS4 handshake.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_id: Option<String>,
@@ -41,8 +43,8 @@ pub enum OutboundProxy {
 
     /// A SOCKS5 proxy at the given address.
     Socks5 {
-        /// Proxy socket address.
-        address: SocketAddr,
+        /// Proxy address (`IP:PORT` or `HOST:PORT`).
+        address: ProxyAddress,
         /// Optional durable username/password authentication configuration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials: Option<Socks5Credentials>,
@@ -56,8 +58,8 @@ pub enum ResolvedOutboundProxy {
     /// An HTTP CONNECT proxy ready for TCP connections.
     #[serde(rename = "http_connect")]
     HttpConnect {
-        /// Proxy socket address.
-        address: SocketAddr,
+        /// Proxy address (`IP:PORT` or `HOST:PORT`).
+        address: ProxyAddress,
         /// Optional resolved username/password authentication credentials.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials: Option<super::http_connect::ResolvedHttpConnectCredentials>,
@@ -65,16 +67,16 @@ pub enum ResolvedOutboundProxy {
 
     /// A SOCKS4 proxy ready for TCP connections.
     Socks4 {
-        /// Proxy socket address.
-        address: SocketAddr,
+        /// Proxy address (`IP:PORT` or `HOST:PORT`).
+        address: ProxyAddress,
         /// Optional user ID sent during the SOCKS4 handshake.
         user_id: Option<String>,
     },
 
     /// A SOCKS5 proxy ready for TCP and UDP connections.
     Socks5 {
-        /// Proxy socket address.
-        address: SocketAddr,
+        /// Proxy address (`IP:PORT` or `HOST:PORT`).
+        address: ProxyAddress,
         /// Optional resolved username/password authentication credentials.
         credentials: Option<super::socks::ResolvedSocks5Credentials>,
     },
@@ -112,16 +114,16 @@ pub struct OutboundProxyBuilder;
 /// Error returned when building an outbound proxy.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum OutboundProxyBuildError {
-    /// The proxy address is not a valid socket address.
+    /// The proxy address is neither `IP:PORT` nor `HOST:PORT`.
     #[error("invalid {protocol} proxy address {address:?}: {source}")]
     InvalidAddress {
         /// Proxy protocol whose address was invalid.
         protocol: OutboundProxyProtocol,
         /// Invalid address text.
         address: String,
-        /// Socket-address parsing failure.
+        /// Address parsing failure.
         #[source]
-        source: AddrParseError,
+        source: ProxyAddressParseError,
     },
 
     /// A SOCKS4 user ID is empty, too long, or contains a null byte.
@@ -180,7 +182,7 @@ pub enum OutboundProxyParseError {
     #[error("outbound proxy URI must not include a path, query, or fragment")]
     ExtraComponentsNotSupported,
 
-    /// The proxy address is not a valid socket address.
+    /// The proxy address or settings are invalid.
     #[error(transparent)]
     Build(#[from] OutboundProxyBuildError),
 }

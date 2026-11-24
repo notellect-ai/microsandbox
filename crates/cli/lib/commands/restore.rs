@@ -142,7 +142,7 @@ pub struct RestoreControlArgs {
     /// Dial the destination's outbound connections through this proxy, as with create/run.
     /// Replaces any proxy recorded in the snapshot.
     #[cfg(feature = "net")]
-    #[arg(long, value_name = "http://IP:PORT|socks[4|5]://IP:PORT")]
+    #[arg(long, value_name = "http://HOST:PORT|socks[4|5]://HOST:PORT")]
     pub proxy: Option<String>,
     /// Optional user ID for a SOCKS4 proxy.
     #[cfg(feature = "net")]

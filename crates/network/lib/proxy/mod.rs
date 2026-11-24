@@ -1,5 +1,6 @@
 //! Outbound proxy configuration and transport implementations.
 
+mod address;
 mod http_connect;
 mod socks;
 mod types;
@@ -11,6 +12,7 @@ mod types;
 #[cfg(feature = "engine")]
 pub use crate::tcp::proxy::*;
 
+pub use address::{ProxyAddress, ProxyAddressParseError};
 #[doc(hidden)]
 pub use http_connect::ResolvedHttpConnectCredentials;
 pub use http_connect::{HttpConnectCredentials, HttpConnectProxyBuilder};

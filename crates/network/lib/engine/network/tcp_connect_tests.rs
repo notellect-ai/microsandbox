@@ -216,7 +216,7 @@ async fn check_stalled_ipv6_fallback() {
     let config = NetworkConfig {
         policy: NetworkPolicy::allow_all(),
         outbound_proxy: Some(OutboundProxy::HttpConnect {
-            address: listener.local_addr().unwrap(),
+            address: listener.local_addr().unwrap().into(),
             credentials: None,
         }),
         ..Default::default()
