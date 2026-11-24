@@ -9,6 +9,9 @@ use microsandbox::{
 };
 
 #[cfg(feature = "net")]
+use microsandbox::OutboundProxy;
+
+#[cfg(feature = "net")]
 use super::common::parse_port_mapping;
 use super::common::{
     display_restore_warnings, guest_clock_parser, parse_explicit_disk_mount, parse_restore_volume,
@@ -136,6 +139,31 @@ pub struct RestoreControlArgs {
     #[cfg(feature = "net")]
     #[arg(long)]
     pub max_udp_connections: Option<usize>,
+    /// Dial the destination's outbound connections through this proxy, as with create/run.
+    /// Replaces any proxy recorded in the snapshot.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "http://IP:PORT|socks[4|5]://IP:PORT")]
+    pub proxy: Option<String>,
+    /// Optional user ID for a SOCKS4 proxy.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "USER_ID", requires = "proxy")]
+    pub socks4_user_id: Option<String>,
+    /// Username for SOCKS5 username/password authentication.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "USERNAME", requires_all = ["proxy", "socks5_password_env"])]
+    pub socks5_username: Option<String>,
+    /// Host environment variable containing the SOCKS5 password.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "ENV_VAR", requires_all = ["proxy", "socks5_username"])]
+    pub socks5_password_env: Option<String>,
+    /// Username for HTTP CONNECT proxy authentication.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "USERNAME", requires_all = ["proxy", "http_connect_password_env"])]
+    pub http_connect_username: Option<String>,
+    /// Host environment variable containing the HTTP CONNECT proxy password.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "ENV_VAR", requires_all = ["proxy", "http_connect_username"])]
+    pub http_connect_password_env: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -185,8 +213,26 @@ impl RestoreControlArgs {
             if let Some(limit) = self.max_udp_connections {
                 builder = builder.max_udp_connections(limit);
             }
+            if let Some(proxy) = self.outbound_proxy()? {
+                builder = builder.proxy(|_| proxy);
+            }
         }
         Ok(builder)
+    }
+
+    /// Build the destination proxy with the same parsing and validation as create/run.
+    #[cfg(feature = "net")]
+    fn outbound_proxy(&self) -> anyhow::Result<Option<OutboundProxy>> {
+        super::common::SandboxOpts {
+            proxy: self.proxy.clone(),
+            socks4_user_id: self.socks4_user_id.clone(),
+            socks5_username: self.socks5_username.clone(),
+            socks5_password_env: self.socks5_password_env.clone(),
+            http_connect_username: self.http_connect_username.clone(),
+            http_connect_password_env: self.http_connect_password_env.clone(),
+            ..Default::default()
+        }
+        .build_outbound_proxy()
     }
 
     #[cfg(feature = "net")]
@@ -606,6 +652,79 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn restore_proxy_matches_create_grammar() {
+        let cli = TestCli::try_parse_from([
+            "restore",
+            "ready",
+            "--name",
+            "child",
+            "--proxy",
+            "http://127.0.0.1:3128",
+            "--http-connect-username",
+            "sandbox",
+            "--http-connect-password-env",
+            "PROXY_PASSWORD",
+        ])
+        .unwrap();
+        let proxy = cli.args.controls.outbound_proxy().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(proxy).unwrap(),
+            serde_json::json!({
+                "protocol": "http_connect",
+                "address": "127.0.0.1:3128",
+                "credentials": {
+                    "username": "sandbox",
+                    "password": {"kind": "env", "var": "PROXY_PASSWORD"}
+                }
+            })
+        );
+        assert!(cli.args.controls.apply(Sandbox::restore("ready")).is_ok());
+
+        let defaults = TestCli::try_parse_from(["restore", "ready", "--name", "child"]).unwrap();
+        assert!(defaults.args.controls.outbound_proxy().unwrap().is_none());
+
+        // Authentication without a proxy is a parse error, as for create/run.
+        assert!(
+            TestCli::try_parse_from([
+                "restore",
+                "ready",
+                "--name",
+                "child",
+                "--socks4-user-id",
+                "sandbox",
+            ])
+            .is_err()
+        );
+
+        // Invalid proxies fail before the source is opened.
+        for controls in [
+            RestoreControlArgs {
+                proxy: Some("ftp://127.0.0.1:21".into()),
+                ..Default::default()
+            },
+            RestoreControlArgs {
+                proxy: Some("http://user@127.0.0.1:3128".into()),
+                ..Default::default()
+            },
+            RestoreControlArgs {
+                proxy: Some("socks4://127.0.0.1:1080".into()),
+                socks5_username: Some("sandbox".into()),
+                socks5_password_env: Some("PROXY_PASSWORD".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                controls
+                    .apply(Sandbox::restore("source-not-opened"))
+                    .is_err(),
+                "{:?}",
+                controls.proxy
+            );
+        }
     }
 
     #[cfg(feature = "net")]

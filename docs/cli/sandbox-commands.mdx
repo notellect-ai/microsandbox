@@ -379,6 +379,7 @@ msb snap restore ./saved.msb --name disk-copy --disk-only
 | `--max-tcp-connections` | Concurrent TCP limit; zero explicitly means unlimited |
 | `--max-udp-connections` | Concurrent UDP session limit; zero explicitly means unlimited |
 | `--max-connections` | Deprecated TCP-only alias; cannot be combined with `--max-tcp-connections` |
+| `--proxy` and its authentication flags | Destination outbound proxy, with the same grammar as [create/run](#outbound-proxy); replaces a proxy recorded in the snapshot |
 | `--max-duration` | Destination sandbox lifetime bound, e.g. `10m` |
 | `--idle-timeout` | Destination inactivity bound, e.g. `2m` |
 | `-q`, `--quiet` | Hide progress, but not unavailable-resource warnings |
