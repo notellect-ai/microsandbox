@@ -7,11 +7,11 @@ release tags `vX.Y.Z-notellect.N`. Pushing such a tag builds `msb` (with agentd
 embedded) and `libkrunfw` for macOS, Linux and Windows from this source, as
 upstream's release does, and publishes them with `checksums.sha256`.
 
-For v0.8.1 the current branch is `notellect/windows-lookup-final-path`:
-`notellect/v0.8.1-ci15` plus the Windows one-open lookup commits. The next
-tag, `v0.8.1-notellect.6`, is meant to be cut from it. The earlier branches
-(`notellect/v0.8.1`, `-ci`, `-ci2` to `-ci15`, some `-wip`) are earlier
-pushes of the same work, left as they were.
+For v0.8.1 the current branch is `notellect/v0.8.1-proxy`:
+`notellect/windows-lookup-final-path` (tag `.6`) plus the outbound proxy
+commits. The next tag, `v0.8.1-notellect.7`, is meant to be cut from it. The
+earlier branches (`notellect/v0.8.1`, `-ci`, `-ci2` to `-ci15`, some `-wip`)
+are earlier pushes of the same work, left as they were.
 
 | Tag | Cut from |
 |---|---|
@@ -20,6 +20,8 @@ pushes of the same work, left as they were.
 | `v0.8.1-notellect.3` | `notellect/v0.8.1-ci8` |
 | `v0.8.1-notellect.4` | `notellect/v0.8.1-ci9` (late filesystem read credit) |
 | `v0.8.1-notellect.5` | `notellect/v0.8.1-ci15` (performance work and the root inode guard) |
+| `v0.8.1-notellect.6` | `notellect/windows-lookup-final-path` (Windows one-open lookup) |
+| `v0.8.1-notellect.7` | `notellect/v0.8.1-proxy` (outbound proxy: host names, CONNECT by name, bypass, restore) |
 
 Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
 `snapshot restore` mount flags were dropped because 0.8 boots snapshots with
@@ -93,6 +95,22 @@ Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
   frequency for the bundled kernel, so the guest skips delay-loop
   calibration on every vCPU (under WHP the secondary CPUs' calibration
   failed and fell back to the slow path).
+- The outbound proxy address may be a host name (`http://proxy.corp:8080`),
+  resolved on the Host each time a connection is opened, as company proxy
+  settings (PAC files, `HTTPS_PROXY`) usually give it.
+- When a guest connects to an address its DNS answers named (through the
+  sandbox resolver), the proxy is asked for that name: `CONNECT name:port`
+  for HTTP CONNECT and a domain address for SOCKS5 (SOCKS4 keeps the IP).
+  The TLS SNI picks among several names for one address. Proxies that filter
+  by host name, as most company proxies do, then allow the connection.
+  The proxy resolves the name itself, so it may reach another address of the
+  same name than the one the sandbox policy checked.
+- `--proxy-bypass` (create, run, restore; `SandboxBuilder::proxy_bypass`)
+  lists destinations reached directly instead of through the proxy, in the
+  spirit of `NO_PROXY`: `*`, IP addresses, CIDR ranges and host names with
+  their subdomains (matched against the names the guest resolved).
+- `msb restore` takes `--proxy`, its credential flags and `--proxy-bypass`,
+  replacing the proxy recorded in the snapshot.
 
 Upstream status (open PRs from this fork, 2026-11-24): microsandbox #2128
 (vsock pipe wait), #2131 (late read credit), #2132 (job breakaway), #2133
@@ -101,8 +119,8 @@ lookup), #2136 (Host directory move), #2137 (directory mount coherence),
 #2138 (mount path separators), #2139 (elevated sandbox sharing, default off),
 #2141 (in-process launch checks), #2142 (root inode guard), #2153
 (inaccessible recorded runtime pid); libkrun #191 (reset receive credit).
-Not yet proposed upstream: the lpj preset, the passthroughfs open reductions
-and the one-open lookup.
+Not yet proposed upstream: the lpj preset, the passthroughfs open reductions,
+the one-open lookup and the outbound proxy commits.
 
 Known and left as they are (from a review of the v0.8.1 commits):
 
