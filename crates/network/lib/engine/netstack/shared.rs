@@ -356,6 +356,36 @@ impl SharedState {
             .member_matches(&addr, Instant::now(), |key| predicate(&key.hostname))
     }
 
+    /// The host name to ask an outbound proxy for when the guest dials `addr`:
+    /// one of the names whose live DNS answers (through this sandbox's
+    /// resolver) returned `addr`. `preferred` (the TLS SNI) wins when it is
+    /// one of them; otherwise the smallest name is taken so the choice is
+    /// stable. A name the guest never resolved to `addr` is never returned,
+    /// so the proxy is not sent somewhere the egress policy did not check.
+    pub(crate) fn proxy_destination_name(
+        &self,
+        addr: IpAddr,
+        preferred: Option<&str>,
+    ) -> Option<String> {
+        let preferred = preferred.map(normalize_hostname);
+        let mut chosen: Option<String> = None;
+        let mut preferred_found = false;
+        self.any_resolved_hostname(addr, |name| {
+            if !crate::proxy::is_destination_host_name(name) {
+                return false;
+            }
+            if preferred.as_deref() == Some(name) {
+                preferred_found = true;
+                return true;
+            }
+            if chosen.as_deref().is_none_or(|current| name < current) {
+                chosen = Some(name.to_string());
+            }
+            false
+        });
+        if preferred_found { preferred } else { chosen }
+    }
+
     /// Snapshot live hostname bindings for a DNS range authorization decision.
     /// Holding one read lock prevents a concurrent DNS answer from introducing
     /// an unsampled hostname-policy exception halfway through that decision.
@@ -557,6 +587,83 @@ mod tests {
 
         assert!(!state.push_rx_frame(vec![4, 5]));
         assert_eq!(state.rx_bytes(), 3);
+    }
+
+    #[test]
+    fn proxy_destination_name_comes_from_dns_answers_for_the_address() {
+        let state = SharedState::new(4);
+        let shared_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let other_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        assert_eq!(state.proxy_destination_name(shared_ip, None), None);
+        for name in ["www.example.com", "cdn.example.net", "Api.Example.org."] {
+            state.cache_resolved_hostname(
+                name,
+                ResolvedHostnameFamily::Ipv4,
+                [shared_ip],
+                Duration::from_secs(60),
+            );
+        }
+        state.cache_resolved_hostname(
+            "elsewhere.example",
+            ResolvedHostnameFamily::Ipv4,
+            [other_ip],
+            Duration::from_secs(60),
+        );
+        // Stable choice without a hint; the SNI wins when it was resolved to the address.
+        assert_eq!(
+            state.proxy_destination_name(shared_ip, None).as_deref(),
+            Some("api.example.org")
+        );
+        assert_eq!(
+            state
+                .proxy_destination_name(shared_ip, Some("WWW.example.com."))
+                .as_deref(),
+            Some("www.example.com")
+        );
+        // An SNI that never resolved to this address is not sent to the proxy.
+        assert_eq!(
+            state
+                .proxy_destination_name(shared_ip, Some("elsewhere.example"))
+                .as_deref(),
+            Some("api.example.org")
+        );
+        assert_eq!(
+            state
+                .proxy_destination_name(other_ip, Some("www.example.com"))
+                .as_deref(),
+            Some("elsewhere.example")
+        );
+        // An IPv4-mapped IPv6 destination finds the IPv4 answers.
+        let mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 8).to_ipv6_mapped());
+        assert_eq!(
+            state.proxy_destination_name(mapped, None).as_deref(),
+            Some("elsewhere.example")
+        );
+    }
+
+    #[test]
+    fn proxy_destination_name_skips_names_a_proxy_cannot_take() {
+        let state = SharedState::new(4);
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        state.cache_resolved_hostname(
+            "a b.example",
+            ResolvedHostnameFamily::Ipv4,
+            [ip],
+            Duration::from_secs(60),
+        );
+        assert_eq!(state.proxy_destination_name(ip, Some("a b.example")), None);
+        state.cache_resolved_hostname(
+            "z.example",
+            ResolvedHostnameFamily::Ipv4,
+            [ip],
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            state
+                .proxy_destination_name(ip, Some("a b.example"))
+                .as_deref(),
+            Some("z.example")
+        );
     }
 
     #[test]

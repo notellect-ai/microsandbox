@@ -12,6 +12,8 @@ mod types;
 #[cfg(feature = "engine")]
 pub use crate::tcp::proxy::*;
 
+#[cfg(feature = "engine")]
+pub(crate) use address::is_destination_host_name;
 pub use address::{ProxyAddress, ProxyAddressParseError};
 #[doc(hidden)]
 pub use http_connect::ResolvedHttpConnectCredentials;

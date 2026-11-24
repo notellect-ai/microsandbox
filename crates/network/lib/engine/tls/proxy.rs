@@ -250,6 +250,7 @@ impl TlsProxy {
             tracing::debug!(sni = %sni_name, dst = %connect_dst, guest_dst = %guest_dst, "TLS bypass");
             bypass_relay(
                 connect_target,
+                &sni_name,
                 initial_buf,
                 from_smoltcp,
                 to_smoltcp,
@@ -416,6 +417,7 @@ async fn complete_guest_handshake(
 #[allow(clippy::too_many_arguments)]
 async fn bypass_relay(
     connect_target: UpstreamTcpTarget,
+    sni_name: &str,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
@@ -428,7 +430,12 @@ async fn bypass_relay(
         Some(s) => s,
         None => {
             connect_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                .connect(
+                    &proxy_connect,
+                    &shared,
+                    outbound_proxy.as_deref(),
+                    Some(sni_name),
+                )
                 .await?
         }
     };
@@ -525,7 +532,12 @@ pub(crate) async fn intercept_relay(
         Some(s) => s,
         None => {
             connect_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                .connect(
+                    &proxy_connect,
+                    &shared,
+                    outbound_proxy.as_deref(),
+                    Some(sni_name),
+                )
                 .await?
         }
     };

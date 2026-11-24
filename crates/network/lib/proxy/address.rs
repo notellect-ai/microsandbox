@@ -185,6 +185,23 @@ fn validate_host_name(name: &str) -> Result<(), ProxyAddressParseError> {
     Ok(())
 }
 
+/// Whether `name` can be sent to an outbound proxy as a destination host
+/// (HTTP CONNECT authority, SOCKS5 domain): lowercase-insensitive DNS labels
+/// of letters, digits, hyphens and underscores, no trailing dot.
+#[cfg(feature = "engine")]
+pub(crate) fn is_destination_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HOST_NAME_LEN
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= MAX_LABEL_LEN
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+        && name.parse::<std::net::IpAddr>().is_err()
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -292,6 +309,37 @@ mod tests {
         assert_eq!(value, serde_json::json!("proxy.corp.example:8080"));
         assert_eq!(serde_json::from_value::<ProxyAddress>(value).unwrap(), host);
         assert!(serde_json::from_value::<ProxyAddress>(serde_json::json!("bad name:1")).is_err());
+    }
+
+    #[cfg(feature = "engine")]
+    #[test]
+    fn destination_host_names_are_dns_names_only() {
+        for name in [
+            "example.com",
+            "a",
+            "_dmarc.example.com",
+            "x-1.example",
+            "1.example",
+        ] {
+            assert!(is_destination_host_name(name), "{name:?} refused");
+        }
+        let long = format!("{}com", "abcdefghi.".repeat(26));
+        for name in [
+            "",
+            "example.com.",
+            ".example.com",
+            "a..b",
+            "exa mple.com",
+            "example.com\r\nX-Injected: 1",
+            "example.com:443",
+            "user@example.com",
+            "ex\u{e4}mple.com",
+            "192.0.2.1",
+            "::1",
+            &long,
+        ] {
+            assert!(!is_destination_host_name(name), "{name:?} accepted");
+        }
     }
 
     #[cfg(feature = "engine")]

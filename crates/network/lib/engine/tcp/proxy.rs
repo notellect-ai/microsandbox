@@ -359,7 +359,12 @@ impl TcpProxy {
             Some(stream) => stream,
             None => {
                 connect_target
-                    .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                    .connect(
+                        &proxy_connect,
+                        &shared,
+                        outbound_proxy.as_deref(),
+                        sni.as_deref(),
+                    )
                     .await?
             }
         };
@@ -715,7 +720,7 @@ async fn handle_connect_tunnel(
         Some(stream) => stream,
         None => {
             proxy_target
-                .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
+                .connect(&proxy_connect, &shared, outbound_proxy.as_deref(), None)
                 .await?
         }
     };
@@ -1435,7 +1440,7 @@ mod tests {
         let shared = SharedState::new(4);
         let proxy_connect = ProxyConnectState::new();
         let mut stream = UpstreamTcpTarget::direct(addr)
-            .connect(&proxy_connect, &shared, None)
+            .connect(&proxy_connect, &shared, None, None)
             .await
             .unwrap();
         stream.write_all(b"hello").await.unwrap();

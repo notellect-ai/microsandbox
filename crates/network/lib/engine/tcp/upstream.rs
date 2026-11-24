@@ -50,14 +50,16 @@ impl UpstreamTcpTarget {
     ///
     /// When `outbound_proxy` is set, it dials `primary` through that proxy
     /// instead of connecting directly; the address-family fallback only
-    /// applies to direct dials.
+    /// applies to direct dials. `sni` is the TLS server name when known; see
+    /// [`Self::open`].
     pub(crate) async fn connect(
         self,
         proxy_connect: &ProxyConnectState,
         shared: &SharedState,
         outbound_proxy: Option<&ResolvedOutboundProxy>,
+        sni: Option<&str>,
     ) -> io::Result<TcpStream> {
-        let result = self.open(outbound_proxy).await;
+        let result = self.open(outbound_proxy, shared, sni).await;
         let stream = match result {
             Ok(stream) => stream,
             Err(error) => {
@@ -74,12 +76,23 @@ impl UpstreamTcpTarget {
     }
 
     /// Dial directly or through `outbound_proxy`, leaving status updates to the caller.
+    ///
+    /// Through a proxy, the destination is named by a host name the guest
+    /// resolved to `primary` through the sandbox resolver, preferring `sni`
+    /// when it is one of them, so a proxy that resolves names itself (and may
+    /// get other addresses than the host's resolver) reaches the right
+    /// server. Without such a name the proxy is asked for the IP.
     pub(crate) async fn open(
         self,
         outbound_proxy: Option<&ResolvedOutboundProxy>,
+        shared: &SharedState,
+        sni: Option<&str>,
     ) -> io::Result<TcpStream> {
         match outbound_proxy {
-            Some(proxy) => proxy.connect(self.primary).await,
+            Some(proxy) => {
+                let name = shared.proxy_destination_name(self.primary.ip(), sni);
+                proxy.connect(self.primary, name.as_deref()).await
+            }
             None => self.dial().await,
         }
     }
@@ -150,7 +163,7 @@ mod tests {
         let shared = SharedState::new(4);
 
         let stream = target
-            .connect(&proxy_connect, &shared, None)
+            .connect(&proxy_connect, &shared, None, None)
             .await
             .expect("IPv4 loopback fallback should connect");
 

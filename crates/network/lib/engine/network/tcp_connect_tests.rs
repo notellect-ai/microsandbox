@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use super::test_support::{GuestDevice, ipv6_loopback_unavailable};
 use super::{HostRoutes, SmoltcpNetwork};
 use crate::config::{EnvNetworkSecretResolver, MultiTenantConfig, NetworkConfig};
+use crate::netstack::shared::ResolvedHostnameFamily;
 use crate::policy::NetworkPolicy;
 use crate::proxy::OutboundProxy;
 
@@ -52,6 +53,9 @@ fn guest_tcp_connect_reflects_upstream_outcome() {
         tokio::time::timeout(Duration::from_secs(5), check_stalled_ipv6_fallback())
             .await
             .expect("stalled IPv6 fallback or cancellation timed out");
+        tokio::time::timeout(Duration::from_secs(5), check_proxy_connect_names())
+            .await
+            .expect("CONNECT by host name timed out");
         for ipv6 in [false, true] {
             for listening in [false, true] {
                 tokio::time::timeout(Duration::from_secs(5), check_connect(ipv6, listening))
@@ -357,6 +361,97 @@ async fn check_stalled_ipv6_fallback() {
     }
     server.await.unwrap();
     assert!(fallback_started && replied && cancelled);
+}
+
+/// A guest connection to an address its DNS answers named reaches the proxy as
+/// `CONNECT name:port`; an address no answer named stays `CONNECT ip:port`.
+async fn check_proxy_connect_names() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let config = NetworkConfig {
+        policy: NetworkPolicy::allow_all(),
+        outbound_proxy: Some(OutboundProxy::HttpConnect {
+            address: listener.local_addr().unwrap().into(),
+            credentials: None,
+        }),
+        ..Default::default()
+    };
+    let named = Ipv4Addr::new(192, 0, 2, 123);
+    let unnamed = Ipv4Addr::new(192, 0, 2, 124);
+    let server = tokio::spawn(async move {
+        let mut authorities = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            authorities.push(read_connect_request(&mut stream).await);
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        }
+        authorities.sort();
+        authorities
+    });
+
+    let mut network = SmoltcpNetwork::build(
+        config.resolve(&EnvNetworkSecretResolver).unwrap(),
+        2,
+        Default::default(),
+        &MultiTenantConfig::default(),
+        HostRoutes {
+            ipv4: true,
+            ..HostRoutes::default()
+        },
+    )
+    .unwrap();
+    // As the sandbox resolver records a guest's A answer.
+    network.shared.cache_resolved_hostname(
+        "API.example.test.",
+        ResolvedHostnameFamily::Ipv4,
+        [named.into()],
+        Duration::from_secs(60),
+    );
+    let v4 = network.guest_bootstrap_network().ipv4.unwrap();
+    let mut device = GuestDevice(network.take_backend());
+    let mut iface = Interface::new(
+        Config::new(HardwareAddress::Ethernet(EthernetAddress(
+            network.guest_mac(),
+        ))),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    iface.update_ip_addrs(|ips| {
+        ips.push(IpCidr::new(v4.address.into(), 30)).unwrap();
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(v4.gateway)
+        .unwrap();
+    let mut sockets = SocketSet::new(vec![]);
+    for (destination, local_port) in [(named, 49160), (unnamed, 49161)] {
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 1024]),
+            tcp::SocketBuffer::new(vec![0; 1024]),
+        );
+        socket
+            .connect(
+                iface.context(),
+                (destination, 8443),
+                (v4.address, local_port),
+            )
+            .unwrap();
+        sockets.add(socket);
+    }
+    network.start(tokio::runtime::Handle::current()).unwrap();
+    let started = std::time::Instant::now();
+    while !server.is_finished() {
+        let now = Instant::from_millis(started.elapsed().as_millis() as i64);
+        iface.poll_ingress_single(now, &mut device, &mut sockets);
+        iface.poll_egress(now, &mut device, &mut sockets);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        server.await.unwrap(),
+        ["192.0.2.124:8443", "api.example.test:8443"]
+    );
 }
 
 async fn read_connect_request(stream: &mut TcpStream) -> String {

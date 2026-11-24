@@ -81,7 +81,7 @@ SDK addresses use `IP:port`, `[IPv6]:port`, or `host:port`. The `msb run` and `m
 
 ## HTTP CONNECT
 
-HTTP CONNECT opens a TCP tunnel through an HTTP proxy. It supports optional HTTP Basic authentication and TCP only; UDP is unsupported. microsandbox resolves and checks the destination using its normal DNS and egress policy before sending the destination IP and port in the CONNECT request.
+HTTP CONNECT opens a TCP tunnel through an HTTP proxy. It supports optional HTTP Basic authentication and TCP only; UDP is unsupported. microsandbox resolves and checks the destination using its normal DNS and egress policy before sending the CONNECT request, which names the destination as described in [Destination names](#destination-names).
 
 The selected `msb` runtime must support HTTP CONNECT. When using an older runtime, the SDK requests an upgrade before creating or replacing a sandbox.
 
@@ -273,6 +273,15 @@ msb run alpine \
 <Warning>
   HTTP Basic authentication does not encrypt credentials in transit. Use a trusted local or private proxy, or encrypt the connection separately.
 </Warning>
+
+## Destination names
+
+When the guest looked up the destination through microsandbox's DNS forwarder, HTTP CONNECT and SOCKS5 ask the proxy for that host name and the destination port (`CONNECT api.example.com:443`, or the SOCKS5 domain address type) instead of the IP address. The proxy then resolves the name itself, which matters when it sees different DNS than the host, and proxies that filter by host name see the name. The rules are:
+
+- The name must be one whose live DNS answer returned the address the guest dialed. When several names share the address, the TLS server name (SNI) is used if microsandbox has already read it and it is one of those names; otherwise the alphabetically first name is used.
+- A connection to an address no answer named (the guest dialed an IP, or used its own resolver) sends the IP address, as before.
+- SOCKS4 always sends the IP address.
+- Network policy is still evaluated against the address the guest dialed. If the proxy resolves the name to a different address, the connection reaches that address.
 
 ## Behavior and limits
 

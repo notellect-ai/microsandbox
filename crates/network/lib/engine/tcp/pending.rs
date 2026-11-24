@@ -37,7 +37,7 @@ impl PendingConnect {
     ) -> Self {
         let (sender, result) = oneshot::channel();
         let task = runtime.spawn(async move {
-            let result = target.open(proxy.as_deref()).await;
+            let result = target.open(proxy.as_deref(), &shared, None).await;
             let _ = sender.send(result);
             shared.proxy_wake.wake();
         });

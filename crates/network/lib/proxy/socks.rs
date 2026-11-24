@@ -71,6 +71,18 @@ pub(crate) struct Socks5UdpAssociation {
 #[cfg(feature = "engine")]
 struct Socks5Protocol;
 
+/// Destination sent in a SOCKS5 command request.
+#[cfg(feature = "engine")]
+#[derive(Clone, Copy)]
+enum Socks5Target<'a> {
+    Socket(SocketAddr),
+    /// A host name of at most 255 bytes, resolved by the proxy.
+    Domain {
+        name: &'a str,
+        port: u16,
+    },
+}
+
 /// Address returned by a SOCKS5 command reply.
 #[cfg(feature = "engine")]
 enum Socks5ReplyAddress {
@@ -187,15 +199,28 @@ impl ResolvedOutboundProxy {
     }
 
     /// Connects to `destination` through this outbound proxy.
+    ///
+    /// When `name` is set (a host name the guest resolved to `destination`),
+    /// HTTP CONNECT and SOCKS5 ask the proxy for `name` and the destination
+    /// port, so the proxy resolves the name itself; SOCKS4 always sends the IP.
     #[cfg(feature = "engine")]
-    pub(crate) async fn connect(&self, destination: SocketAddr) -> io::Result<TcpStream> {
+    pub(crate) async fn connect(
+        &self,
+        destination: SocketAddr,
+        name: Option<&str>,
+    ) -> io::Result<TcpStream> {
         match self {
             Self::HttpConnect {
                 address,
                 credentials,
             } => {
-                HttpConnectProtocol::connect(address.clone(), destination, credentials.as_ref())
-                    .await
+                HttpConnectProtocol::connect(
+                    address.clone(),
+                    destination,
+                    name,
+                    credentials.as_ref(),
+                )
+                .await
             }
             Self::Socks4 { address, user_id } => {
                 let socket = address.connect().await?;
@@ -217,7 +242,14 @@ impl ResolvedOutboundProxy {
                 Socks5Protocol::negotiate(&mut stream, credentials.as_ref()).await?;
                 // The bound address is informational for CONNECT. Parse it to
                 // validate the reply, but do not resolve proxy-supplied domains.
-                let _ = Socks5Protocol::command(&mut stream, 0x01, destination).await?;
+                let target = match name {
+                    Some(name) => Socks5Target::Domain {
+                        name,
+                        port: destination.port(),
+                    },
+                    None => Socks5Target::Socket(destination),
+                };
+                let _ = Socks5Protocol::command(&mut stream, 0x01, target).await?;
                 Ok(stream)
             }
         }
@@ -250,7 +282,13 @@ impl ResolvedOutboundProxy {
             IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
         };
-        let relays = match Socks5Protocol::command(&mut control, 0x03, request_address).await? {
+        let relays = match Socks5Protocol::command(
+            &mut control,
+            0x03,
+            Socks5Target::Socket(request_address),
+        )
+        .await?
+        {
             Socks5ReplyAddress::Socket(relay) => vec![relay],
             Socks5ReplyAddress::Domain { name, port } => {
                 Socks5Protocol::resolve_domain(dns_forwarder.as_ref(), &name, port).await?
@@ -633,11 +671,24 @@ impl Socks5Protocol {
     async fn command(
         stream: &mut TcpStream,
         command: u8,
-        destination: SocketAddr,
+        destination: Socks5Target<'_>,
     ) -> io::Result<Socks5ReplyAddress> {
-        let mut request = Vec::with_capacity(3 + Self::address_len(destination));
+        let mut request = Vec::with_capacity(3 + Self::target_len(destination));
         request.extend_from_slice(&[0x05, command, 0x00]);
-        Self::encode_address(&mut request, destination);
+        match destination {
+            Socks5Target::Socket(address) => Self::encode_address(&mut request, address),
+            Socks5Target::Domain { name, port } => {
+                let length = u8::try_from(name.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "SOCKS5 destination name is longer than 255 bytes",
+                    )
+                })?;
+                request.extend_from_slice(&[0x03, length]);
+                request.extend_from_slice(name.as_bytes());
+                request.extend_from_slice(&port.to_be_bytes());
+            }
+        }
         stream.write_all(&request).await?;
 
         let mut header = [0u8; 4];
@@ -709,6 +760,14 @@ impl Socks5Protocol {
                 output.extend_from_slice(&address.ip().octets());
                 output.extend_from_slice(&address.port().to_be_bytes());
             }
+        }
+    }
+
+    /// Returns the encoded length of a SOCKS5 request destination.
+    fn target_len(target: Socks5Target<'_>) -> usize {
+        match target {
+            Socks5Target::Socket(address) => Self::address_len(address),
+            Socks5Target::Domain { name, .. } => 4 + name.len(),
         }
     }
 
@@ -1154,11 +1213,12 @@ mod tests {
             client.write_all(&buf).await.unwrap();
         });
 
+        // SOCKS4 has no host-name form; a known name still sends the IP.
         let mut stream = ResolvedOutboundProxy::Socks4 {
             address: proxy_addr.into(),
             user_id: Some("sandbox".to_string()),
         }
-        .connect(target)
+        .connect(target, Some("example.com"))
         .await
         .unwrap();
         stream.write_all(b"hello").await.unwrap();
@@ -1204,7 +1264,7 @@ mod tests {
             address: proxy_addr.into(),
             credentials: None,
         }
-        .connect(target)
+        .connect(target, None)
         .await
         .unwrap();
         stream.write_all(b"hello").await.unwrap();
@@ -1213,6 +1273,54 @@ mod tests {
         assert_eq!(&echoed, b"hello");
 
         proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_asks_the_proxy_for_a_known_host_name() {
+        let target: SocketAddr = "93.184.216.34:8443".parse().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut client, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            client.read_exact(&mut greeting).await.unwrap();
+            client.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut header = [0u8; 5];
+            client.read_exact(&mut header).await.unwrap();
+            assert_eq!(
+                &header[..4],
+                &[0x05, 0x01, 0x00, 0x03],
+                "domain address type"
+            );
+            let mut name = vec![0u8; header[4] as usize];
+            client.read_exact(&mut name).await.unwrap();
+            let mut port = [0u8; 2];
+            client.read_exact(&mut port).await.unwrap();
+            client
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            (String::from_utf8(name).unwrap(), u16::from_be_bytes(port))
+        });
+
+        let deadline = std::time::Duration::from_secs(5);
+        tokio::time::timeout(
+            deadline,
+            ResolvedOutboundProxy::Socks5 {
+                address: proxy_addr.into(),
+                credentials: None,
+            }
+            .connect(target, Some("api.example.com")),
+        )
+        .await
+        .expect("SOCKS5 connect stalled")
+        .unwrap();
+        let (name, port) = tokio::time::timeout(deadline, proxy_task)
+            .await
+            .expect("proxy stalled")
+            .unwrap();
+        assert_eq!((name.as_str(), port), ("api.example.com", 8443));
     }
 
     #[tokio::test]
@@ -1244,7 +1352,7 @@ mod tests {
             address: proxy_addr.into(),
             credentials: None,
         }
-        .connect(target)
+        .connect(target, None)
         .await
         .unwrap();
         stream.write_all(b"hello").await.unwrap();
@@ -1300,7 +1408,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        proxy.connect(target).await.unwrap();
+        proxy.connect(target, None).await.unwrap();
 
         proxy_task.await.unwrap();
     }

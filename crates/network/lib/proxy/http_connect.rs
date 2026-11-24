@@ -151,10 +151,14 @@ impl HttpConnectProtocol {
     pub(super) async fn connect(
         address: ProxyAddress,
         destination: SocketAddr,
+        name: Option<&str>,
         credentials: Option<&ResolvedHttpConnectCredentials>,
     ) -> io::Result<TcpStream> {
         let mut stream = address.connect().await?;
-        let authority = destination.to_string();
+        let authority = match name {
+            Some(name) => format!("{name}:{}", destination.port()),
+            None => destination.to_string(),
+        };
         let request = Self::build_connect_request(&authority, credentials);
 
         stream.write_all(request.as_bytes()).await?;
@@ -869,14 +873,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_asks_for_a_known_host_name_with_the_destination_port() {
+        let (address, request_rx, task) =
+            spawn_mock_proxy(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
+        let destination: SocketAddr = "[2001:db8::9]:8443".parse().unwrap();
+        bounded(HttpConnectProtocol::connect(
+            address.into(),
+            destination,
+            Some("api.example.com"),
+            None,
+        ))
+        .await
+        .unwrap();
+        let request = bounded(request_rx).await.expect("request capture stalled");
+        join_proxy(task).await;
+        assert_eq!(
+            request,
+            b"CONNECT api.example.com:8443 HTTP/1.1\r\nHost: api.example.com:8443\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
     async fn connect_reaches_a_proxy_named_by_host() {
         let (address, request_rx, task) =
             spawn_mock_proxy(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()).await;
         let named: ProxyAddress = format!("localhost:{}", address.port()).parse().unwrap();
         assert!(matches!(named, ProxyAddress::Host { .. }));
-        let stream = bounded(HttpConnectProtocol::connect(named, destination(), None))
-            .await
-            .unwrap();
+        let stream = bounded(HttpConnectProtocol::connect(
+            named,
+            destination(),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), address);
         let request = bounded(request_rx).await.expect("request capture stalled");
         join_proxy(task).await;
@@ -972,6 +1002,7 @@ mod tests {
             address.into(),
             destination(),
             None,
+            None,
         ))
         .await;
 
@@ -1005,6 +1036,7 @@ mod tests {
         let mut stream = bounded(HttpConnectProtocol::connect(
             address.into(),
             destination(),
+            None,
             None,
         ))
         .await
@@ -1072,6 +1104,7 @@ mod tests {
                 address.into(),
                 destination(),
                 None,
+                None,
             ));
 
             let request = tokio::select! {
@@ -1116,6 +1149,7 @@ mod tests {
                 address.into(),
                 destination(),
                 None,
+                None,
             ));
 
             let request = tokio::select! {
@@ -1155,6 +1189,7 @@ mod tests {
         let handshake = tokio::spawn(HttpConnectProtocol::connect(
             address.into(),
             destination(),
+            None,
             None,
         ));
 
@@ -1432,6 +1467,7 @@ mod tests {
             address.into(),
             destination,
             None,
+            None,
         ))
         .await;
 
@@ -1452,6 +1488,7 @@ mod tests {
         let result = bounded(HttpConnectProtocol::connect(
             address.into(),
             destination,
+            None,
             Some(credentials),
         ))
         .await;
