@@ -132,5 +132,11 @@ jobs:
         shell: bash
         run: cargo test --locked -p microsandbox --lib -- dir_mount_arg file_mount_export_name
 
-      - name: Test CLI (volume paths with commas)
-        run: cargo test --locked -p microsandbox-cli --lib -- commands::common
+      - name: Test CLI (volume paths with commas, proxy flags)
+        run: cargo test --locked -p microsandbox-cli --lib -- commands::common commands::restore
+
+      - name: Test network (outbound proxy host names, CONNECT names, bypass)
+        shell: bash
+        run: |
+          cargo test --locked -p microsandbox-network --lib -- \
+            proxy:: tcp_connect_tests proxy_destination_name outbound_proxy
