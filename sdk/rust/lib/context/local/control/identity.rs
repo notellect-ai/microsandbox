@@ -159,7 +159,7 @@ impl ProcessIdentity {
         #[cfg(target_os = "macos")]
         let born = self.start.0 as i64 * 1_000_000 + self.start.1 as i64;
         #[cfg(windows)]
-        let born = crate::runtime::reap::filetime_ticks_to_unix_micros(self.start.0 as u64);
+        let born = crate::runtime::reap::filetime_ticks_to_unix_micros(self.start.0);
         #[cfg(target_os = "linux")]
         let born = {
             let mut uptime = libc::timespec {
