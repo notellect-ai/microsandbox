@@ -1749,7 +1749,9 @@ mod tests {
             .unwrap()
             .unwrap()
             .status;
-        assert_eq!(status, SandboxStatus::Stopped);
+        // The runtime died without recording its exit: reconciled as crashed, and
+        // removable.
+        assert_eq!(status, SandboxStatus::Crashed);
     }
 
     /// `run.started_at` is the identity of a run without sdk-process.json; the
