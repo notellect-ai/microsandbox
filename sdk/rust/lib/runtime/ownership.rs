@@ -1,4 +1,8 @@
 //! Exact Windows process ownership for runtimes predating the lifecycle lock.
+//!
+//! The SDK records the runtime it started (PID and creation time) in `sdk-process.json`.
+//! That record is the only evidence that may end a process: Windows reuses PIDs, so a PID
+//! alone can name any process. See [`run_runtime`].
 
 use std::io::{self, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -14,7 +18,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    WaitForSingleObject,
+    PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 use crate::{MicrosandboxError, MicrosandboxResult};
@@ -68,6 +72,22 @@ impl RecordedOwner {
     }
 }
 
+/// What a run's evidence proves about its runtime process. Only [`Self::Owned`], the process
+/// the SDK recorded, matched by its exact creation time, may ever be ended.
+pub(crate) enum RunRuntime {
+    /// No process can still be the run's runtime: it has no PID, its PID is free or names an
+    /// exited process, the recorded runtime exited, or the PID's holder was created after the
+    /// run began (a recycled PID).
+    Gone,
+    /// The runtime the SDK recorded, still running.
+    Owned(RuntimeProcess),
+    /// A live process holds the PID and nothing proves whose it is: no matching record (the
+    /// SDK stopped between starting the runtime and recording it) or a recorded runtime this
+    /// account may not open. It may be the runtime, so it is not gone, and it may be any other
+    /// process, so it is never ended.
+    Unknown(String),
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -98,18 +118,55 @@ impl RuntimeProcess {
         }
         // SAFETY: OpenProcess returned a new owned handle.
         let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut creation: FILETIME = unsafe { std::mem::zeroed() };
-        let mut exit = creation;
-        let mut kernel = creation;
-        let mut user = creation;
-        if unsafe { GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
         Ok(Some(Self {
             pid,
-            birth: (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+            birth: creation_time(&handle)?,
             handle,
         }))
+    }
+
+    /// Ends this runtime. The handle `self` holds keeps Windows from giving the PID to another
+    /// process, and the terminating handle's creation time is checked against the recorded one
+    /// as well, so nothing but this process can be ended. Termination is asynchronous: wait
+    /// with [`Self::exited_within`].
+    pub(crate) fn terminate(&self) -> io::Result<()> {
+        // SAFETY: a new handle with terminate rights, owned below.
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                self.pid as u32,
+            )
+        };
+        if raw.is_null() {
+            let error = io::Error::last_os_error();
+            return if self.alive()? { Err(error) } else { Ok(()) };
+        }
+        // SAFETY: OpenProcess returned a new owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        if creation_time(&handle)? != self.birth {
+            return Err(io::Error::other(
+                "runtime process identity changed before termination",
+            ));
+        }
+        if unsafe { TerminateProcess(raw, 1) } == 0 {
+            // A process already exiting refuses termination.
+            let error = io::Error::last_os_error();
+            return if self.alive()? { Err(error) } else { Ok(()) };
+        }
+        Ok(())
+    }
+
+    /// Whether the process has exited by the end of `timeout`.
+    pub(crate) async fn exited_within(&self, timeout: Duration) -> io::Result<bool> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.alive()? {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(true)
     }
 
     pub(crate) fn alive(&self) -> io::Result<bool> {
@@ -210,7 +267,10 @@ pub(crate) fn recorded_owner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(record_error(&path, None, error).into()),
     };
-    let record: Record = serde_json::from_slice(&bytes)?;
+    // A partial or unreadable record proves nothing about any process: no matching record.
+    let Ok(record) = serde_json::from_slice::<Record>(&bytes) else {
+        return Ok(None);
+    };
     // An old file must never bind an unrelated run, including after removal/recreation.
     if record.sandbox_id != run.sandbox_id || record.run_id != run.id || Some(record.pid) != run.pid
     {
@@ -223,6 +283,89 @@ pub(crate) fn recorded_owner(
     )
     .map_err(|error| record_error(&path, Some(record.pid), error))?;
     Ok(Some(owner))
+}
+
+/// What the evidence proves about `run`'s runtime process; see [`RunRuntime`]. `directory` is
+/// the sandbox's runtime directory, where the SDK keeps its record.
+pub(crate) fn run_runtime(directory: &Path, run: &run::Model) -> MicrosandboxResult<RunRuntime> {
+    let Some(pid) = run.pid.filter(|pid| *pid > 0) else {
+        return Ok(RunRuntime::Gone);
+    };
+    match recorded_owner(directory, run)? {
+        Some(owner) => Ok(recorded_runtime(owner, pid)?),
+        None => unrecorded_runtime(RuntimeProcess::capture(pid), run, pid).map_err(|error| {
+            record_error(&directory.join("sdk-process.json"), Some(pid), error).into()
+        }),
+    }
+}
+
+/// The runtime a matching record names: ended only through its verified process.
+fn recorded_runtime(owner: RecordedOwner, pid: i32) -> io::Result<RunRuntime> {
+    if owner.inaccessible {
+        return Ok(RunRuntime::Unknown(format!(
+            "runtime pid {pid} is not accessible to this user; stop it from the account that \
+             started it"
+        )));
+    }
+    Ok(match owner.process {
+        Some(process) if process.alive()? => RunRuntime::Owned(process),
+        _ => RunRuntime::Gone,
+    })
+}
+
+/// A run with no matching record: its PID's holder is gone, proven not the runtime by its
+/// creation time, or unknown. Never owned.
+fn unrecorded_runtime(
+    captured: io::Result<Option<RuntimeProcess>>,
+    run: &run::Model,
+    pid: i32,
+) -> io::Result<RunRuntime> {
+    let unknown = || {
+        RunRuntime::Unknown(format!(
+            "runtime pid {pid} has no matching SDK process record, so the process holding it \
+             may be another program; it was left running"
+        ))
+    };
+    match captured {
+        Ok(None) => Ok(RunRuntime::Gone),
+        Ok(Some(process)) if !process.alive()? => Ok(RunRuntime::Gone),
+        Ok(Some(process)) if created_after_run(process.birth, run) => Ok(RunRuntime::Gone),
+        Ok(Some(_)) => Ok(unknown()),
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => Ok(unknown()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a process created at `birth` came too late to be `run`'s runtime, which starts
+/// before it writes the run row.
+fn created_after_run(birth: u64, run: &run::Model) -> bool {
+    run.started_at.is_some_and(|started| {
+        !super::reap::creation_may_belong_to_run(
+            super::reap::filetime_ticks_to_unix_micros(birth),
+            started.and_utc().timestamp_micros(),
+        )
+    })
+}
+
+/// The creation time of the process `handle` refers to, as FILETIME ticks.
+fn creation_time(handle: &OwnedHandle) -> io::Result<u64> {
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    if unsafe {
+        GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
 }
 
 /// Turns the capture of a recorded PID into its owner. ERROR_ACCESS_DENIED means the
@@ -475,6 +618,169 @@ mod tests {
             error.to_string().contains(&path.display().to_string()),
             "{error}"
         );
+    }
+
+    fn started(pid: i32, started_at: Option<chrono::NaiveDateTime>) -> run::Model {
+        run::Model {
+            started_at,
+            ..run(pid)
+        }
+    }
+
+    fn an_hour(sign: i64) -> Option<chrono::NaiveDateTime> {
+        Some(chrono::Utc::now().naive_utc() + chrono::Duration::hours(sign))
+    }
+
+    fn owned(runtime: &RunRuntime) -> bool {
+        matches!(runtime, RunRuntime::Owned(_))
+    }
+
+    fn unknown(runtime: &RunRuntime) -> bool {
+        matches!(runtime, RunRuntime::Unknown(_))
+    }
+
+    fn gone(runtime: &RunRuntime) -> bool {
+        matches!(runtime, RunRuntime::Gone)
+    }
+
+    fn running(child: &mut ChildFixture) -> bool {
+        child.0.try_wait().unwrap().is_none()
+    }
+
+    /// W-31m: a crash between starting the runtime and recording it leaves no record. The PID
+    /// may since name any process (11-24: a `ping` started after the run). Nothing without a
+    /// matching record is ever owned, so nothing ends it.
+    #[test]
+    fn an_unrecorded_pid_is_never_owned() {
+        let mut bystander = ChildFixture::start();
+        let pid = bystander.0.id() as i32;
+        let directory = tempfile::tempdir().unwrap();
+        // Created after the run began: a recycled PID, so the runtime is gone.
+        let recycled = run_runtime(directory.path(), &started(pid, an_hour(-1))).unwrap();
+        assert!(gone(&recycled));
+        // Not provably later than the run (or the run has no start time): unknown.
+        let unproven = run_runtime(directory.path(), &started(pid, an_hour(1))).unwrap();
+        assert!(unknown(&unproven));
+        let undated = run_runtime(directory.path(), &started(pid, None)).unwrap();
+        assert!(unknown(&undated));
+        assert!(running(&mut bystander));
+    }
+
+    /// A record cut short (or otherwise unreadable as a record) proves nothing.
+    #[test]
+    fn a_partial_record_is_no_record() {
+        let mut bystander = ChildFixture::start();
+        let pid = bystander.0.id() as i32;
+        let directory = tempfile::tempdir().unwrap();
+        let run = started(pid, None);
+        let process = RuntimeProcess::capture(pid).unwrap().unwrap();
+        process.publish(directory.path(), &run, false).unwrap();
+        let path = directory.path().join("sdk-process.json");
+        let whole = std::fs::read(&path).unwrap();
+        for cut in [0, 1, whole.len() / 2, whole.len() - 1] {
+            std::fs::write(&path, &whole[..cut]).unwrap();
+            assert!(recorded_owner(directory.path(), &run).unwrap().is_none());
+            assert!(unknown(&run_runtime(directory.path(), &run).unwrap()));
+        }
+        assert!(running(&mut bystander));
+    }
+
+    /// A record whose creation time is not the live process's: the recorded runtime exited and
+    /// its PID was reused. Gone, and the process holding the PID is left alone.
+    #[test]
+    fn a_record_with_another_creation_time_owns_nothing() {
+        let mut bystander = ChildFixture::start();
+        let pid = bystander.0.id() as i32;
+        let directory = tempfile::tempdir().unwrap();
+        let run = started(pid, an_hour(1));
+        RuntimeProcess::capture(pid)
+            .unwrap()
+            .unwrap()
+            .publish(directory.path(), &run, false)
+            .unwrap();
+        let path = directory.path().join("sdk-process.json");
+        for delta in [-1i64, 1] {
+            let mut record: Record =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record.birth = record.birth.wrapping_add_signed(delta);
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            assert!(gone(&run_runtime(directory.path(), &run).unwrap()));
+            record.birth = record.birth.wrapping_add_signed(-delta);
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+        assert!(running(&mut bystander));
+    }
+
+    /// Termination checks the creation time on the terminating handle too.
+    #[test]
+    fn terminate_refuses_a_process_with_another_creation_time() {
+        let mut bystander = ChildFixture::start();
+        let mut impostor = RuntimeProcess::capture(bystander.0.id() as i32)
+            .unwrap()
+            .unwrap();
+        impostor.birth -= 1;
+        assert!(impostor.terminate().is_err());
+        assert!(running(&mut bystander));
+    }
+
+    /// The recorded runtime is ended through its record alone: the SDK that started it, and its
+    /// Job, are gone. A bystander is untouched.
+    #[tokio::test]
+    async fn the_recorded_runtime_is_ended_without_its_job() {
+        let mut runtime = ChildFixture::start();
+        let mut bystander = ChildFixture::start();
+        let directory = tempfile::tempdir().unwrap();
+        let run = started(runtime.0.id() as i32, an_hour(-1));
+        RuntimeProcess::capture(runtime.0.id() as i32)
+            .unwrap()
+            .unwrap()
+            .publish(directory.path(), &run, false)
+            .unwrap();
+        let RunRuntime::Owned(process) = run_runtime(directory.path(), &run).unwrap() else {
+            panic!("the recorded runtime is not owned");
+        };
+        process.terminate().unwrap();
+        assert!(process.exited_within(Duration::from_secs(5)).await.unwrap());
+        assert!(!running(&mut runtime));
+        assert!(running(&mut bystander));
+        // Once it has exited, the record owns nothing, and termination is a no-op.
+        assert!(gone(&run_runtime(directory.path(), &run).unwrap()));
+        process.terminate().unwrap();
+    }
+
+    /// Access denied, recorded or not, is unknown: alive for status, never ended.
+    #[test]
+    fn access_denied_is_unknown_recorded_or_not() {
+        let denied = || io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+        let owner = owner_from_capture(Err(denied()), 1, true).unwrap();
+        assert!(unknown(&recorded_runtime(owner, 7).unwrap()));
+        let run = started(7, an_hour(-1));
+        assert!(unknown(
+            &unrecorded_runtime(Err(denied()), &run, 7).unwrap()
+        ));
+        assert!(gone(&unrecorded_runtime(Ok(None), &run, 7).unwrap()));
+        let other = io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32);
+        assert!(unrecorded_runtime(Err(other), &run, 7).is_err());
+        // A run without a usable PID has no runtime to end.
+        for pid in [None, Some(0), Some(-4)] {
+            let run = run::Model { pid, ..run.clone() };
+            let directory = tempfile::tempdir().unwrap();
+            assert!(gone(&run_runtime(directory.path(), &run).unwrap()));
+        }
+    }
+
+    /// A matching record for a live runtime is owned; status callers see it as running.
+    #[test]
+    fn a_matching_record_owns_the_live_runtime() {
+        let runtime = ChildFixture::start();
+        let directory = tempfile::tempdir().unwrap();
+        let run = started(runtime.0.id() as i32, an_hour(1));
+        RuntimeProcess::capture(runtime.0.id() as i32)
+            .unwrap()
+            .unwrap()
+            .publish(directory.path(), &run, true)
+            .unwrap();
+        assert!(owned(&run_runtime(directory.path(), &run).unwrap()));
     }
 
     #[test]

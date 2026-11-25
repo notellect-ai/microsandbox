@@ -132,6 +132,13 @@ jobs:
         shell: bash
         run: cargo test --locked -p microsandbox --lib -- dir_mount_arg file_mount_export_name
 
+      # Only the runtime the SDK recorded is ever ended; a PID alone never is.
+      - name: Test SDK (runtime ownership, kill, replace, remove)
+        shell: bash
+        run: |
+          cargo test --locked -p microsandbox --lib -- \
+            runtime::ownership runtime::reap context::local::sandbox::kill_tests
+
       - name: Test CLI (volume paths with commas, proxy flags)
         run: cargo test --locked -p microsandbox-cli --lib -- commands::common commands::restore
 

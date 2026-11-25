@@ -6,6 +6,8 @@
 //! methods; [`LocalContext::create_sandbox`] is its entry point.
 
 mod create;
+#[cfg(all(test, windows))]
+mod kill_tests;
 #[cfg(target_os = "linux")]
 mod process_exit;
 #[cfg(target_os = "macos")]
@@ -37,10 +39,6 @@ use sea_orm::{
     ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::Expr,
 };
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::CloseHandle;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
 use super::{LocalContext, creation};
 use crate::MicrosandboxResult;
@@ -167,22 +165,17 @@ impl LocalContext {
         // and cleans the deterministic socket namespace.
         let previous_run = Self::load_latest_run(pools.read(), model.id).await?;
         #[cfg(windows)]
-        let previous_owner = previous_run
-            .as_ref()
-            .map(|run| {
-                crate::runtime::ownership::recorded_owner(
-                    &self.sandboxes_dir().join(name).join("runtime"),
-                    run,
-                )
-            })
-            .transpose()?
-            .flatten();
-        if let Some(pid) = previous_run.and_then(|run| run.pid) {
+        let runtime_dir = self.sandboxes_dir().join(name).join("runtime");
+        if let Some(run) = previous_run.as_ref()
+            && let Some(pid) = run.pid
+        {
             let alive = || -> MicrosandboxResult<bool> {
                 #[cfg(windows)]
-                if let Some(owner) = &previous_owner {
-                    return Ok(owner.alive()?);
-                }
+                return Ok(!matches!(
+                    crate::runtime::ownership::run_runtime(&runtime_dir, run)?,
+                    crate::runtime::ownership::RunRuntime::Gone
+                ));
+                #[cfg(not(windows))]
                 Ok(!Self::pid_has_exited(pid))
             };
             let start = std::time::Instant::now();
@@ -396,7 +389,7 @@ impl LocalContext {
             }
             true
         };
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         let all_dead = {
             let signaled_pid = pid.filter(|p| Self::pid_is_alive(*p));
             if let Some(pid) = signaled_pid {
@@ -412,6 +405,32 @@ impl LocalContext {
                 }
             }
             signaled_pid.is_none_or(Self::pid_has_exited)
+        };
+        // Windows reuses PIDs: only the runtime the SDK recorded, verified by its creation
+        // time, is ended. A PID nothing proves is the runtime's is left running.
+        #[cfg(windows)]
+        let all_dead = {
+            let _ = pid;
+            let run = Self::load_latest_run(self.db().await?.read(), model.id).await?;
+            let runtime = match &run {
+                Some(run) => crate::runtime::ownership::run_runtime(
+                    &self.sandboxes_dir().join(name).join("runtime"),
+                    run,
+                )?,
+                None => crate::runtime::ownership::RunRuntime::Gone,
+            };
+            match runtime {
+                crate::runtime::ownership::RunRuntime::Gone => true,
+                crate::runtime::ownership::RunRuntime::Owned(process) => {
+                    process.terminate()?;
+                    process.exited_within(Duration::from_secs(5)).await?
+                }
+                crate::runtime::ownership::RunRuntime::Unknown(reason) => {
+                    return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+                        "cannot kill sandbox {name:?}: {reason}"
+                    )));
+                }
+            }
         };
 
         if all_dead {
@@ -798,14 +817,16 @@ impl LocalContext {
             .as_ref()
             .and_then(|run| run.pid)
             .is_some_and(Self::pid_is_alive);
+        // A runtime nothing proves gone stays as recorded (see `RunRuntime::Unknown`).
         #[cfg(windows)]
-        if let (Some((_, sandboxes_dir)), Some(run)) = (socket_roots, &run)
-            && let Some(owner) = crate::runtime::ownership::recorded_owner(
-                &sandboxes_dir.join(&sandbox.name).join("runtime"),
-                run,
-            )?
-        {
-            alive = owner.alive()?;
+        if let (Some((_, sandboxes_dir)), Some(run)) = (socket_roots, &run) {
+            alive = !matches!(
+                crate::runtime::ownership::run_runtime(
+                    &sandboxes_dir.join(&sandbox.name).join("runtime"),
+                    run,
+                )?,
+                crate::runtime::ownership::RunRuntime::Gone
+            );
         }
         if alive {
             return Ok(sandbox);
@@ -903,13 +924,14 @@ impl LocalContext {
         #[allow(unused_mut)]
         let mut alive = run.pid.is_some_and(Self::pid_is_alive);
         #[cfg(windows)]
-        if let Some((_, sandboxes_dir)) = socket_roots
-            && let Some(owner) = crate::runtime::ownership::recorded_owner(
-                &sandboxes_dir.join(&sandbox.name).join("runtime"),
-                &run,
-            )?
-        {
-            alive = owner.alive()?;
+        if let Some((_, sandboxes_dir)) = socket_roots {
+            alive = !matches!(
+                crate::runtime::ownership::run_runtime(
+                    &sandboxes_dir.join(&sandbox.name).join("runtime"),
+                    &run,
+                )?,
+                crate::runtime::ownership::RunRuntime::Gone
+            );
         }
         if alive {
             return Ok(sandbox);
@@ -1203,12 +1225,6 @@ impl LocalContext {
         Ok(())
     }
 
-    /// Request termination (Windows has no graceful signal equivalent).
-    #[cfg(windows)]
-    fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
-        Self::terminate_pid(pid)
-    }
-
     /// Force-kill a process (SIGKILL).
     #[cfg(unix)]
     fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
@@ -1219,12 +1235,6 @@ impl LocalContext {
         Ok(())
     }
 
-    /// Force-kill a process.
-    #[cfg(windows)]
-    fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
-        Self::terminate_pid(pid)
-    }
-
     /// Trigger the legacy drain path (SIGUSR1).
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     fn drain_pid(pid: i32) -> MicrosandboxResult<()> {
@@ -1232,28 +1242,6 @@ impl LocalContext {
             nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGUSR1,
         )?;
-        Ok(())
-    }
-
-    /// Terminate a process via the Win32 process API.
-    #[cfg(windows)]
-    fn terminate_pid(pid: i32) -> MicrosandboxResult<()> {
-        let pid = u32::try_from(pid).map_err(|_| {
-            crate::MicrosandboxError::Runtime(format!("invalid Windows pid: {pid}"))
-        })?;
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error().into());
-        }
-
-        let result = unsafe { TerminateProcess(handle, 1) };
-        let close_result = unsafe { CloseHandle(handle) };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if close_result == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
         Ok(())
     }
 }

@@ -2105,6 +2105,7 @@ impl LocalContext {
                     &model,
                     config.replace_with_timeout,
                     local,
+                    sandboxes_dir,
                 )
                 .await?;
             }
@@ -2196,67 +2197,116 @@ impl LocalContext {
     /// Replaces the previous "wait 30s and give up" behavior, which spun
     /// the full timeout when libkrun's SIGTERM handler did a slow
     /// graceful shutdown.
-    async fn stop_sandbox_for_replacement(
+    pub(super) async fn stop_sandbox_for_replacement(
         pools: &DbPools,
         sandbox: &sandbox_entity::Model,
         grace: std::time::Duration,
         local: Option<&Self>,
+        #[cfg_attr(unix, allow(unused_variables))] sandboxes_dir: &Path,
     ) -> MicrosandboxResult<()> {
         let run = Self::load_active_run(pools.read(), sandbox.id).await?;
-        let pids: Vec<i32> = run
-            .as_ref()
-            .and_then(|model| model.pid)
-            .filter(|pid| Self::pid_is_alive(*pid))
-            .into_iter()
-            .collect();
-
-        if !pids.is_empty() {
-            // Polite phase: SIGTERM and wait up to `grace` for graceful exit.
-            if !grace.is_zero() {
-                let deadline = tokio::time::Instant::now() + grace;
-                // The guest shutdown handler flushes dirty disks. Sending the host
-                // process SIGTERM first can discard an already returned guest write.
-                let requested = if let Some(local) = local
-                    && sandbox.status == SandboxStatus::Running
-                {
-                    matches!(
-                        tokio::time::timeout_at(
-                            deadline,
-                            local.request_agent_shutdown(&sandbox.name, sandbox.id)
-                        )
-                        .await,
-                        Ok(Ok(()))
+        // The guest shutdown handler flushes dirty disks. Sending the host
+        // process SIGTERM first can discard an already returned guest write.
+        let request_shutdown = |deadline: tokio::time::Instant| async move {
+            match local {
+                Some(local) if sandbox.status == SandboxStatus::Running => matches!(
+                    tokio::time::timeout_at(
+                        deadline,
+                        local.request_agent_shutdown(&sandbox.name, sandbox.id)
                     )
-                } else {
-                    false
-                };
-                if !requested {
-                    for pid in &pids {
-                        let _ = Self::terminate_pid_gracefully(*pid);
+                    .await,
+                    Ok(Ok(()))
+                ),
+                _ => false,
+            }
+        };
+
+        #[cfg(unix)]
+        {
+            let pids: Vec<i32> = run
+                .as_ref()
+                .and_then(|model| model.pid)
+                .filter(|pid| Self::pid_is_alive(*pid))
+                .into_iter()
+                .collect();
+
+            if !pids.is_empty() {
+                // Polite phase: SIGTERM and wait up to `grace` for graceful exit.
+                if !grace.is_zero() {
+                    let deadline = tokio::time::Instant::now() + grace;
+                    if !request_shutdown(deadline).await {
+                        for pid in &pids {
+                            let _ = Self::terminate_pid_gracefully(*pid);
+                        }
+                    }
+                    Self::wait_for_pids_to_exit(
+                        &pids,
+                        deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    )
+                    .await;
+                }
+
+                // SIGKILL anything still alive, then prove every recorded owner
+                // exited before deterministic sockets or storage can be reused.
+                for pid in pids.iter().copied().filter(|p| Self::pid_is_alive(*p)) {
+                    if let Err(error) = Self::kill_pid(pid)
+                        && Self::pid_is_alive(pid)
+                    {
+                        return Err(error);
                     }
                 }
-                Self::wait_for_pids_to_exit(
-                    &pids,
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                )
-                .await;
-            }
-
-            // SIGKILL anything still alive, then prove every recorded owner
-            // exited before deterministic sockets or storage can be reused.
-            for pid in pids.iter().copied().filter(|p| Self::pid_is_alive(*p)) {
-                if let Err(error) = Self::kill_pid(pid)
-                    && Self::pid_is_alive(pid)
-                {
-                    return Err(error);
+                Self::wait_for_pids_to_exit(&pids, std::time::Duration::from_secs(5)).await;
+                if pids.iter().any(|pid| !Self::pid_has_exited(*pid)) {
+                    return Err(MicrosandboxError::SandboxStillRunning(format!(
+                        "cannot replace sandbox {:?}: runtime did not exit after SIGKILL",
+                        sandbox.name
+                    )));
                 }
             }
-            Self::wait_for_pids_to_exit(&pids, std::time::Duration::from_secs(5)).await;
-            if pids.iter().any(|pid| !Self::pid_has_exited(*pid)) {
-                return Err(MicrosandboxError::SandboxStillRunning(format!(
-                    "cannot replace sandbox {:?}: runtime did not exit after SIGKILL",
-                    sandbox.name
-                )));
+        }
+
+        // Windows reuses PIDs: only the runtime the SDK recorded, verified by its creation
+        // time, is ended. With no graceful signal, the guest's shutdown request is the polite
+        // phase.
+        #[cfg(windows)]
+        {
+            use crate::runtime::ownership::{RunRuntime, run_runtime};
+            let runtime = match &run {
+                Some(run) => run_runtime(&sandboxes_dir.join(&sandbox.name).join("runtime"), run)?,
+                None => RunRuntime::Gone,
+            };
+            match runtime {
+                RunRuntime::Gone => {}
+                RunRuntime::Unknown(reason) => {
+                    return Err(MicrosandboxError::SandboxStillRunning(format!(
+                        "cannot replace sandbox {:?}: {reason}",
+                        sandbox.name
+                    )));
+                }
+                RunRuntime::Owned(process) => {
+                    if !grace.is_zero() {
+                        let deadline = tokio::time::Instant::now() + grace;
+                        if request_shutdown(deadline).await {
+                            process
+                                .exited_within(
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                )
+                                .await?;
+                        }
+                    }
+                    if process.alive()? {
+                        process.terminate()?;
+                    }
+                    if !process
+                        .exited_within(std::time::Duration::from_secs(5))
+                        .await?
+                    {
+                        return Err(MicrosandboxError::SandboxStillRunning(format!(
+                            "cannot replace sandbox {:?}: runtime did not exit after termination",
+                            sandbox.name
+                        )));
+                    }
+                }
             }
         }
 
@@ -2317,6 +2367,7 @@ impl LocalContext {
     }
 
     /// Poll until every pid has exited or `timeout` elapses.
+    #[cfg(unix)]
     async fn wait_for_pids_to_exit(pids: &[i32], timeout: std::time::Duration) {
         let start = std::time::Instant::now();
         let poll_interval = std::time::Duration::from_millis(50);
@@ -2418,8 +2469,14 @@ impl LocalContext {
         if !creation::pending(pools.write(), model.id).await? {
             return Ok(());
         }
-        Self::stop_sandbox_for_replacement(pools, &model, config.replace_with_timeout, None)
-            .await?;
+        Self::stop_sandbox_for_replacement(
+            pools,
+            &model,
+            config.replace_with_timeout,
+            None,
+            &self.sandboxes_dir(),
+        )
+        .await?;
         let _lineage =
             crate::snapshot::lineage::lock_source(&self.config().run_dir(), &model.name).await?;
         let _runtime = crate::runtime::acquire_sandbox_lifecycle_guard(

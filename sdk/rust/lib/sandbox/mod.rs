@@ -64,7 +64,7 @@ pub(crate) use patch::{
 #[cfg(feature = "local")]
 pub(crate) mod pause;
 #[cfg(all(feature = "local", windows))]
-mod reap;
+pub(crate) mod reap;
 #[cfg(not(feature = "local"))]
 mod remote_only;
 #[cfg(feature = "local")]
