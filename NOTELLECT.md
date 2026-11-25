@@ -7,10 +7,10 @@ release tags `vX.Y.Z-notellect.N`. Pushing such a tag builds `msb` (with agentd
 embedded) and `libkrunfw` for macOS, Linux and Windows from this source, as
 upstream's release does, and publishes them with `checksums.sha256`.
 
-For v0.8.1 the current branch is `notellect/v0.8.1-proxy-l7`:
-`notellect/v0.8.1-proxy` (tag `.7`: `notellect/windows-lookup-final-path`,
-tag `.6`, plus the outbound proxy commits) plus the recorded-owner
-ACCESS_DENIED fix. The next tag is cut from it. The
+For v0.8.1 the current branch is `notellect/v0.8.1-safe-kill`:
+`notellect/v0.8.1-proxy-l7` (tag `.8`: `notellect/v0.8.1-proxy`, tag `.7`,
+plus the recorded-owner ACCESS_DENIED fix) plus the balloon fix and the safe
+kill by recorded PID. The next tag is cut from it. The
 earlier branches (`notellect/v0.8.1`, `-ci`, `-ci2` to `-ci15`, some `-wip`)
 are earlier pushes of the same work, left as they were.
 
@@ -24,6 +24,7 @@ are earlier pushes of the same work, left as they were.
 | `v0.8.1-notellect.6` | `notellect/windows-lookup-final-path` (Windows one-open lookup) |
 | `v0.8.1-notellect.7` | `notellect/v0.8.1-proxy` (outbound proxy: host names, CONNECT by name, bypass, restore) |
 | `v0.8.1-notellect.8` | `notellect/v0.8.1-proxy-l7` (a recorded runtime PID this user may not open counts as alive) |
+| `v0.8.1-notellect.9` | `notellect/v0.8.1-safe-kill` (no free page reporting on Windows; a recorded PID is judged and ended only as the run's own runtime) |
 
 Commits on top of upstream v0.8.1 (carried over from `notellect/v0.7.16`; the
 `snapshot restore` mount flags were dropped because 0.8 boots snapshots with
@@ -164,6 +165,29 @@ Known and left as they are (from a review of the v0.8.1 commits):
   alive, as `pid_is_alive` already treats it, instead of failing `msb list`,
   stop and reconcile with a bare "io error: Access is denied"; other record
   and capture I/O errors name the record path and PID. Upstream later.
+- The balloon device does not offer free page reporting on Windows, so the
+  guest never sets up that queue: reporting made the host
+  `DiscardVirtualMemory` guest RAM still mapped into the running WHP
+  partition, the prime suspect for the memory-corruption bugchecks (0x139/3,
+  0x1A) on Windows hosts running many VMs. Windows guests' free memory is no
+  longer returned to the host. On every platform a reported range must lie in
+  guest memory (`check_range`; only its start was checked, as libkrun #930
+  fixed). Upstream later.
+- A run's recorded PID is judged and ended in one place
+  (`sdk/rust/lib/context/local/sandbox/safe_kill.rs`). Every OS reuses PIDs,
+  Windows at once, and without `sdk-process.json` `remove --force` after a
+  crash terminated whatever process held the PID (on a Windows 10 handheld, a
+  `ping` of the same user). A run's process is now its PID plus a start time:
+  the record's creation time, or else the run row's `started_at` (the runtime
+  inserts its row while running, so a process born after it is a later holder
+  of the PID; Linux, whose birth is estimated from the boot time, allows 1 s);
+  as a backstop against clock steps the process must also run the runtime's
+  image (`msb`). Kill, drain, replace, stop, reconcile and the Windows
+  `remove` reaper (`sandbox/reap.rs`, which had its own check) open the PID
+  once, compare, and end the process through that handle (Windows handle,
+  Linux pidfd, macOS compare right before `kill`); `runtime/reap.rs` keeps the
+  shared rules. No start time to compare, or ERROR_ACCESS_DENIED, is unknown:
+  never killed and never reconciled as exited. Upstream later.
 
 `notellect-windows-check.yml` runs formatting, clippy and the tests of these
 commits that need no microVM on a GitHub Windows runner, on every push to a
