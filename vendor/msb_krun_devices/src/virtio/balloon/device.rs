@@ -29,7 +29,18 @@ pub(crate) const FRQ_INDEX: usize = 4;
 pub(crate) const BASE_AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_STATS_VQ as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT as u64)
-    | (1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64);
+    | REPORTING_FEATURE;
+
+// Free page reporting makes the host discard guest RAM while it stays mapped
+// into the running partition. On Windows that is DiscardVirtualMemory on
+// memory WHvMapGpaRange gave the hypervisor, with vCPUs running, and the
+// hosts that ran many such VMs bugchecked with memory corruption (0x139/3,
+// 0x1A). Until that path is proven safe, Windows does not offer the feature,
+// so the guest never sets up the reporting queue.
+#[cfg(not(windows))]
+const REPORTING_FEATURE: u64 = 1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64;
+#[cfg(windows)]
+const REPORTING_FEATURE: u64 = 0;
 
 pub(crate) const VIRTIO_BALLOON_S_MEMTOT: u16 = 5;
 pub(crate) const VIRTIO_BALLOON_S_AVAIL: u16 = 6;
@@ -123,6 +134,13 @@ impl Balloon {
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
             for desc in head.into_iter() {
+                // The guest chooses addr and len; a range that runs past the
+                // end of its memory region must not discard host memory
+                // beyond it.
+                if !mem.check_range(desc.addr, desc.len as usize) {
+                    error!("balloon: free-page range is outside guest memory");
+                    continue;
+                }
                 let host_addr = mem.get_host_address(desc.addr).unwrap();
                 if !queues[FRQ_INDEX].queue.mark_host_write(HostMemoryRange {
                     start: desc.addr.raw_value(),

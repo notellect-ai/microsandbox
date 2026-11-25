@@ -18,6 +18,8 @@ mod defs {
         pub const VIRTIO_ID_BALLOON: u32 = 5;
         pub const VIRTIO_BALLOON_F_STATS_VQ: u32 = 1;
         pub const VIRTIO_BALLOON_F_FREE_PAGE_HINT: u32 = 3;
+        // Not offered on Windows; see device.rs.
+        #[cfg_attr(windows, allow(dead_code))]
         pub const VIRTIO_BALLOON_F_REPORTING: u32 = 5;
     }
 }
