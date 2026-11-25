@@ -2099,10 +2099,12 @@ impl LocalContext {
                 model.status,
                 SandboxStatus::Running | SandboxStatus::Draining | SandboxStatus::Paused
             );
+            let runtime_dir = sandboxes_dir.join(&config.spec.name).join("runtime");
             if active {
                 Self::stop_sandbox_for_replacement(
                     pools,
                     &model,
+                    &runtime_dir,
                     config.replace_with_timeout,
                     local,
                 )
@@ -2117,8 +2119,9 @@ impl LocalContext {
             .await?;
             if Self::load_latest_run(pools.read(), model.id)
                 .await?
-                .and_then(|run| run.pid)
-                .is_some_and(Self::pid_is_alive)
+                .is_some_and(|run| {
+                    super::safe_kill::RunProcess::resolve(&run, Some(&runtime_dir)).may_be_alive()
+                })
             {
                 return Err(MicrosandboxError::SandboxStillRunning(format!(
                     "cannot replace sandbox {:?}: its recorded runtime process is still alive",
@@ -2199,18 +2202,30 @@ impl LocalContext {
     async fn stop_sandbox_for_replacement(
         pools: &DbPools,
         sandbox: &sandbox_entity::Model,
+        runtime_dir: &Path,
         grace: std::time::Duration,
         local: Option<&Self>,
     ) -> MicrosandboxResult<()> {
-        let run = Self::load_active_run(pools.read(), sandbox.id).await?;
-        let pids: Vec<i32> = run
-            .as_ref()
-            .and_then(|model| model.pid)
-            .filter(|pid| Self::pid_is_alive(*pid))
-            .into_iter()
-            .collect();
+        use super::safe_kill::{Ending, RunProcess};
 
-        if !pids.is_empty() {
+        let run = Self::load_active_run(pools.read(), sandbox.id).await?;
+        // Only the run's own runtime is signalled, through the handle its start time
+        // was compared on; a reused PID is Exited and never touched.
+        let runtime = match run
+            .as_ref()
+            .map(|run| RunProcess::resolve(run, Some(runtime_dir)))
+        {
+            Some(RunProcess::Alive(runtime)) => Some(runtime),
+            Some(RunProcess::Exited) | None => None,
+            Some(RunProcess::Unknown) => {
+                return Err(MicrosandboxError::SandboxStillRunning(format!(
+                    "cannot replace sandbox {:?}: cannot prove which process holds its recorded runtime PID",
+                    sandbox.name
+                )));
+            }
+        };
+
+        if let Some(runtime) = &runtime {
             // Polite phase: SIGTERM and wait up to `grace` for graceful exit.
             if !grace.is_zero() {
                 let deadline = tokio::time::Instant::now() + grace;
@@ -2231,28 +2246,24 @@ impl LocalContext {
                     false
                 };
                 if !requested {
-                    for pid in &pids {
-                        let _ = Self::terminate_pid_gracefully(*pid);
-                    }
+                    let _ = runtime.end(Ending::Graceful);
                 }
-                Self::wait_for_pids_to_exit(
-                    &pids,
+                Self::wait_for_runtime_exit(
+                    runtime,
                     deadline.saturating_duration_since(tokio::time::Instant::now()),
                 )
                 .await;
             }
 
-            // SIGKILL anything still alive, then prove every recorded owner
-            // exited before deterministic sockets or storage can be reused.
-            for pid in pids.iter().copied().filter(|p| Self::pid_is_alive(*p)) {
-                if let Err(error) = Self::kill_pid(pid)
-                    && Self::pid_is_alive(pid)
-                {
-                    return Err(error);
-                }
+            // SIGKILL it if still alive, then prove it exited before deterministic
+            // sockets or storage can be reused.
+            if let Err(error) = runtime.end(Ending::Kill)
+                && !runtime.has_exited()
+            {
+                return Err(error.into());
             }
-            Self::wait_for_pids_to_exit(&pids, std::time::Duration::from_secs(5)).await;
-            if pids.iter().any(|pid| !Self::pid_has_exited(*pid)) {
+            Self::wait_for_runtime_exit(runtime, std::time::Duration::from_secs(5)).await;
+            if !runtime.has_exited() {
                 return Err(MicrosandboxError::SandboxStillRunning(format!(
                     "cannot replace sandbox {:?}: runtime did not exit after SIGKILL",
                     sandbox.name
@@ -2316,20 +2327,14 @@ impl LocalContext {
         .await
     }
 
-    /// Poll until every pid has exited or `timeout` elapses.
-    async fn wait_for_pids_to_exit(pids: &[i32], timeout: std::time::Duration) {
+    /// Poll until the held runtime has exited or `timeout` elapses.
+    async fn wait_for_runtime_exit(
+        runtime: &super::safe_kill::RuntimeHandle,
+        timeout: std::time::Duration,
+    ) {
         let start = std::time::Instant::now();
         let poll_interval = std::time::Duration::from_millis(50);
-
-        loop {
-            if pids.iter().all(|pid| Self::pid_has_exited(*pid)) {
-                return;
-            }
-
-            if start.elapsed() >= timeout {
-                return;
-            }
-
+        while !runtime.has_exited() && start.elapsed() < timeout {
             tokio::time::sleep(poll_interval).await;
         }
     }
@@ -2418,8 +2423,15 @@ impl LocalContext {
         if !creation::pending(pools.write(), model.id).await? {
             return Ok(());
         }
-        Self::stop_sandbox_for_replacement(pools, &model, config.replace_with_timeout, None)
-            .await?;
+        let runtime_dir = self.sandboxes_dir().join(&model.name).join("runtime");
+        Self::stop_sandbox_for_replacement(
+            pools,
+            &model,
+            &runtime_dir,
+            config.replace_with_timeout,
+            None,
+        )
+        .await?;
         let _lineage =
             crate::snapshot::lineage::lock_source(&self.config().run_dir(), &model.name).await?;
         let _runtime = crate::runtime::acquire_sandbox_lifecycle_guard(
@@ -4869,10 +4881,13 @@ esac
             let mut child = child;
             child.wait().unwrap()
         });
+        // A runtime inserts its run row after it started, and runs the runtime image.
+        crate::context::local::sandbox::safe_kill::accept_runtime_image_for_tests("sleep");
         let run = run_entity::ActiveModel {
             sandbox_id: Set(sandbox_id),
             pid: Set(Some(live_pid)),
             status: Set(run_entity::RunStatus::Running),
+            started_at: Set(Some(chrono::Utc::now().naive_utc())),
             ..Default::default()
         };
         run_entity::Entity::insert(run)

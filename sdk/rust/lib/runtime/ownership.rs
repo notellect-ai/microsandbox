@@ -14,7 +14,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    WaitForSingleObject,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 
 use crate::{MicrosandboxError, MicrosandboxResult};
@@ -73,21 +73,71 @@ impl RecordedOwner {
 //--------------------------------------------------------------------------------------------------
 
 impl RuntimeProcess {
+    /// Creation time (FILETIME ticks) of the held process.
+    pub(crate) fn birth(&self) -> u64 {
+        self.birth
+    }
+
+    /// Full path of the held process's executable image.
+    pub(crate) fn image_path(&self) -> io::Result<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        let mut buffer = vec![0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        // SAFETY: the handle is owned and open; the buffer holds `length` u16s.
+        if unsafe {
+            QueryFullProcessImageNameW(
+                self.handle.as_raw_handle(),
+                0,
+                buffer.as_mut_ptr(),
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        buffer.truncate(length as usize);
+        Ok(std::ffi::OsString::from_wide(&buffer).into())
+    }
+
+    /// Terminate the held process. One that has already exited counts as ended:
+    /// Windows answers ERROR_ACCESS_DENIED for terminating an exited process.
+    /// Needs a handle from [`Self::capture_terminable`].
+    pub(crate) fn terminate(&self) -> io::Result<()> {
+        // SAFETY: the handle is owned and open for this call.
+        if unsafe { TerminateProcess(self.handle.as_raw_handle(), 1) } != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !self.alive()? {
+            return Ok(());
+        }
+        Err(error)
+    }
+
     pub(crate) fn capture(pid: i32) -> io::Result<Option<Self>> {
+        // Rights only permit identity inspection and waiting, never termination.
+        Self::capture_with(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+    }
+
+    /// [`Self::capture`] with a handle that may also terminate the process: the
+    /// process is ended through the very handle whose creation time was compared,
+    /// so a PID reused after the comparison is never hit.
+    pub(crate) fn capture_terminable(pid: i32) -> io::Result<Option<Self>> {
+        Self::capture_with(
+            pid,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+        )
+    }
+
+    fn capture_with(pid: i32, rights: u32) -> io::Result<Option<Self>> {
         if pid <= 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid runtime PID",
             ));
         }
-        // SAFETY: rights only permit identity inspection and waiting, never termination.
-        let raw = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                0,
-                pid as u32,
-            )
-        };
+        // SAFETY: OpenProcess has no memory-safety preconditions.
+        let raw = unsafe { OpenProcess(rights, 0, pid as u32) };
         if raw.is_null() {
             let error = io::Error::last_os_error();
             return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
@@ -223,6 +273,16 @@ pub(crate) fn recorded_owner(
     )
     .map_err(|error| record_error(&path, Some(record.pid), error))?;
     Ok(Some(owner))
+}
+
+/// The creation time the SDK recorded for this exact run's runtime, if a record
+/// for it exists. A record of another run or sandbox, or one that does not parse,
+/// is no record: the caller falls back to the run's own start time.
+pub(crate) fn recorded_birth(directory: &Path, run: &run::Model) -> Option<u64> {
+    let bytes = std::fs::read(directory.join("sdk-process.json")).ok()?;
+    let record: Record = serde_json::from_slice(&bytes).ok()?;
+    (record.sandbox_id == run.sandbox_id && record.run_id == run.id && Some(record.pid) == run.pid)
+        .then_some(record.birth)
 }
 
 /// Turns the capture of a recorded PID into its owner. ERROR_ACCESS_DENIED means the

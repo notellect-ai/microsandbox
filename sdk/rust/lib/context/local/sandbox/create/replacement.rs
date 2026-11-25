@@ -124,12 +124,20 @@ impl LocalContext {
                 )));
             }
             let run_dir = self.config().run_dir();
-            let pid = match current {
-                Some(id) => Self::load_latest_run(pools.read(), id)
-                    .await?
-                    .and_then(|run| run.pid),
+            let run = match current {
+                Some(id) => Self::load_latest_run(pools.read(), id).await?,
                 None => None,
             };
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let pid = run.as_ref().and_then(|run| run.pid);
+            // Wait only for the run's own runtime, never for a later holder of its PID.
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let departing = run.as_ref().map(|run| {
+                super::super::safe_kill::RunProcess::resolve(
+                    run,
+                    Some(&root.join(name).join("runtime")),
+                )
+            });
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let departing = super::super::process_exit::RuntimeExit::capture(
                 pid,
@@ -161,12 +169,22 @@ impl LocalContext {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 loop {
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    // No observer (the runtime dropped its lifecycle lock, or the PID is
+                    // gone): the run's own runtime, never a later holder of its PID, decides.
                     let exited = match &departing {
                         Some(process) => process.has_exited()?,
-                        None => pid.is_none_or(Self::pid_has_exited),
+                        None => run.as_ref().is_none_or(|run| {
+                            !super::super::safe_kill::RunProcess::resolve(run, None).may_be_alive()
+                        }),
                     };
                     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                    let exited = pid.is_none_or(Self::pid_has_exited);
+                    let exited = match &departing {
+                        Some(super::super::safe_kill::RunProcess::Alive(process)) => {
+                            process.has_exited()
+                        }
+                        Some(super::super::safe_kill::RunProcess::Unknown) => false,
+                        Some(super::super::safe_kill::RunProcess::Exited) | None => true,
+                    };
                     if exited {
                         break;
                     }

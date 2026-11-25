@@ -180,10 +180,13 @@ impl LocalContext {
         let legacy_alive = match &owner {
             Some(owner) if !owner.lifecycle_lock => owner.alive()?,
             None if !lock_owned
-                && run
-                    .as_ref()
-                    .and_then(|run| run.pid)
-                    .is_some_and(Self::pid_is_alive) =>
+                && run.as_ref().is_some_and(|run| {
+                    super::safe_kill::RunProcess::resolve(
+                        run,
+                        Some(&self.sandboxes_dir().join(name).join("runtime")),
+                    )
+                    .may_be_alive()
+                }) =>
             {
                 return Err(MicrosandboxError::Runtime("cannot prove legacy runtime ownership: no matching SDK process record; refusing to report stop complete".into()));
             }

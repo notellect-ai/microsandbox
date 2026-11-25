@@ -128,9 +128,9 @@ jobs:
           cargo test --locked -p microsandbox-runtime --lib -- \
             checkpoint::memory_cache runner::vm::tests
 
-      - name: Test SDK (mount wire encoding)
+      - name: Test SDK (mount wire encoding, safe kill by recorded PID)
         shell: bash
-        run: cargo test --locked -p microsandbox --lib -- dir_mount_arg file_mount_export_name
+        run: cargo test --locked -p microsandbox --lib -- dir_mount_arg file_mount_export_name safe_kill
 
       - name: Test CLI (volume paths with commas, proxy flags)
         run: cargo test --locked -p microsandbox-cli --lib -- commands::common commands::restore

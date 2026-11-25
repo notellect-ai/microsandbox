@@ -23,7 +23,7 @@ mod database;
 mod dispatch;
 pub(crate) mod host_paths;
 mod metrics_lookup;
-mod sandbox;
+pub(crate) mod sandbox;
 #[cfg(test)]
 mod sharing;
 pub(crate) mod snapshot;

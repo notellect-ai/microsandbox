@@ -11,6 +11,7 @@ mod process_exit;
 #[cfg(target_os = "macos")]
 #[path = "process_exit_macos.rs"]
 mod process_exit;
+pub(crate) mod safe_kill;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod signals;
 mod stop;
@@ -19,6 +20,7 @@ mod stop;
 mod signal_tests;
 
 use crate::context::sandbox::SandboxRecordPage;
+use safe_kill::RunProcess;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -37,10 +39,6 @@ use sea_orm::{
     ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder, QuerySelect,
     sea_query::Expr,
 };
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::CloseHandle;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
 use super::{LocalContext, creation};
 use crate::MicrosandboxResult;
@@ -177,13 +175,15 @@ impl LocalContext {
             })
             .transpose()?
             .flatten();
-        if let Some(pid) = previous_run.and_then(|run| run.pid) {
+        let runtime_dir = self.sandboxes_dir().join(name).join("runtime");
+        if let Some(run) = previous_run.filter(|run| run.pid.is_some()) {
+            let pid = run.pid.unwrap_or_default();
             let alive = || -> MicrosandboxResult<bool> {
                 #[cfg(windows)]
                 if let Some(owner) = &previous_owner {
                     return Ok(owner.alive()?);
                 }
-                Ok(!Self::pid_has_exited(pid))
+                Ok(RunProcess::resolve(&run, Some(&runtime_dir)).may_be_alive())
             };
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(5) && alive()? {
@@ -398,20 +398,26 @@ impl LocalContext {
         };
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let all_dead = {
-            let signaled_pid = pid.filter(|p| Self::pid_is_alive(*p));
-            if let Some(pid) = signaled_pid {
-                Self::kill_pid(pid)?;
-                let timeout = Duration::from_secs(5);
-                let start = std::time::Instant::now();
-                let poll_interval = Duration::from_millis(50);
-                while start.elapsed() < timeout {
-                    if Self::pid_has_exited(pid) {
-                        break;
+            let _ = pid;
+            // Only the run's own runtime is ever terminated, through the handle its
+            // start time was compared on; a reused PID resolves to Exited (W-31m).
+            let run = Self::load_latest_run(self.db().await?.read(), model.id).await?;
+            let runtime_dir = self.sandboxes_dir().join(name).join("runtime");
+            match run.map(|run| RunProcess::resolve(&run, Some(&runtime_dir))) {
+                Some(RunProcess::Alive(runtime)) => {
+                    runtime.end(safe_kill::Ending::Kill)?;
+                    let timeout = Duration::from_secs(5);
+                    let start = std::time::Instant::now();
+                    let poll_interval = Duration::from_millis(50);
+                    while start.elapsed() < timeout && !runtime.has_exited() {
+                        tokio::time::sleep(poll_interval).await;
                     }
-                    tokio::time::sleep(poll_interval).await;
+                    runtime.has_exited()
                 }
+                Some(RunProcess::Exited) | None => true,
+                // Not provably this run's runtime: never killed, never reported stopped.
+                Some(RunProcess::Unknown) => false,
             }
-            signaled_pid.is_none_or(Self::pid_has_exited)
         };
 
         if all_dead {
@@ -475,7 +481,15 @@ impl LocalContext {
 
         #[cfg(windows)]
         {
-            if pid.is_some_and(Self::pid_is_alive) {
+            let _ = pid;
+            let run = Self::load_latest_run(self.db().await?.read(), model.id).await?;
+            let runtime_dir = self.sandboxes_dir().join(name).join("runtime");
+            if run.is_some_and(|run| {
+                matches!(
+                    RunProcess::resolve(&run, Some(&runtime_dir)),
+                    RunProcess::Alive(_) | RunProcess::Unknown
+                )
+            }) {
                 self.request_agent_shutdown(name, model.id)
                     .await
                     .map_err(drain_shutdown_error)?;
@@ -485,8 +499,13 @@ impl LocalContext {
 
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         {
-            if let Some(pid) = pid.filter(|p| Self::pid_is_alive(*p)) {
-                Self::drain_pid(pid)?;
+            let _ = pid;
+            let run = Self::load_latest_run(self.db().await?.read(), model.id).await?;
+            let runtime_dir = self.sandboxes_dir().join(name).join("runtime");
+            if let Some(RunProcess::Alive(runtime)) =
+                run.map(|run| RunProcess::resolve(&run, Some(&runtime_dir)))
+            {
+                runtime.end(safe_kill::Ending::Drain)?;
             }
             Ok(())
         }
@@ -793,11 +812,13 @@ impl LocalContext {
         let run = Self::load_latest_run(pools.read(), sandbox.id).await?;
         #[cfg(not(windows))]
         let run = Self::load_active_run(pools.read(), sandbox.id).await?;
+        let runtime_dir = socket_roots
+            .map(|(_, sandboxes_dir)| sandboxes_dir.join(&sandbox.name).join("runtime"));
+        // A reused PID is not this run's runtime; one that cannot be compared stays alive.
         #[allow(unused_mut)]
         let mut alive = run
             .as_ref()
-            .and_then(|run| run.pid)
-            .is_some_and(Self::pid_is_alive);
+            .is_some_and(|run| RunProcess::resolve(run, runtime_dir.as_deref()).may_be_alive());
         #[cfg(windows)]
         if let (Some((_, sandboxes_dir)), Some(run)) = (socket_roots, &run)
             && let Some(owner) = crate::runtime::ownership::recorded_owner(
@@ -901,7 +922,7 @@ impl LocalContext {
         };
 
         #[allow(unused_mut)]
-        let mut alive = run.pid.is_some_and(Self::pid_is_alive);
+        let mut alive = RunProcess::resolve(&run, runtime_dir.as_deref()).may_be_alive();
         #[cfg(windows)]
         if let Some((_, sandboxes_dir)) = socket_roots
             && let Some(owner) = crate::runtime::ownership::recorded_owner(
@@ -1182,79 +1203,6 @@ impl LocalContext {
     /// Whether `pid` refers to a live process.
     pub(super) fn pid_is_alive(pid: i32) -> bool {
         microsandbox_utils::process::pid_is_alive(pid)
-    }
-
-    /// Whether `pid` has exited without consuming its wait status.
-    ///
-    /// The runtime's owning `Child` or Tokio task must remain the sole reaper;
-    /// probing with `waitpid` here can steal the status and make that waiter
-    /// fail with `ECHILD`.
-    fn pid_has_exited(pid: i32) -> bool {
-        !Self::pid_is_alive(pid)
-    }
-
-    /// Request graceful termination (SIGTERM).
-    #[cfg(unix)]
-    fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGTERM,
-        )?;
-        Ok(())
-    }
-
-    /// Request termination (Windows has no graceful signal equivalent).
-    #[cfg(windows)]
-    fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
-        Self::terminate_pid(pid)
-    }
-
-    /// Force-kill a process (SIGKILL).
-    #[cfg(unix)]
-    fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        )?;
-        Ok(())
-    }
-
-    /// Force-kill a process.
-    #[cfg(windows)]
-    fn kill_pid(pid: i32) -> MicrosandboxResult<()> {
-        Self::terminate_pid(pid)
-    }
-
-    /// Trigger the legacy drain path (SIGUSR1).
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-    fn drain_pid(pid: i32) -> MicrosandboxResult<()> {
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGUSR1,
-        )?;
-        Ok(())
-    }
-
-    /// Terminate a process via the Win32 process API.
-    #[cfg(windows)]
-    fn terminate_pid(pid: i32) -> MicrosandboxResult<()> {
-        let pid = u32::try_from(pid).map_err(|_| {
-            crate::MicrosandboxError::Runtime(format!("invalid Windows pid: {pid}"))
-        })?;
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error().into());
-        }
-
-        let result = unsafe { TerminateProcess(handle, 1) };
-        let close_result = unsafe { CloseHandle(handle) };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if close_result == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
     }
 }
 
@@ -1751,6 +1699,91 @@ mod tests {
         }
     }
 
+    /// W-31m: after a crash, the run's PID belongs to an unrelated process created
+    /// after the run started, and no sdk-process.json was written. `msb remove
+    /// --force` (kill) must leave that process running and reconcile the run.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn safe_kill_spares_a_later_holder_of_the_runs_pid() {
+        let home = tempdir().unwrap();
+        let mut unrelated = scopeguard::guard(
+            std::process::Command::new("ping")
+                .args(["-n", "60", "127.0.0.1"])
+                .spawn()
+                .unwrap(),
+            |mut child| {
+                let _ = child.kill();
+                let _ = child.wait();
+            },
+        );
+        let backend = Arc::new(
+            crate::test_support::local_backend_builder(home.path())
+                .build()
+                .unwrap(),
+        );
+        let pools = backend.db().await.unwrap();
+        let id = LocalContext::insert_sandbox_record(pools.write(), &test_config("w31m"))
+            .await
+            .unwrap();
+        run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(unrelated.id() as i32)),
+            started_at: Set(Some(
+                (chrono::Utc::now() - chrono::Duration::hours(1)).naive_utc(),
+            )),
+            status: Set(run_entity::RunStatus::Running),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        backend.kill_sandbox("w31m", None).await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "kill ended a process created after the run started"
+        );
+        let status = sandbox_entity::Entity::find_by_id(id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(status, SandboxStatus::Stopped);
+    }
+
+    /// `run.started_at` is the identity of a run without sdk-process.json; the
+    /// birth comparison relies on it keeping sub-millisecond precision.
+    #[tokio::test]
+    async fn safe_kill_started_at_round_trips_to_the_microsecond() {
+        let temp = tempdir().unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
+        let id = LocalContext::insert_sandbox_record(pools.write(), &test_config("precision"))
+            .await
+            .unwrap();
+        let started = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_000)
+            .unwrap()
+            .naive_utc();
+        let run_id = run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(1)),
+            started_at: Set(Some(started)),
+            status: Set(run_entity::RunStatus::Running),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap()
+        .last_insert_id;
+        let stored = run_entity::Entity::find_by_id(run_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at;
+        assert_eq!(stored, Some(started));
+    }
+
     fn dead_pid() -> i32 {
         let mut pid = 900_000;
         while LocalContext::pid_is_alive(pid) {
@@ -1905,7 +1938,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        assert!(LocalContext::pid_has_exited(pid));
+        assert!(!LocalContext::pid_is_alive(pid));
         assert!(child.wait().unwrap().success());
     }
 

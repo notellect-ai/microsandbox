@@ -145,28 +145,84 @@ impl ProcessIdentity {
     /// Reject a reused PID whose current process was born after the catalog run.
     /// The cached OS birth token remains the authority for later revalidation.
     pub fn started_by(&self, started: chrono::NaiveDateTime) -> bool {
+        self.born_micros().is_some_and(|born| {
+            crate::runtime::reap::creation_may_belong_to_run(
+                born,
+                started.and_utc().timestamp_micros(),
+            )
+        })
+    }
+
+    /// Wall-clock birth in Unix microseconds, rounded down (Linux: to its clock
+    /// tick, estimated from the boot time, so a later wall-clock step shifts it).
+    pub fn born_micros(&self) -> Option<i64> {
         #[cfg(target_os = "macos")]
-        let born_ms = (self.start.0 as i128) * 1000 + (self.start.1 as i128) / 1000;
+        let born = self.start.0 as i64 * 1_000_000 + self.start.1 as i64;
         #[cfg(windows)]
-        let born_ms = (self.start.0 as i128) / 10_000 - 11_644_473_600_000i128;
+        let born = crate::runtime::reap::filetime_ticks_to_unix_micros(self.start.0 as u64);
         #[cfg(target_os = "linux")]
-        let born_ms = {
+        let born = {
             let mut uptime = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
             let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
             if hz <= 0 || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut uptime) } != 0 {
-                return false;
+                return None;
             }
-            let boot_ms = chrono::Utc::now().timestamp_millis() as i128
-                - uptime.tv_sec as i128 * 1000
-                - uptime.tv_nsec as i128 / 1_000_000;
-            boot_ms + self.start.0 as i128 * 1000 / hz as i128
+            let boot = chrono::Utc::now().timestamp_micros()
+                - uptime.tv_sec as i64 * 1_000_000
+                - uptime.tv_nsec as i64 / 1_000;
+            boot + (self.start.0 as i128 * 1_000_000 / hz as i128) as i64
         };
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-        return false;
-        born_ms <= started.and_utc().timestamp_millis() as i128
+        return None;
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Some(born)
+    }
+
+    /// Send `signal` to this process, never to a later holder of its PID. Returns
+    /// `Ok(false)` when the process has already exited. Linux signals through the
+    /// pidfd when the kernel has one; otherwise (and on macOS) the start time is
+    /// compared right before `kill`, and PIDs are handed out in sequence, so a
+    /// reuse inside that window would need the whole PID space to wrap.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn signal(&self, signal: libc::c_int) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = &self.handle {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    handle.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if result == 0 {
+                return Ok(true);
+            }
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        match self.verify() {
+            Ok(()) => {}
+            Err(ControlClientError::RuntimeChanged) => return Ok(false),
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+        if unsafe { libc::kill(self.pid, signal) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
     }
 
     pub fn verify_peer(&self, pid: i32) -> ControlClientResult<()> {
