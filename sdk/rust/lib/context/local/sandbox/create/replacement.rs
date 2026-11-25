@@ -507,6 +507,89 @@ mod tests {
     use super::*;
     use crate::sandbox::{SandboxConfig, SandboxStatus};
 
+    /// Recovery waits for an unpublished candidate's runtime to release its files.
+    /// Once that runtime has dropped its lifecycle lock (or never held one) there is
+    /// no exit observer, and the run row decides: its own runtime, still alive, is
+    /// waited for (and recovery fails rather than reuse its files); a later holder
+    /// of its PID is not waited for. Neither is ever signalled.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn recovery_without_an_exit_observer_waits_only_for_the_runs_own_runtime() {
+        use microsandbox_db::entity::run as run_entity;
+        use sea_orm::{ActiveValue::Set, EntityTrait};
+
+        for (own_runtime, started) in [
+            (true, chrono::Utc::now() + chrono::Duration::hours(1)),
+            (false, chrono::Utc::now() - chrono::Duration::hours(1)),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let backend = crate::test_support::local_backend_builder(temp.path())
+                .build()
+                .unwrap();
+            let db = backend.db().await.unwrap().write();
+            let mut config = SandboxConfig::default();
+            config.spec.name = "kept".into();
+            config.spec.lifecycle.ephemeral = true;
+            let id = LocalContext::insert_sandbox_record_with_status(
+                db,
+                &config,
+                SandboxStatus::Stopped,
+            )
+            .await
+            .unwrap();
+            retain_ephemeral(db, id).await.unwrap();
+            let dir = backend.sandboxes_dir().join("kept");
+            fs::create_dir_all(&dir).unwrap();
+            let mut attempt = None;
+            park(db, "kept", id, &dir, &mut attempt).await.unwrap();
+            let token = attempt.unwrap().token.unwrap();
+            let candidate = LocalContext::insert_with_replacement(
+                db,
+                &config,
+                SandboxStatus::Starting,
+                true,
+                Some(&token),
+            )
+            .await
+            .unwrap();
+
+            // A process holding no lifecycle lock stands in for the runtime.
+            let mut process = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            crate::context::local::sandbox::safe_kill::accept_runtime_image_for_tests("sleep");
+            run_entity::Entity::insert(run_entity::ActiveModel {
+                sandbox_id: Set(candidate),
+                pid: Set(Some(process.id().unwrap() as i32)),
+                status: Set(run_entity::RunStatus::Running),
+                started_at: Set(Some(started.naive_utc())),
+                ..Default::default()
+            })
+            .exec(db)
+            .await
+            .unwrap();
+
+            let recovered = backend.recover_replacement_for_lookup("kept").await;
+            if own_runtime {
+                let error = recovered.expect_err("recovery reused a live runtime's files");
+                assert!(
+                    error.to_string().contains("still owns its files"),
+                    "{error}"
+                );
+            } else {
+                recovered.unwrap();
+                assert!(storage_token(db, "kept").await.unwrap().is_none());
+            }
+            assert!(
+                process.try_wait().unwrap().is_none(),
+                "recovery signalled the process"
+            );
+            process.kill().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn replacement_reopens_durable_state_and_fences_only_its_original() {
         for published in [false, true] {
